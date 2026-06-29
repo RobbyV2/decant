@@ -3,12 +3,12 @@ name = "decant-memflow"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "MemflowBackend — the real connector over guest physical RAM. Feature-gated (memflow). Connectors load at runtime as plugins, so this compiles without a VM but only runs on the VM host (see docs/DECISIONS.md ADR-0005)."
+description = "MemflowBackend: the connector over guest physical RAM. Feature-gated (memflow). Connectors load at runtime as plugins, so this compiles without a VM but only runs on the VM host (see docs/DECISIONS.md ADR-0005)."
 
 [features]
-# Off by default so the host autonomous suite builds hermetically. Enabling it
+# Off by default so the host offline suite builds hermetically. Enabling it
 # pulls memflow + memflow-win32 (verified versions per ADR-0005). The qemu/kvm
-# connector itself is a RUNTIME plugin installed via memflowup — not a build dep.
+# connector itself is a RUNTIME plugin installed via memflowup, not a build dep.
 default = []
 memflow = ["dep:memflow"]
 
@@ -19,8 +19,8 @@ anyhow.workspace = true
 
 # memflow core with the `plugins` feature (the runtime Inventory). The win32 OS
 # layer is loaded as a runtime `.os` plugin via inventory.builder().os("win32"),
-# so memflow-win32 is NOT a compile-time dependency in this design — that sidesteps
-# the memflow-win32 0.2.0 / core 0.2.4 source-skew risk flagged in ADR-0005 §9.
+# so memflow-win32 is NOT a compile-time dependency in this design; that sidesteps
+# the memflow-win32 0.2.0 / core 0.2.4 source-skew risk flagged in ADR-0005.
 [dependencies.memflow]
 version = "0.2"
 features = ["plugins"]

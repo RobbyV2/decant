@@ -1,14 +1,3 @@
-//! # decant-daemon library — "the cellar"
-//!
-//! The reusable server core: a length-prefixed `decant-protocol` TCP server that
-//! dispatches every [`Request`] to a [`MemoryBackend`] and writes back a
-//! [`Response`]. Kept in a library (separate from `main.rs`) so integration tests
-//! can [`serve`] a mock backend on an ephemeral port and drive it over a real
-//! socket — the Phase 1 autonomous gate (spec §Phase 1).
-//!
-//! The backend is a `dyn MemoryBackend` chosen at startup, so the same server code
-//! serves the `MockBackend` (offline) and the `MemflowBackend` (live VM) unchanged.
-
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,14 +6,12 @@ use std::sync::Arc;
 use decant_backend::MemoryBackend;
 use decant_protocol::{read_msg, write_msg, Diagnostics, ProtoError, Request, Response};
 
-/// Live counters surfaced via [`Request::Diagnostics`]. Atomic so connection
-/// threads can bump them without a lock on the hot read/write path.
 #[derive(Debug)]
 pub struct Diag {
     pub connector: String,
     pub reads: AtomicU64,
     pub writes: AtomicU64,
-    pub exec_wall_hits: AtomicU64,
+    pub unsupported_ops: AtomicU64,
 }
 
 impl Diag {
@@ -33,7 +20,7 @@ impl Diag {
             connector: connector.into(),
             reads: AtomicU64::new(0),
             writes: AtomicU64::new(0),
-            exec_wall_hits: AtomicU64::new(0),
+            unsupported_ops: AtomicU64::new(0),
         }
     }
 
@@ -42,17 +29,12 @@ impl Diag {
             connector: self.connector.clone(),
             reads: self.reads.load(Ordering::Relaxed),
             writes: self.writes.load(Ordering::Relaxed),
-            exec_wall_hits: self.exec_wall_hits.load(Ordering::Relaxed),
+            unsupported_ops: self.unsupported_ops.load(Ordering::Relaxed),
         }
     }
 }
 
-/// Translate one request into a response by calling the backend. Pure w.r.t. the
-/// socket (no I/O), so it is unit-testable directly. Backend errors become
-/// [`Response::Err`] with a wire-stable [`ProtoError`] — never a panic.
 pub fn dispatch(req: Request, backend: &dyn MemoryBackend, diag: &Diag) -> Response {
-    // Convert a backend Result into the matching Response, bumping the exec-wall
-    // counter if the failure was an execution-wall refusal (spec §9).
     fn finish<T>(
         r: decant_backend::Result<T>,
         ok: impl FnOnce(T) -> Response,
@@ -62,8 +44,8 @@ pub fn dispatch(req: Request, backend: &dyn MemoryBackend, diag: &Diag) -> Respo
             Ok(v) => ok(v),
             Err(e) => {
                 let pe: ProtoError = e.into();
-                if matches!(pe, ProtoError::ExecutionWall { .. }) {
-                    diag.exec_wall_hits.fetch_add(1, Ordering::Relaxed);
+                if matches!(pe, ProtoError::Unsupported { .. }) {
+                    diag.unsupported_ops.fetch_add(1, Ordering::Relaxed);
                 }
                 Response::Err(pe)
             }
@@ -106,8 +88,6 @@ pub fn dispatch(req: Request, backend: &dyn MemoryBackend, diag: &Diag) -> Respo
         Request::Resolve { pid, base, offsets } => {
             match decant_core::resolve(backend, pid, base, &offsets) {
                 Ok(address) => {
-                    // Best-effort: read the 8 bytes at the resolved address so the
-                    // caller sees the pointed-to value without a second round-trip.
                     diag.reads.fetch_add(1, Ordering::Relaxed);
                     let value = backend.read(pid, address, 8).unwrap_or_default();
                     Response::Resolved { address, value }
@@ -118,7 +98,6 @@ pub fn dispatch(req: Request, backend: &dyn MemoryBackend, diag: &Diag) -> Respo
     }
 }
 
-/// Map a `decant-core` analysis error onto the wire-stable [`ProtoError`].
 fn core_err_to_proto(e: decant_core::CoreError) -> ProtoError {
     match e {
         decant_core::CoreError::Pattern(message) => ProtoError::Backend { message },
@@ -126,9 +105,6 @@ fn core_err_to_proto(e: decant_core::CoreError) -> ProtoError {
     }
 }
 
-/// Serve one connection until the peer closes it. Each framed [`Request`] is
-/// dispatched and answered. A clean EOF ends the loop; any other I/O error is
-/// returned (the caller logs it and drops the connection).
 pub fn serve_connection(
     mut stream: TcpStream,
     backend: &dyn MemoryBackend,
@@ -145,8 +121,6 @@ pub fn serve_connection(
     }
 }
 
-/// Accept connections on `listener` forever, one thread per connection. The
-/// backend + diagnostics are shared (`Arc`) across all connections.
 pub fn serve(
     listener: TcpListener,
     backend: Arc<dyn MemoryBackend>,

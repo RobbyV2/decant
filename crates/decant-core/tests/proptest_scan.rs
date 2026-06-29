@@ -1,35 +1,3 @@
-//! Adversarial property tests for the AOB **scanner** (`decant_core::scanner`).
-//!
-//! The unit tests in `src/scanner.rs` pin a handful of concrete cases. These tests
-//! instead hammer the whole input space with proptest and check the scanner against
-//! an independent, dead-simple reference implementation. The properties are chosen
-//! to catch the classes of bug that are easy to introduce in a chunked scanner:
-//!
-//!   1. **Reference-oracle.** Over a random region, `scanner::scan` must return
-//!      *exactly* the offsets a naive byte-by-byte slide finds (wildcards match
-//!      anything), mapped to absolute addresses. This is the core correctness
-//!      invariant — it catches off-by-one, missed matches, and false positives.
-//!   2. **Chunk invariance.** The chunk size is purely an internal memory knob; it
-//!      must never change the *result*. We scan the same guest at many chunk sizes
-//!      (including 1, which forces a window per byte) and assert identical ascending
-//!      hits. This is the property that catches overlap/dedup bugs at chunk seams.
-//!   3. **Robustness.** Arbitrary printable-ASCII strings fed to `Pattern::parse`
-//!      must only ever return `Ok`/`Err`, never panic; and scanning a guest with no
-//!      readable region is an empty `Ok`.
-//!   4. **Multi-region.** With the pattern planted in two disjoint regions, the
-//!      scanner returns the hits from *both*, ascending, with nothing invented in
-//!      the unmapped gap between them.
-//!
-//! ## Why the oracle pads to a page
-//!
-//! `MockGuest` infers a region's size from the highest written byte, rounded up to
-//! a 0x1000 page (min one page). So a region holding `data` actually presents
-//! `data` followed by zero-fill out to the page boundary, and the scanner sees all
-//! of it. The oracle therefore searches that same page-padded byte image (see
-//! [`region_image`]) rather than `data` alone — otherwise a pattern that happens to
-//! match inside the zero padding would look like a (spurious) scanner "false
-//! positive" when it is in fact a real, readable match.
-
 use decant_core::scanner::{scan, scan_with_chunk};
 use decant_core::Pattern;
 use decant_backend::{MockBackend, MockGuest, Pid};
@@ -37,14 +5,6 @@ use proptest::prelude::*;
 
 const PAGE: usize = 0x1000;
 
-// ---------------------------------------------------------------------------
-// Reference helpers (deliberately trivial — the whole point is that they are
-// obviously correct, so any disagreement indicts the scanner, not the oracle).
-// ---------------------------------------------------------------------------
-
-/// The exact byte image a `MockGuest` presents for a region whose only content is
-/// `data` written at the region base: `data` then zero-fill up to a whole page
-/// (minimum one page). This mirrors `mock.rs`'s size inference.
 fn region_image(data: &[u8]) -> Vec<u8> {
     let size = data.len().div_ceil(PAGE).max(1) * PAGE;
     let mut img = vec![0u8; size];
@@ -52,8 +12,6 @@ fn region_image(data: &[u8]) -> Vec<u8> {
     img
 }
 
-/// Naive overlapping pattern search: slide the pattern over `hay`, a `None` entry
-/// matches any byte. Returns every start offset, ascending.
 fn naive_find(hay: &[u8], pat: &[Option<u8>]) -> Vec<usize> {
     let plen = pat.len();
     if plen == 0 || hay.len() < plen {
@@ -71,9 +29,6 @@ fn naive_find(hay: &[u8], pat: &[Option<u8>]) -> Vec<usize> {
         .collect()
 }
 
-/// Render a `Vec<Option<u8>>` pattern as the textual AOB form `Pattern::parse`
-/// consumes (`"4D ?? 00 ..."`), so the test exercises the real public parse path
-/// rather than reaching into private fields.
 fn pattern_string(pat: &[Option<u8>]) -> String {
     pat.iter()
         .map(|b| match b {
@@ -84,15 +39,6 @@ fn pattern_string(pat: &[Option<u8>]) -> String {
         .join(" ")
 }
 
-// ---------------------------------------------------------------------------
-// Strategies.
-// ---------------------------------------------------------------------------
-
-/// Generate a random data buffer (1..4096 bytes) together with a pattern *derived
-/// from that buffer* so real matches occur: pick a random window of the data
-/// (length 1..=16), then randomly turn some positions into `??` wildcards. The
-/// pattern is returned as `Vec<Option<u8>>` (the oracle's view); the test renders
-/// it to text for `Pattern::parse`.
 fn arb_data_and_pattern() -> impl Strategy<Value = (Vec<u8>, Vec<Option<u8>>)> {
     prop::collection::vec(any::<u8>(), 1..4096)
         .prop_flat_map(|data| {
@@ -116,12 +62,10 @@ fn arb_data_and_pattern() -> impl Strategy<Value = (Vec<u8>, Vec<Option<u8>>)> {
         })
 }
 
-/// A page-aligned, non-null region base in `[0x1000, 0x1_0000_0000)`.
 fn arb_base() -> impl Strategy<Value = u64> {
     (1u64..0x10_0000).prop_map(|page| page * PAGE as u64)
 }
 
-/// Build a one-region rw- guest holding `data` at `base`, pid 1.
 fn guest_with(base: u64, data: &[u8]) -> MockBackend {
     let guest = MockGuest::builder()
         .process("t.exe", Pid(1))
@@ -132,13 +76,7 @@ fn guest_with(base: u64, data: &[u8]) -> MockBackend {
     MockBackend::new(guest)
 }
 
-// ---------------------------------------------------------------------------
-// Properties.
-// ---------------------------------------------------------------------------
-
 proptest! {
-    /// CORE INVARIANT. The scanner's absolute hit list equals the naive oracle's
-    /// offsets (searched over the page-padded region image) mapped to `base + off`.
     #[test]
     fn scan_equals_naive_oracle((data, pat) in arb_data_and_pattern(), base in arb_base()) {
         let backend = guest_with(base, &data);
@@ -154,9 +92,6 @@ proptest! {
         prop_assert_eq!(got, expected);
     }
 
-    /// CHUNK INVARIANCE. For one fixed guest+pattern, every chunk size yields the
-    /// identical ascending, duplicate-free hit list. Chunk 1 forces a fresh window
-    /// per byte (maximum overlap churn); 4096 covers the whole region in one shot.
     #[test]
     fn scan_is_chunk_invariant((data, pat) in arb_data_and_pattern(), base in arb_base()) {
         let backend = guest_with(base, &data);
@@ -166,7 +101,6 @@ proptest! {
         for chunk in [1usize, 2, 3, 5, 8, 13, 64, 4096] {
             let hits = scan_with_chunk(&backend, Pid(1), &pattern, chunk).unwrap();
 
-            // Strictly ascending => sorted and de-duplicated.
             prop_assert!(
                 hits.windows(2).all(|w| w[0] < w[1]),
                 "chunk={chunk} produced non-ascending/duplicate hits: {hits:?}"
@@ -179,21 +113,16 @@ proptest! {
         }
     }
 
-    /// ROBUSTNESS. Any printable-ASCII string is safe to hand to `Pattern::parse`:
-    /// it returns `Ok` or `Err`, never panics. (Garbage tokens, lone digits, mixed
-    /// case, stray `?`, empty/whitespace — all must be handled, not crashed on.)
     #[test]
     fn parse_never_panics(s in "[\\x20-\\x7e]{0,64}") {
         let _ = Pattern::parse(&s);
     }
 
-    /// ROBUSTNESS. A guest whose only region is non-readable yields an empty `Ok`:
-    /// the scanner must skip unreadable memory, not error or invent hits.
     #[test]
     fn no_readable_region_is_empty_ok(pat_bytes in prop::collection::vec(any::<u8>(), 1..16)) {
         let guest = MockGuest::builder()
             .process("t.exe", Pid(1))
-            .region(0x10000, "-w-") // writable but NOT readable
+            .region(0x10000, "-w-")
             .bytes_at(0x10000, &[0xAAu8; 64])
             .done()
             .build();
@@ -203,14 +132,10 @@ proptest! {
         prop_assert!(scan(&backend, Pid(1), &pattern).unwrap().is_empty());
     }
 
-    /// MULTI-REGION. The same pattern planted in two widely separated regions is
-    /// found in both, ascending, with no hit landing in the unmapped gap between
-    /// them. The two regions are a page each; the gap (region A's end up to region
-    /// B's base) is not mapped at all, so nothing there is readable.
     #[test]
     fn hits_span_two_regions_with_clean_gap((data, pat) in arb_data_and_pattern()) {
         const BASE_A: u64 = 0x10_000;
-        const BASE_B: u64 = 0x2000_0000; // far past A's single page
+        const BASE_B: u64 = 0x2000_0000;
         let guest = MockGuest::builder()
             .process("t.exe", Pid(1))
             .region(BASE_A, "rw-")
@@ -237,8 +162,6 @@ proptest! {
 
         prop_assert_eq!(&got, &expected);
 
-        // Explicit gap check: no hit may fall between the end of region A's page
-        // and the base of region B.
         let gap_start = BASE_A + img.len() as u64;
         prop_assert!(
             got.iter().all(|&a| a < gap_start || a >= BASE_B),

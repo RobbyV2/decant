@@ -1,12 +1,3 @@
-//! # originals — the forwarder's saved real function pointers
-//!
-//! Before the carafe patches an IAT slot, it resolves the **real** Win32/NT export
-//! (via `GetModuleHandleW`/`GetProcAddress` on the public DLL) and stores it here.
-//! Hooks that handle a *real* (non-synthetic) handle call back through these so the
-//! ~95% of behavior Decant does not own forwards untouched to the Wine builtin
-//! (ADR-0006). Resolution is best-effort: an unresolved original stays `0`, and the
-//! forwarder treats `0` as "cannot forward" (a clean failure, never a wild call).
-
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -17,7 +8,6 @@ extern "system" {
     fn LoadLibraryA(lib_file_name: *const u8) -> *mut c_void;
 }
 
-/// Slots for every export a hook may need to forward to. `0` ⇒ unresolved.
 pub struct Originals {
     pub read_process_memory: AtomicUsize,
     pub write_process_memory: AtomicUsize,
@@ -50,15 +40,12 @@ impl Originals {
     }
 }
 
-/// The process-wide table of saved originals.
 pub static ORIGINALS: Originals = Originals::new();
 
-/// NUL-terminated UTF-16 of `s`, for `GetModuleHandleW`.
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(core::iter::once(0)).collect()
 }
 
-/// Resolve `name` from already-loaded module `module_w`; `0` if either step fails.
 unsafe fn resolve(module_w: &[u16], name: &[u8]) -> usize {
     let h = GetModuleHandleW(module_w.as_ptr());
     if h.is_null() {
@@ -67,8 +54,6 @@ unsafe fn resolve(module_w: &[u16], name: &[u8]) -> usize {
     GetProcAddress(h, name.as_ptr()) as usize
 }
 
-/// Resolve and store every original. Idempotent; call once during install, before
-/// patching. `psapi`/`ntdll` are force-loaded so `GetModuleHandleW` finds them.
 pub unsafe fn capture() {
     LoadLibraryA(b"psapi.dll\0".as_ptr());
     LoadLibraryA(b"ntdll.dll\0".as_ptr());
@@ -86,7 +71,6 @@ pub unsafe fn capture() {
     store(&ORIGINALS.close_handle, resolve(&k32, b"CloseHandle\0"));
     store(&ORIGINALS.nt_close, resolve(&ntdll, b"NtClose\0"));
 
-    // psapi exports also exist as `K32…` in kernel32; prefer psapi, fall back.
     let epm = {
         let p = resolve(&psapi, b"EnumProcessModules\0");
         if p != 0 { p } else { resolve(&k32, b"K32EnumProcessModules\0") }

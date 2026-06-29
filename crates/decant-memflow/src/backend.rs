@@ -1,10 +1,3 @@
-//! The memflow-backed `MemoryBackend`. Compiled only with `--features memflow`.
-//!
-//! Per ADR-0005, the trait methods map onto memflow's `Os` / `Process` /
-//! `MemoryView` traits. The OS handle is a boxed plugin instance
-//! (`OsInstanceArcBox`) obtained from the `Inventory` builder, stored behind a
-//! `Mutex` to bridge memflow's `&mut self` API to our `&self` trait.
-
 use std::sync::Mutex;
 
 use decant_backend::{BackendError, MemoryBackend, Result};
@@ -12,31 +5,20 @@ use decant_protocol::{MemRegion, ModuleInfo, Pid, ProcessInfo};
 
 use memflow::prelude::v1::*;
 
-/// A live connection to a guest's memory through a memflow connector + win32 OS.
 pub struct MemflowBackend {
     os: Mutex<OsInstanceArcBox<'static>>,
     connector: String,
 }
 
-/// Map any memflow error into our backend error without naming memflow's error
-/// type (it has churned across versions); `Debug` is stable enough for a message.
 fn other<E: std::fmt::Debug>(e: E) -> BackendError {
     BackendError::Other(format!("memflow: {e:?}"))
 }
 
 impl MemflowBackend {
-    /// Connect using the named connector (`qemu`, `kvm`, …). Connector arguments
-    /// (e.g. the QEMU VM name) come from `DECANT_CONNECTOR_ARGS` (memflow's
-    /// `key=value,flag` syntax, parsed by `ConnectorArgs`).
-    ///
-    /// Fails with a clear error if the plugin is missing or the VM is unreachable
-    /// (the daemon turns this into a startup diagnostic — capability detection).
     pub fn connect(connector: &str) -> anyhow::Result<Self> {
         let mut inventory = Inventory::scan();
         let args = std::env::var("DECANT_CONNECTOR_ARGS").ok();
 
-        // Two explicit chains so the optional `.args()` doesn't fight the builder's
-        // per-step types.
         let os = match args {
             Some(a) => {
                 let cargs: ConnectorArgs = a
@@ -61,7 +43,6 @@ impl MemflowBackend {
         Ok(MemflowBackend { os: Mutex::new(os), connector: connector.to_string() })
     }
 
-    /// The connector name, for diagnostics.
     pub fn connector(&self) -> &str {
         &self.connector
     }
@@ -126,7 +107,6 @@ impl MemoryBackend for MemflowBackend {
             .map_err(|_| BackendError::NoSuchModule { pid: pid.0, module: module.to_string() })?;
         let exports = proc.module_export_list(&m).map_err(other)?;
         let base = m.base.to_umem() as u64;
-        // ExportInfo.offset is relative to the module base; report absolute VAs.
         Ok(exports
             .into_iter()
             .map(|e| (e.name.to_string(), base + e.offset as u64))
@@ -139,9 +119,6 @@ impl MemoryBackend for MemflowBackend {
             pid: Some(pid.0),
             name: None,
         })?;
-        // read_raw returns a PartialResult: a partial error means some pages were
-        // not present (paged out). We surface that as a read failure rather than
-        // returning silently-truncated data (spec §9 honesty).
         proc.read_raw(Address::from(addr), len).map_err(|e| BackendError::ReadFailed {
             addr,
             len: len as u64,
@@ -166,15 +143,12 @@ impl MemoryBackend for MemflowBackend {
             pid: Some(pid.0),
             name: None,
         })?;
-        // gap_size = -1 coalesces only exactly-adjacent pages. Each range carries a
-        // PageType whose flags give coarse r/w/x (spec §9: coarser than native).
         let ranges = proc.mapped_mem_vec(-1);
         Ok(ranges
             .into_iter()
             .map(|CTup3(addr, size, page_type): CTup3<Address, umem, PageType>| MemRegion {
                 base: addr.to_umem() as u64,
                 size: size as u64,
-                // A mapped range is readable; write/exec come from the page flags.
                 readable: true,
                 writable: page_type.contains(PageType::WRITEABLE),
                 executable: !page_type.contains(PageType::NOEXEC),
@@ -183,11 +157,9 @@ impl MemoryBackend for MemflowBackend {
     }
 }
 
-/// Convert a memflow `ModuleInfo` into Decant's wire type.
 fn module_to_info(m: ModuleInfo_) -> ModuleInfo {
     ModuleInfo { name: m.name.to_string(), base: m.base.to_umem() as u64, size: m.size as u64 }
 }
 
-// `ModuleInfo` is also the name of memflow's type; alias memflow's to avoid the
-// clash with our wire type imported above.
+// aliased to avoid clash with our wire ModuleInfo
 use memflow::os::module::ModuleInfo as ModuleInfo_;

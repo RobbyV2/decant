@@ -11,5 +11,5 @@ decant-backend = { path = "../decant-backend" }
 thiserror.workspace = true
 
 [dev-dependencies]
-# proptest added in Phase 2 for scanner/resolver property tests.
+# proptest for scanner/resolver property tests.
 proptest = "1"

@@ -1,4 +1,4 @@
-# Decant — cargo workspace.
+# Decant cargo workspace.
 #
 # IMPORTANT: this is a *mixed-target* workspace. Most crates build for the host
 # (native Linux: daemon, cli, core, backend, protocol). A handful build ONLY for
@@ -29,7 +29,7 @@ members = [
 #
 # `decant-interpose` is a windows-gnu cdylib, but its handle-table + rpc cores are
 # platform-agnostic (no Win32), so it is listed here too: that runs the handle-table
-# red-team under `cargo test` on the host with no Wine (the Win32-binding modules are
+# tests under `cargo test` on the host with no Wine (the Win32-binding modules are
 # `#[cfg(windows)]` and simply compile out on the host).
 default-members = [
     "xtask",

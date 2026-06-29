@@ -1,9 +1,3 @@
-//! End-to-end test of the real `decant-daemon` BINARY over a real TCP socket,
-//! `--backend mock`. Spawns the daemon on an OS-assigned port, parses the port it
-//! prints, then drives every request type with a raw `decant-protocol` client and
-//! asserts against the scripted demo guest. This is half of the Phase 1 autonomous
-//! gate ("the daemon binary serves correctly"); the CLI half lives in decant-cli.
-
 use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
@@ -11,7 +5,6 @@ use std::process::{Child, Command, Stdio};
 use decant_backend::fixtures::{DEMO_MAGIC, DEMO_MAGIC_ADDR, DEMO_SLOT_ADDR, DEMO_TARGET_PID};
 use decant_protocol::{read_msg, write_msg, Pid, ProtoError, Request, Response};
 
-/// Kills the daemon when the test ends, pass or panic.
 struct Daemon {
     child: Child,
     port: u16,
@@ -32,7 +25,6 @@ fn start_daemon() -> Daemon {
         .spawn()
         .expect("spawn decant-daemon");
 
-    // The daemon prints "decant-daemon listening on 127.0.0.1:PORT (backend: mock)".
     let stdout = child.stdout.take().expect("daemon stdout");
     let mut line = String::new();
     BufReader::new(stdout).read_line(&mut line).expect("read daemon banner");
@@ -56,10 +48,8 @@ fn call(port: u16, req: Request) -> Response {
 fn daemon_binary_serves_the_demo_guest() {
     let d = start_daemon();
 
-    // Ping.
     assert!(matches!(call(d.port, Request::Ping), Response::Pong));
 
-    // Processes: demo guest has decant-target.exe + explorer.exe.
     match call(d.port, Request::ListProcesses) {
         Response::Processes(ps) => {
             assert!(ps.iter().any(|p| p.name == "decant-target.exe" && p.pid == DEMO_TARGET_PID));
@@ -68,7 +58,6 @@ fn daemon_binary_serves_the_demo_guest() {
         other => panic!("expected Processes, got {other:?}"),
     }
 
-    // Modules of the target.
     match call(d.port, Request::ModuleList(DEMO_TARGET_PID)) {
         Response::Modules(ms) => {
             assert!(ms.iter().any(|m| m.name == "decant-target.exe"));
@@ -77,13 +66,11 @@ fn daemon_binary_serves_the_demo_guest() {
         other => panic!("expected Modules, got {other:?}"),
     }
 
-    // Read the planted magic.
     match call(d.port, Request::Read { pid: DEMO_TARGET_PID, addr: DEMO_MAGIC_ADDR, len: 16 }) {
         Response::Data(bytes) => assert_eq!(bytes, DEMO_MAGIC),
         other => panic!("expected Data, got {other:?}"),
     }
 
-    // Write the slot, read it back changed (the host-side write proof, offline).
     let payload = vec![0xAA, 0xBB, 0xCC, 0xDD];
     match call(d.port, Request::Write { pid: DEMO_TARGET_PID, addr: DEMO_SLOT_ADDR, data: payload.clone() }) {
         Response::Written(4) => {}
@@ -94,13 +81,11 @@ fn daemon_binary_serves_the_demo_guest() {
         other => panic!("expected Data, got {other:?}"),
     }
 
-    // Unknown pid -> structured error, not a panic or a dropped connection.
     match call(d.port, Request::ProcessByPid(Pid(424242))) {
         Response::Err(ProtoError::NoSuchProcess { .. }) => {}
         other => panic!("expected NoSuchProcess, got {other:?}"),
     }
 
-    // Diagnostics reflect the two reads + one write above (plus this connection's).
     match call(d.port, Request::Diagnostics) {
         Response::Diagnostics(diag) => {
             assert_eq!(diag.connector, "mock");

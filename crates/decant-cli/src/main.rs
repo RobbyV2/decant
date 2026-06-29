@@ -1,10 +1,3 @@
-//! # decant-cli (Phase 1)
-//!
-//! The user's hands-on tool for driving the daemon and verifying the live VM. It
-//! is a thin `decant-protocol` client: open a TCP connection, send one framed
-//! [`Request`], read one [`Response`], render it. The same binary works against
-//! `--backend mock` (offline) and `--backend memflow` (the live VM).
-
 use std::io::Write as _;
 use std::net::TcpStream;
 use std::process::ExitCode;
@@ -16,7 +9,6 @@ use decant_protocol::{read_msg, write_msg, Pid, Request, Response};
 #[derive(Debug, Parser)]
 #[command(name = "decant-cli", about = "Drive the Decant daemon")]
 struct Cli {
-    /// Daemon endpoint `host:port`. Also settable via `DECANT_ENDPOINT`.
     #[arg(long, env = "DECANT_ENDPOINT", default_value = "127.0.0.1:7878")]
     endpoint: String,
 
@@ -26,23 +18,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// List guest processes (pid + name).
     Processes,
-    /// List a process's loaded modules.
     Modules { pid: u32 },
-    /// List a module's exports (name -> address).
     Exports { pid: u32, module: String },
-    /// Read LEN bytes at ADDR (ADDR/LEN accept 0x.. or decimal); hex-dumps them.
     Read { pid: u32, addr: String, len: String },
-    /// Write hex bytes at ADDR (e.g. `deadbeef` or `de ad be ef`).
     Write { pid: u32, addr: String, hexbytes: String },
-    /// Show the process's virtual memory regions.
     MemoryMap { pid: u32 },
-    /// Show daemon diagnostics (connector, counters, execution-wall hits).
     Diagnostics,
-    /// (Phase 2) AOB/signature scan.
     Scan { pid: u32, pattern: String },
-    /// (Phase 2) Resolve a pointer chain.
     Resolve { pid: u32, base: String, offsets: Vec<String> },
 }
 
@@ -134,7 +117,7 @@ fn run() -> Result<()> {
                     println!("connector:       {}", d.connector);
                     println!("reads:           {}", d.reads);
                     println!("writes:          {}", d.writes);
-                    println!("exec-wall hits:  {}", d.exec_wall_hits);
+                    println!("unsupported ops: {}", d.unsupported_ops);
                 }
                 other => bail!(unexpected(other)),
             }
@@ -177,7 +160,6 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-/// Open a connection, send one request, return the response.
 fn request(endpoint: &str, req: Request) -> Result<Response> {
     let mut stream = TcpStream::connect(endpoint)
         .with_context(|| format!("connecting to daemon at {endpoint}"))?;
@@ -194,7 +176,6 @@ fn expect_processes(resp: Response) -> Result<Vec<decant_protocol::ProcessInfo>>
     }
 }
 
-/// Render an unexpected response (usually `Response::Err`) as an error message.
 fn unexpected(resp: Response) -> String {
     match resp {
         Response::Err(e) => format!("daemon error: {e}"),
@@ -202,7 +183,6 @@ fn unexpected(resp: Response) -> String {
     }
 }
 
-/// Parse a u64 that may be `0x`-prefixed hex or decimal.
 fn parse_u64(s: &str) -> Result<u64> {
     let s = s.trim();
     let v = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
@@ -213,7 +193,6 @@ fn parse_u64(s: &str) -> Result<u64> {
     Ok(v)
 }
 
-/// Parse a hex byte string, ignoring spaces and an optional `0x` prefix.
 fn parse_hex(s: &str) -> Result<Vec<u8>> {
     let cleaned: String = s
         .trim()
@@ -234,7 +213,6 @@ fn parse_hex(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-/// Classic 16-bytes-per-line hex dump with an ASCII gutter.
 fn hexdump(base: u64, bytes: &[u8]) {
     for (i, chunk) in bytes.chunks(16).enumerate() {
         let off = base + (i * 16) as u64;

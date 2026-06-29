@@ -1,4 +1,4 @@
-# Decant — Architecture
+# Decant Architecture
 
 Decant lets an **unmodified** Windows memory-editing tool run under Wine while its
 memory accesses are transparently redirected to a *separate* Windows VM. The tool
@@ -7,7 +7,7 @@ serviced by reading the guest VM's physical RAM from the outside via
 [memflow](https://github.com/memflow/memflow).
 
 This document describes the component topology, the "narrow waist" that makes the
-whole thing tractable, the host/VM physical reality that constrains the design, and
+design tractable, the host/VM physical reality that constrains the design, and
 the mock-backend seam that keeps ~90% of the system testable with no VM at all.
 
 ---
@@ -17,14 +17,14 @@ the mock-backend seam that keeps ~90% of the system testable with no VM at all.
 ```
   ┌────────────────────────────────────────────────────────────────┐
   │  Windows guest VM (QEMU/KVM)                                     │
-  │    target.exe — the game/process being inspected                │
-  │    (runs real, unmodified, oblivious)                           │
+  │    target.exe, the game/process being inspected                 │
+  │    (runs real, unmodified)                                      │
   └───────────────▲────────────────────────────────────────────────┘
                   │  physical RAM read out-of-band
                   │  (hypervisor memory introspection)
                   │
   ┌───────────────┴──────────── memflow connector (QEMU/KVM) ───────┐
-  │  HOST (Linux) — where the hypervisor runs                       │
+  │  HOST (Linux), where the hypervisor runs                        │
   │                                                                 │
   │   ┌──────────────────────────────┐                             │
   │   │  decant-daemon  "the cellar" │  reads/writes guest memory  │
@@ -45,21 +45,20 @@ the mock-backend seam that keeps ~90% of the system testable with no VM at all.
 
 Named pieces (the wine metaphor is load-bearing in the code comments):
 
-- **The guest** — the real Windows VM and the `target.exe` inside it. Decant never
-  runs code in here; it only reads/writes its memory from outside (see §3).
-- **The cellar** (`decant-daemon`) — a Linux-side TCP server. It owns the active
+- **The guest**: the real Windows VM and the `target.exe` inside it. Decant never
+  runs code in here; it only reads/writes its memory from outside (see section 3).
+- **The cellar** (`decant-daemon`): a Linux-side TCP server. It owns the active
   `MemoryBackend` and dispatches `decant-protocol` requests to it. Chosen at
-  startup: `--backend mock` (default, no VM) or `--backend memflow` (live VM).
-- **memflow + MemflowBackend** (`decant-memflow`) — the real backend. Reads guest
+  startup: `--backend mock` (default, no VM) or `--backend memflow` (VM).
+- **memflow + MemflowBackend** (`decant-memflow`): the memflow backend. Reads guest
   *physical* RAM through a QEMU/KVM connector and resolves it into virtual-memory
   reads, process/module enumeration, and export tables. A drop-in implementor of
-  the `MemoryBackend` trait. (Stubbed in Phase 0; wired in Phase 1.)
-- **The carafe** (`decant-interpose`) — the Windows DLL loaded into the unmodified
+  the `MemoryBackend` trait.
+- **The carafe** (`decant-interpose`): the Windows DLL loaded into the unmodified
   tool under Wine. It implements the handful of Win32/NT memory + introspection
   exports the tool calls, marshals each to the cellar over `decant-protocol`,
   maintains a synthetic handle table, synthesizes process/module snapshots from
-  daemon data, and forwards everything else to the real Wine builtin. (Empty
-  `cdylib` in Phase 0; implemented in Phase 3 after the injection-vector spike.)
+  daemon data, and forwards everything else to the real Wine builtin.
 
 ---
 
@@ -87,11 +86,11 @@ fn memory_map(&self, pid: Pid) -> Result<Vec<MemRegion>>;
 These nine primitives are mirrored almost one-to-one by the
 [`Request`/`Response`](../crates/decant-protocol/src/lib.rs) wire enums. This is
 the design's central leverage: **translate these primitives once, and every Win32
-API above them comes along for free.** A new tool that calls some exotic
+API above them is handled too.** A new tool that calls some exotic
 toolhelp/psapi combination still bottoms out in read/query/enumerate.
 
 What does *not* fit through the waist is anything that requires the guest to
-*execute code* — and the design refuses to fake it (see §3, the execution wall).
+*execute code*. The design does not simulate it (see section 3, unsupported operations).
 
 ---
 
@@ -103,33 +102,33 @@ architecture:
 
 1. **memflow must run where the hypervisor runs.** The QEMU/KVM connector reads
    the QEMU process's mapping of guest RAM. Therefore the daemon ("the cellar")
-   lives on the **host**, beside the VM — not inside the Wine process and not
+   lives on the **host**, beside the VM, not inside the Wine process and not
    inside the guest. The carafe DLL, by contrast, lives inside the Wine-hosted
    tool. They are different machines-of-execution bridged only by the TCP
    protocol. This split is *why* there is a daemon at all.
 
-2. **The execution wall.** memflow can read and write guest memory, enumerate
+2. **Unsupported operations.** memflow can read and write guest memory, enumerate
    processes/modules, and resolve exports. It **cannot run guest code**: no
    `VirtualAllocEx` of new guest pages backed by the guest allocator, no
    `CreateRemoteThread`, no DLL injection into the *target*, no calling a guest
-   function. Any tool request that needs guest execution is a hard wall. Decant
-   surfaces this honestly rather than silently corrupting state:
-   `ProtoError::ExecutionWall { op }` / `BackendError::ExecutionWall { op }`, and
-   `Diagnostics::exec_wall_hits` counts how often a tool hit it. **Never fake an
-   allocation or a thread.** Read/write/scan/pointer-resolve are fully supported;
-   anything past the wall fails loudly.
+   function. Any tool request that needs guest execution is unsupported. Decant
+   surfaces this rather than silently corrupting state:
+   `ProtoError::Unsupported { op }` / `BackendError::Unsupported { op }`, and
+   `Diagnostics::unsupported_ops` counts how often a tool hit it. **Never
+   synthesize an allocation or a thread.** Read, write, scan, and pointer-resolve
+   are fully supported; anything beyond these limits fails clearly.
 
 (Note the layering distinction: the carafe DLL *is* injected into the Wine-hosted
-tool — that is host-side Wine process manipulation, the Phase 3 spike. The
-execution wall is specifically about the *guest VM*, which memflow cannot inject
-into.)
+tool, which is host-side Wine process manipulation. The
+unsupported-operation limit is specifically about the *guest VM*, which memflow
+cannot inject into.)
 
 ---
 
 ## 4. The mock-backend testability seam
 
 Because `MemoryBackend` is the single seam through which all memory access flows,
-the entire stack above it can be exercised against a **fake guest** with no VM and
+the entire stack above it can be exercised against a **mock guest** with no VM and
 no memflow. That is [`MockBackend`](../crates/decant-backend/src/mock.rs), driven
 by the `MockGuest` builder:
 
@@ -150,14 +149,14 @@ The mock implements every trait method deterministically, and writes round-trip
 (a `write` followed by a `read` of the same range returns the new bytes), so the
 host-side write-verification strategy (see `docs/TESTING.md`) works without a VM.
 
-This seam is what makes Decant largely VM-free to develop:
+This seam keeps Decant largely VM-free to develop:
 
-- `decant-core` (AOB scanner, pointer-chain resolver, Phase 2) runs entirely
+- `decant-core` (AOB scanner, pointer-chain resolver) runs entirely
   against a `MockGuest`.
 - `decant-daemon` dispatch logic is tested by pointing the server at a
   `MockBackend`.
 - `decant-cli` and the carafe's marshaling can be driven end-to-end with the mock
-  backend behind the daemon, no live VM required.
+  backend behind the daemon, no VM required.
 
 `MemflowBackend` is the *only* component that genuinely needs a VM, and it is
 swapped in behind the identical trait. Everything else is proven against the mock
@@ -174,12 +173,12 @@ crates are members but built only with `--target x86_64-pc-windows-gnu`.
 |---|---|---|
 | `crates/decant-protocol` | host + win-gnu | Frozen wire contract + shared domain types; `write_msg`/`read_msg` framing |
 | `crates/decant-backend` | host | `MemoryBackend` trait + `MockBackend`/`MockGuest` |
-| `crates/decant-memflow` | host | `MemflowBackend` (stub; Phase 1) |
-| `crates/decant-core` | host | AOB scanner + pointer-chain resolver (stub; Phase 2) |
-| `crates/decant-daemon` | host | "the cellar" — TCP server + dispatch (stub; Phase 1) |
-| `crates/decant-cli` | host | user CLI (stub; Phase 1) |
+| `crates/decant-memflow` | host | `MemflowBackend` |
+| `crates/decant-core` | host | AOB scanner + pointer-chain resolver |
+| `crates/decant-daemon` | host | "the cellar", TCP server + dispatch |
+| `crates/decant-cli` | host | user CLI |
 | `crates/decant-wine-harness` | host | launches exes under Wine for `cargo test` |
-| `crates/decant-interpose` | win-gnu (cdylib) | "the carafe" interposer DLL (stub; Phase 3) |
+| `crates/decant-interpose` | win-gnu (cdylib) | "the carafe" interposer DLL |
 | `testbins/hello-dll` | win-gnu (cdylib) | minimal PE32+ DLL exporting `add` |
 | `testbins/dll-smoke` | win-gnu (exe) | loads `hello-dll`, proves the toolchain under Wine |
 | `testbins/guest-target` | win-gnu | sample target for live tests (stub) |

@@ -1,35 +1,3 @@
-//! `MockBackend` + `MockGuest` — "the tasting".
-//!
-//! A scriptable, deterministic fake guest. This is what lets the scanner, the
-//! pointer-chain resolver, the snapshot synthesis, the handle table, and the
-//! entire RPC path be tested with no VM present (spec §3).
-//!
-//! Guest *structure* (processes, modules, regions) is fixed at build time; guest
-//! *memory* is mutable behind an `RwLock` so writes round-trip — exactly what the
-//! Phase 1 acceptance ("daemon writes the slot, daemon reads it back, assert
-//! changed", spec §2's host-side write verification) needs to run offline.
-//!
-//! ## Builder shape
-//!
-//! The builder is *flat with a region cursor*: `.region(..)` opens a region and
-//! the following `.bytes_at`/`.u64_at`/`.u32_at` write into it. Opening another
-//! region (or `.done()`) finalizes the current one. This matches the single
-//! `.done()` per process in the spec §3 example.
-//!
-//! ```
-//! use decant_backend::{MockBackend, MockGuest, MemoryBackend, Pid};
-//! let guest = MockGuest::builder()
-//!     .process("target.exe", Pid(1234))
-//!         .module("target.exe", 0x1400000000, 0x80000)
-//!         .region(0x1400010000, "rw-")
-//!             .u64_at(0x1400010200, 0x1400010300)   // pointer-chain hop
-//!             .u32_at(0x1400010300 + 0x10, 1337)     // terminal value
-//!         .done()
-//!     .build();
-//! let backend = MockBackend::new(guest);
-//! assert_eq!(backend.process_by_name("target.exe").unwrap().pid, Pid(1234));
-//! ```
-
 use crate::{BackendError, MemoryBackend, Result};
 use decant_protocol::{MemRegion, ModuleInfo, Pid, ProcessInfo};
 use std::collections::BTreeMap;
@@ -37,7 +5,6 @@ use std::sync::{Arc, RwLock};
 
 const PAGE: u64 = 0x1000;
 
-/// One region's declared extent + permissions.
 #[derive(Debug, Clone)]
 struct Region {
     base: u64,
@@ -66,11 +33,8 @@ impl Region {
 struct Process {
     info: ProcessInfo,
     modules: Vec<ModuleInfo>,
-    /// module name (lowercased) -> sorted export list
     exports: BTreeMap<String, Vec<(String, u64)>>,
     regions: Vec<Region>,
-    /// Sparse address space. Unwritten addresses inside a readable region read 0.
-    /// Mutable so writes round-trip.
     mem: BTreeMap<u64, u8>,
 }
 
@@ -80,8 +44,6 @@ impl Process {
     }
 }
 
-/// An immutable-structure, mutable-memory fake guest. Cheap to clone; clones
-/// share the same underlying memory (so a write through one is seen by another).
 #[derive(Debug, Clone)]
 pub struct MockGuest {
     inner: Arc<RwLock<Vec<Process>>>,
@@ -93,11 +55,6 @@ impl MockGuest {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Builder
-// ---------------------------------------------------------------------------
-
-/// Top-level builder. Add processes, then `.build()`.
 pub struct GuestBuilder {
     processes: Vec<Process>,
 }
@@ -122,8 +79,6 @@ impl GuestBuilder {
     }
 }
 
-/// In-progress region: tracks base/perms and the highest written address so the
-/// region size can be inferred at finalize time.
 struct PendingRegion {
     base: u64,
     readable: bool,
@@ -132,8 +87,6 @@ struct PendingRegion {
     max_written: Option<u64>,
 }
 
-/// Per-process builder with a region cursor. `.region()` opens a region; byte
-/// writers target it; `.done()` finalizes the process and returns the parent.
 pub struct ProcessBuilder {
     parent: GuestBuilder,
     proc: Process,
@@ -141,13 +94,11 @@ pub struct ProcessBuilder {
 }
 
 impl ProcessBuilder {
-    /// Declare a loaded module.
     pub fn module(mut self, name: &str, base: u64, size: u64) -> Self {
         self.proc.modules.push(ModuleInfo { name: name.to_string(), base, size });
         self
     }
 
-    /// Add an export `(name -> absolute address)` to a module.
     pub fn export(mut self, module: &str, name: &str, addr: u64) -> Self {
         self.proc
             .exports
@@ -157,8 +108,6 @@ impl ProcessBuilder {
         self
     }
 
-    /// Open a memory region. `perms` is a 3-char string like `"rw-"` / `"r-x"`.
-    /// The region's size is inferred from the bytes written into it (min 1 page).
     pub fn region(mut self, base: u64, perms: &str) -> Self {
         self.finalize_region();
         let p = perms.as_bytes();
@@ -172,7 +121,6 @@ impl ProcessBuilder {
         self
     }
 
-    /// Write raw bytes into the current region at an absolute address.
     pub fn bytes_at(mut self, addr: u64, bytes: &[u8]) -> Self {
         {
             let region = self
@@ -193,24 +141,20 @@ impl ProcessBuilder {
         self
     }
 
-    /// Write a little-endian `u64` (e.g. a pointer-chain hop) into the region.
     pub fn u64_at(self, addr: u64, value: u64) -> Self {
         self.bytes_at(addr, &value.to_le_bytes())
     }
 
-    /// Write a little-endian `u32` (e.g. a terminal value) into the region.
     pub fn u32_at(self, addr: u64, value: u32) -> Self {
         self.bytes_at(addr, &value.to_le_bytes())
     }
 
-    /// Finalize the open region (if any) into the process's region list.
     fn finalize_region(&mut self) {
         if let Some(r) = self.cur_region.take() {
             let span = match r.max_written {
                 Some(m) => m - r.base + 1,
                 None => 0,
             };
-            // Round up to a whole page, minimum one page.
             let size = span.div_ceil(PAGE).max(1) * PAGE;
             self.proc.regions.push(Region {
                 base: r.base,
@@ -222,7 +166,6 @@ impl ProcessBuilder {
         }
     }
 
-    /// Finalize this process and return to the top-level builder.
     pub fn done(mut self) -> GuestBuilder {
         self.finalize_region();
         for v in self.proc.exports.values_mut() {
@@ -234,11 +177,6 @@ impl ProcessBuilder {
     }
 }
 
-// ---------------------------------------------------------------------------
-// MockBackend
-// ---------------------------------------------------------------------------
-
-/// `MemoryBackend` over a [`MockGuest`]. Reads and writes both round-trip.
 #[derive(Debug, Clone)]
 pub struct MockBackend {
     guest: MockGuest,
@@ -249,14 +187,11 @@ impl MockBackend {
         MockBackend { guest }
     }
 
-    /// The underlying guest handle (clones share memory). Useful when a test
-    /// wants to write through the backend and then re-inspect via another handle.
     pub fn guest(&self) -> MockGuest {
         self.guest.clone()
     }
 }
 
-/// Locate a process index by pid within a locked process vec.
 fn idx_by_pid(procs: &[Process], pid: Pid) -> Result<usize> {
     procs
         .iter()
@@ -330,7 +265,6 @@ impl MemoryBackend for MockBackend {
     fn write(&self, pid: Pid, addr: u64, data: &[u8]) -> Result<usize> {
         let mut g = self.guest.inner.write().unwrap();
         let i = idx_by_pid(&g, pid)?;
-        // Validate the whole span is writable before mutating anything.
         for off in 0..data.len() as u64 {
             let a = addr + off;
             match g[i].region_at(a) {
@@ -400,7 +334,6 @@ mod tests {
 
     #[test]
     fn writes_round_trip() {
-        // This is the offline analogue of the Phase 1 live write gate.
         let b = MockBackend::new(guest());
         let n = b.write(Pid(1234), 0x1400010400, &[0xAA, 0xBB, 0xCC, 0xDD]).unwrap();
         assert_eq!(n, 4);

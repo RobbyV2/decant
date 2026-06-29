@@ -10,8 +10,8 @@ name = "decant-daemon"
 path = "src/main.rs"
 
 [features]
-# Enables the real VM backend. Off by default so the host autonomous suite builds
-# hermetically; turn on for the live VM: `cargo build -p decant-daemon --features memflow`.
+# Enables the VM backend. Off by default so the host offline suite builds
+# hermetically; turn on for the VM: `cargo build -p decant-daemon --features memflow`.
 default = []
 memflow = ["decant-memflow/memflow"]
 

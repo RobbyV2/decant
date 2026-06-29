@@ -3,7 +3,7 @@ name = "decant-protocol"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "Decant RPC wire protocol — the funnel. Shared by the Linux daemon and the windows-gnu interposer DLL."
+description = "Decant RPC wire protocol, the funnel. Shared by the Linux daemon and the windows-gnu interposer DLL."
 
 [dependencies]
 serde.workspace = true

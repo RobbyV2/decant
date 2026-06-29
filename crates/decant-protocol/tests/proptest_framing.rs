@@ -1,33 +1,9 @@
-//! Adversarial + property tests for the wire protocol's framing (`write_msg` /
-//! `read_msg`) and the serde/bincode encoding of every `Request` / `Response`
-//! variant.
-//!
-//! These complement the hand-written unit tests in `src/lib.rs` (which pin a few
-//! concrete values) by hammering the *whole value space*: proptest constructs
-//! arbitrary variants — random addresses, lengths, payloads, unicode strings,
-//! vectors of process/module info, and every error variant — and asserts three
-//! invariants the daemon<->DLL transport depends on:
-//!
-//!   1. **Round-trip identity.** Any value written then read back is `==` the
-//!      original, and re-encoding it yields byte-for-byte identical bytes
-//!      (bincode is deterministic, so the wire form is stable — important for
-//!      anyone who diffs or caches frames).
-//!   2. **Stream framing.** Two arbitrary messages written back-to-back read back
-//!      in order with no bleed between frames.
-//!   3. **Hostile input safety.** Feeding `read_msg` arbitrary random bytes never
-//!      panics / never UB — it returns `Ok` or `Err`, full stop. A corrupt or
-//!      malicious peer must not be able to crash the reader.
-
 use decant_protocol::{
     read_msg, write_msg, Diagnostics, MemRegion, ModuleInfo, Pid, ProcessInfo, ProtoError, Request,
     Response,
 };
 use proptest::prelude::*;
 use std::io::Cursor;
-
-// ---------------------------------------------------------------------------
-// Strategies — build arbitrary instances of every domain/wire type.
-// ---------------------------------------------------------------------------
 
 fn arb_pid() -> impl Strategy<Value = Pid> {
     any::<u32>().prop_map(Pid)
@@ -56,11 +32,11 @@ fn arb_mem_region() -> impl Strategy<Value = MemRegion> {
 
 fn arb_diagnostics() -> impl Strategy<Value = Diagnostics> {
     (any::<String>(), any::<u64>(), any::<u64>(), any::<u64>()).prop_map(
-        |(connector, reads, writes, exec_wall_hits)| Diagnostics {
+        |(connector, reads, writes, unsupported_ops)| Diagnostics {
             connector,
             reads,
             writes,
-            exec_wall_hits,
+            unsupported_ops,
         },
     )
 }
@@ -75,7 +51,7 @@ fn arb_proto_error() -> impl Strategy<Value = ProtoError> {
             .prop_map(|(addr, len, reason)| ProtoError::ReadFailed { addr, len, reason }),
         (any::<u64>(), any::<String>())
             .prop_map(|(addr, reason)| ProtoError::WriteFailed { addr, reason }),
-        any::<String>().prop_map(|op| ProtoError::ExecutionWall { op }),
+        any::<String>().prop_map(|op| ProtoError::Unsupported { op }),
         any::<String>().prop_map(|message| ProtoError::Backend { message }),
     ]
 }
@@ -114,13 +90,7 @@ fn arb_response() -> impl Strategy<Value = Response> {
     ]
 }
 
-// ---------------------------------------------------------------------------
-// Properties.
-// ---------------------------------------------------------------------------
-
 proptest! {
-    /// Any `Request` survives write_msg -> read_msg unchanged, and the wire form
-    /// is byte-for-byte stable across a re-encode.
     #[test]
     fn request_roundtrips(req in arb_request()) {
         let mut buf = Vec::new();
@@ -130,17 +100,13 @@ proptest! {
         let got: Request = read_msg(&mut cur).unwrap();
         prop_assert_eq!(&req, &got);
 
-        // Byte-for-byte: re-encoding the decoded value reproduces the frame.
         let mut buf2 = Vec::new();
         write_msg(&mut buf2, &got).unwrap();
         prop_assert_eq!(&buf, &buf2);
 
-        // And the reader consumed exactly one frame (no trailing bytes left).
         prop_assert_eq!(cur.position() as usize, cur.get_ref().len());
     }
 
-    /// Same for every `Response` variant, including error variants and the
-    /// vector-carrying ones.
     #[test]
     fn response_roundtrips(resp in arb_response()) {
         let mut buf = Vec::new();
@@ -155,8 +121,6 @@ proptest! {
         prop_assert_eq!(&buf, &buf2);
     }
 
-    /// Two arbitrary messages written back-to-back read back in order, with no
-    /// frame bleeding into the next.
     #[test]
     fn two_messages_read_back_in_order(a in arb_request(), b in arb_response()) {
         let mut buf = Vec::new();
@@ -168,13 +132,9 @@ proptest! {
         let got_b: Response = read_msg(&mut cur).unwrap();
         prop_assert_eq!(a, got_a);
         prop_assert_eq!(b, got_b);
-        // Both frames fully consumed.
         prop_assert_eq!(cur.position() as usize, cur.get_ref().len());
     }
 
-    /// Feeding `read_msg` arbitrary bytes must never panic: it returns Ok (the
-    /// bytes happened to decode) or Err (length cap, truncation, bad payload).
-    /// A hostile peer cannot crash the reader. We decode at both wire types.
     #[test]
     fn random_bytes_never_panic(bytes in any::<Vec<u8>>()) {
         let mut cur = Cursor::new(&bytes);
@@ -182,12 +142,8 @@ proptest! {
 
         let mut cur = Cursor::new(&bytes);
         let _r: std::io::Result<Response> = read_msg(&mut cur);
-        // Reaching here without panicking is the assertion.
     }
 
-    /// A targeted variant of the above: a valid 4-byte length prefix followed by
-    /// arbitrary payload bytes. This explores the "well-framed but garbage
-    /// payload" path (bincode decode failure) rather than only random framing.
     #[test]
     fn framed_garbage_payload_never_panics(payload in prop::collection::vec(any::<u8>(), 0..512)) {
         let mut bytes = (payload.len() as u32).to_le_bytes().to_vec();
