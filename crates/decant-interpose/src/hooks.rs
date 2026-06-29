@@ -21,6 +21,88 @@ const MEM_PRIVATE: u32 = 0x20000;
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_UNSUCCESSFUL: i32 = 0xC000_0001u32 as i32;
 const STATUS_NOT_SUPPORTED: i32 = 0xC000_00BBu32 as i32;
+const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004u32 as i32;
+const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
+const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+const SYSTEM_PROCESS_INFORMATION: u32 = 5;
+const SPI_STRIDE: usize = 0x100;
+const PROCESS_IMAGE_FILE_NAME: u32 = 27;
+const PROCESS_WOW64_INFORMATION: u32 = 26;
+
+macro_rules! interpose_exports {
+    ($apply:ident) => {
+        $apply! {
+            b"GetProcAddress" => get_proc_address,
+            b"OpenProcess" => open_process,
+            b"ReadProcessMemory" => read_process_memory,
+            b"WriteProcessMemory" => write_process_memory,
+            b"NtReadVirtualMemory" => nt_read_virtual_memory,
+            b"NtWriteVirtualMemory" => nt_write_virtual_memory,
+            b"CloseHandle" => close_handle,
+            b"NtClose" => nt_close,
+            b"CreateToolhelp32Snapshot" => create_toolhelp32_snapshot,
+            b"Process32First" => process32_first,
+            b"Process32Next" => process32_next,
+            b"Process32FirstW" => process32_first_w,
+            b"Process32NextW" => process32_next_w,
+            b"Module32First" => module32_first,
+            b"Module32Next" => module32_next,
+            b"Module32FirstW" => module32_first_w,
+            b"Module32NextW" => module32_next_w,
+            b"EnumProcesses" => enum_processes,
+            b"K32EnumProcesses" => enum_processes,
+            b"EnumProcessModules" => enum_process_modules,
+            b"K32EnumProcessModules" => enum_process_modules,
+            b"GetModuleBaseNameA" => get_module_base_name_a,
+            b"K32GetModuleBaseNameA" => get_module_base_name_a,
+            b"GetModuleBaseNameW" => get_module_base_name_w,
+            b"K32GetModuleBaseNameW" => get_module_base_name_w,
+            b"GetModuleFileNameExA" => get_module_file_name_ex_a,
+            b"K32GetModuleFileNameExA" => get_module_file_name_ex_a,
+            b"GetModuleFileNameExW" => get_module_file_name_ex_w,
+            b"K32GetModuleFileNameExW" => get_module_file_name_ex_w,
+            b"VirtualProtectEx" => virtual_protect_ex,
+            b"VirtualQueryEx" => virtual_query_ex,
+            b"VirtualAllocEx" => virtual_alloc_ex,
+            b"VirtualFreeEx" => virtual_free_ex,
+            b"NtAllocateVirtualMemory" => nt_allocate_virtual_memory,
+            b"NtFreeVirtualMemory" => nt_free_virtual_memory,
+            b"CreateRemoteThread" => create_remote_thread,
+            b"CreateRemoteThreadEx" => create_remote_thread_ex,
+            b"NtCreateThreadEx" => nt_create_thread_ex,
+            b"NtQuerySystemInformation" => nt_query_system_information,
+            b"NtOpenProcess" => nt_open_process,
+            b"NtGetNextProcess" => nt_get_next_process,
+            b"Toolhelp32ReadProcessMemory" => toolhelp32_read_process_memory,
+            b"NtQueryInformationProcess" => nt_query_information_process,
+        }
+    };
+}
+
+macro_rules! do_install {
+    ($($n:expr => $f:ident),* $(,)?) => {{
+        let mut t = 0u32;
+        $( t += iat::patch_all_modules(None, $n, $f as *mut c_void); )*
+        t
+    }};
+}
+
+macro_rules! do_redirect {
+    ($($n:expr => $f:ident),* $(,)?) => {
+        pub(crate) unsafe fn redirect(name: *const u8) -> *mut c_void { unsafe {
+            $( if iat::cstr_eq(name, $n) { return $f as *mut c_void; } )*
+            core::ptr::null_mut()
+        }}
+    };
+}
+
+interpose_exports!(do_redirect);
+
+#[repr(C)]
+pub(crate) struct ClientId {
+    pub unique_process: usize,
+    pub unique_thread: usize,
+}
 
 #[repr(C)]
 pub struct MemoryBasicInformation {
@@ -838,61 +920,232 @@ pub unsafe extern "system" fn nt_create_thread_ex(
     STATUS_NOT_SUPPORTED
 }}
 
-pub unsafe fn install_all() -> u32 { unsafe {
-    originals::capture();
+pub unsafe extern "system" fn get_proc_address(module: *mut c_void, name: *const u8) -> *mut c_void { unsafe {
+    if (name as usize) >> 16 != 0 {
+        let r = redirect(name);
+        if !r.is_null() {
+            return r;
+        }
+        let r = crate::process_hooks::redirect(name);
+        if !r.is_null() {
+            return r;
+        }
+        let r = crate::module_hooks::redirect(name);
+        if !r.is_null() {
+            return r;
+        }
+    }
+    let orig = ORIGINALS.get_proc_address.load(Ordering::SeqCst);
+    if orig == 0 {
+        return core::ptr::null_mut();
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *const u8) -> *mut c_void = core::mem::transmute(orig);
+    f(module, name)
+}}
 
-    let mut total = 0u32;
-    macro_rules! patch {
-        ($name:expr_2021, $hook:expr_2021) => {
-            total += iat::patch_all_modules(None, $name, $hook as *mut c_void);
-        };
+pub unsafe extern "system" fn nt_query_system_information(
+    class: u32,
+    info: *mut c_void,
+    len: u32,
+    ret_len: *mut u32,
+) -> i32 { unsafe {
+    if class != SYSTEM_PROCESS_INFORMATION {
+        let orig = ORIGINALS.nt_query_system_information.load(Ordering::SeqCst);
+        if orig == 0 {
+            return STATUS_UNSUCCESSFUL;
+        }
+        let f: unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32 =
+            core::mem::transmute(orig);
+        return f(class, info, len, ret_len);
     }
 
-    patch!(b"OpenProcess", open_process);
-    patch!(b"ReadProcessMemory", read_process_memory);
-    patch!(b"WriteProcessMemory", write_process_memory);
-    patch!(b"NtReadVirtualMemory", nt_read_virtual_memory);
-    patch!(b"NtWriteVirtualMemory", nt_write_virtual_memory);
+    let list = match rpc::request(Request::ListProcesses) {
+        Some(Response::Processes(l)) => l,
+        _ => return STATUS_UNSUCCESSFUL,
+    };
 
-    patch!(b"CloseHandle", close_handle);
-    patch!(b"NtClose", nt_close);
+    let entry_size = |nb: usize| SPI_STRIDE + ((nb + 7) & !7);
+    let required: usize = list.iter().map(|p| entry_size(p.name.encode_utf16().count() * 2)).sum();
 
-    patch!(b"CreateToolhelp32Snapshot", create_toolhelp32_snapshot);
-    patch!(b"Process32First", process32_first);
-    patch!(b"Process32Next", process32_next);
-    patch!(b"Process32FirstW", process32_first_w);
-    patch!(b"Process32NextW", process32_next_w);
-    patch!(b"Module32First", module32_first);
-    patch!(b"Module32Next", module32_next);
-    patch!(b"Module32FirstW", module32_first_w);
-    patch!(b"Module32NextW", module32_next_w);
+    if !ret_len.is_null() {
+        *ret_len = required as u32;
+    }
+    if info.is_null() || (len as usize) < required {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
 
-    patch!(b"EnumProcesses", enum_processes);
-    patch!(b"K32EnumProcesses", enum_processes);
-    patch!(b"EnumProcessModules", enum_process_modules);
-    patch!(b"K32EnumProcessModules", enum_process_modules);
-    patch!(b"GetModuleBaseNameA", get_module_base_name_a);
-    patch!(b"K32GetModuleBaseNameA", get_module_base_name_a);
-    patch!(b"GetModuleBaseNameW", get_module_base_name_w);
-    patch!(b"K32GetModuleBaseNameW", get_module_base_name_w);
-    patch!(b"GetModuleFileNameExA", get_module_file_name_ex_a);
-    patch!(b"K32GetModuleFileNameExA", get_module_file_name_ex_a);
-    patch!(b"GetModuleFileNameExW", get_module_file_name_ex_w);
-    patch!(b"K32GetModuleFileNameExW", get_module_file_name_ex_w);
+    let base = info as *mut u8;
+    core::ptr::write_bytes(base, 0, required);
+    let mut off = 0usize;
+    for (i, p) in list.iter().enumerate() {
+        let entry = base.add(off);
+        let nb = p.name.encode_utf16().count() * 2;
+        let stride = entry_size(nb);
+        let next = if i + 1 == list.len() { 0u32 } else { stride as u32 };
 
-    patch!(b"VirtualProtectEx", virtual_protect_ex);
-    patch!(b"VirtualQueryEx", virtual_query_ex);
+        (entry as *mut u32).write_unaligned(next);
+        (entry.add(0x04) as *mut u32).write_unaligned(0);
+        (entry.add(0x38) as *mut u16).write_unaligned(nb as u16);
+        (entry.add(0x3A) as *mut u16).write_unaligned(nb as u16);
+        let name_ptr = entry.add(SPI_STRIDE);
+        (entry.add(0x40) as *mut u64).write_unaligned(name_ptr as u64);
+        (entry.add(0x50) as *mut u64).write_unaligned(p.pid.0 as u64);
 
-    patch!(b"VirtualAllocEx", virtual_alloc_ex);
-    patch!(b"VirtualFreeEx", virtual_free_ex);
-    patch!(b"NtAllocateVirtualMemory", nt_allocate_virtual_memory);
-    patch!(b"NtFreeVirtualMemory", nt_free_virtual_memory);
-    patch!(b"CreateRemoteThread", create_remote_thread);
-    patch!(b"CreateRemoteThreadEx", create_remote_thread_ex);
-    patch!(b"NtCreateThreadEx", nt_create_thread_ex);
+        let mut w = name_ptr as *mut u16;
+        for u in p.name.encode_utf16() {
+            w.write_unaligned(u);
+            w = w.add(1);
+        }
+        off += stride;
+    }
+    STATUS_SUCCESS
+}}
 
+pub unsafe extern "system" fn nt_open_process(
+    handle: *mut *mut c_void,
+    _access: u32,
+    _obj_attr: *mut c_void,
+    client_id: *const ClientId,
+) -> i32 { unsafe {
+    if handle.is_null() || client_id.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let pid = (*client_id).unique_process as u32;
+    match rpc::request(Request::ProcessByPid(Pid(pid))) {
+        Some(Response::Process(_)) => {
+            *handle = handle_table::open_process(Pid(pid)) as *mut c_void;
+            STATUS_SUCCESS
+        }
+        _ => STATUS_INVALID_PARAMETER,
+    }
+}}
+
+pub unsafe extern "system" fn nt_get_next_process(
+    process: *mut c_void,
+    _access: u32,
+    _attrs: u32,
+    _flags: u32,
+    new_process: *mut *mut c_void,
+) -> i32 { unsafe {
+    if new_process.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let list = match rpc::request(Request::ListProcesses) {
+        Some(Response::Processes(l)) => l,
+        _ => return STATUS_UNSUCCESSFUL,
+    };
+    let start = match handle_table::pid_for(process as usize) {
+        Some(cur) => list.iter().position(|p| p.pid == cur).map_or(0, |i| i + 1),
+        None => 0,
+    };
+    match list.get(start) {
+        Some(p) => {
+            *new_process = handle_table::open_process(p.pid) as *mut c_void;
+            STATUS_SUCCESS
+        }
+        None => STATUS_NO_MORE_ENTRIES,
+    }
+}}
+
+pub unsafe extern "system" fn toolhelp32_read_process_memory(
+    pid: u32,
+    base: *const c_void,
+    buffer: *mut c_void,
+    size: usize,
+    bytes_read: *mut usize,
+) -> i32 { unsafe {
+    if !bytes_read.is_null() {
+        *bytes_read = 0;
+    }
+    if buffer.is_null() || size == 0 {
+        return 0;
+    }
+    match rpc::request(Request::Read { pid: Pid(pid), addr: base as u64, len: size as u64 }) {
+        Some(Response::Data(data)) => {
+            let n = data.len().min(size);
+            if n == 0 {
+                return 0;
+            }
+            core::ptr::copy_nonoverlapping(data.as_ptr(), buffer as *mut u8, n);
+            if !bytes_read.is_null() {
+                *bytes_read = n;
+            }
+            1
+        }
+        _ => 0,
+    }
+}}
+
+pub unsafe extern "system" fn nt_query_information_process(
+    process: *mut c_void,
+    class: u32,
+    info: *mut c_void,
+    len: u32,
+    ret_len: *mut u32,
+) -> i32 { unsafe {
+    if !handle_table::is_synthetic(process as usize) {
+        let orig = ORIGINALS.nt_query_information_process.load(Ordering::SeqCst);
+        if orig == 0 {
+            return STATUS_UNSUCCESSFUL;
+        }
+        let f: unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut u32) -> i32 =
+            core::mem::transmute(orig);
+        return f(process, class, info, len, ret_len);
+    }
+    let pid = match handle_table::pid_for(process as usize) {
+        Some(p) => p,
+        None => return STATUS_INVALID_PARAMETER,
+    };
+    match class {
+        PROCESS_WOW64_INFORMATION => {
+            if info.is_null() || (len as usize) < 8 {
+                if !ret_len.is_null() {
+                    *ret_len = 8;
+                }
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            (info as *mut u64).write_unaligned(0);
+            if !ret_len.is_null() {
+                *ret_len = 8;
+            }
+            STATUS_SUCCESS
+        }
+        PROCESS_IMAGE_FILE_NAME => {
+            let name = match rpc::request(Request::ProcessByPid(pid)) {
+                Some(Response::Process(p)) => p.name,
+                _ => return STATUS_INVALID_PARAMETER,
+            };
+            let nb = name.encode_utf16().count() * 2;
+            let total = 0x10 + nb;
+            if info.is_null() || (len as usize) < total {
+                if !ret_len.is_null() {
+                    *ret_len = total as u32;
+                }
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            let base = info as *mut u8;
+            let buf = base.add(0x10);
+            (base as *mut u16).write_unaligned(nb as u16);
+            (base.add(0x02) as *mut u16).write_unaligned(nb as u16);
+            (base.add(0x08) as *mut u64).write_unaligned(buf as u64);
+            let mut w = buf as *mut u16;
+            for u in name.encode_utf16() {
+                w.write_unaligned(u);
+                w = w.add(1);
+            }
+            if !ret_len.is_null() {
+                *ret_len = total as u32;
+            }
+            STATUS_SUCCESS
+        }
+        _ => STATUS_INVALID_PARAMETER,
+    }
+}}
+
+pub unsafe fn install_all() -> u32 { unsafe {
+    originals::capture();
+    let mut total = interpose_exports!(do_install);
     total += crate::process_hooks::install();
     total += crate::module_hooks::install();
-
     total
 }}
