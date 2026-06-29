@@ -1,7 +1,8 @@
 use core::ffi::c_void;
 use core::sync::atomic::Ordering;
+use std::sync::Mutex;
 
-use decant_protocol::{Pid, Request, Response};
+use decant_protocol::{MemRegion, Pid, Request, Response};
 
 use crate::handle_table;
 use crate::iat;
@@ -17,6 +18,7 @@ const PAGE_READWRITE: u32 = 0x04;
 const PAGE_EXECUTE_READ: u32 = 0x20;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 const MEM_COMMIT: u32 = 0x1000;
+const MEM_FREE: u32 = 0x10000;
 const MEM_PRIVATE: u32 = 0x20000;
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_UNSUCCESSFUL: i32 = 0xC000_0001u32 as i32;
@@ -135,6 +137,62 @@ fn protect_flags(readable: bool, writable: bool, executable: bool) -> u32 {
         (true, false, false) => PAGE_READONLY,
         _ => PAGE_NOACCESS,
     }
+}
+
+struct RegionCache {
+    pid: Pid,
+    regions: Vec<MemRegion>,
+}
+
+static REGION_CACHE: Mutex<Option<RegionCache>> = Mutex::new(None);
+
+// A region walker queries upward from a low address; report committed regions and
+// span the gaps as free so the caller advances instead of stalling at the first hole.
+// The map is fetched once per walk (cached by pid, refreshed when the walk restarts at 0)
+// to avoid one daemon round trip per query.
+pub(crate) fn region_for(pid: Pid, addr: u64) -> Option<MemoryBasicInformation> {
+    let mut guard = REGION_CACHE.lock().ok()?;
+    let refresh = match guard.as_ref() {
+        Some(c) => c.pid != pid || addr == 0,
+        None => true,
+    };
+    if refresh {
+        let mut regions = match rpc::request(Request::MemoryMap(pid)) {
+            Some(Response::MemoryMap(r)) => r,
+            _ => return None,
+        };
+        regions.sort_by_key(|r| r.base);
+        *guard = Some(RegionCache { pid, regions });
+    }
+    let regions = &guard.as_ref()?.regions;
+
+    if let Some(r) = regions.iter().find(|r| addr >= r.base && addr < r.base + r.size) {
+        let p = protect_flags(r.readable, r.writable, r.executable);
+        return Some(MemoryBasicInformation {
+            base_address: r.base as usize,
+            allocation_base: r.base as usize,
+            allocation_protect: p,
+            __align1: 0,
+            region_size: r.size as usize,
+            state: MEM_COMMIT,
+            protect: p,
+            type_: MEM_PRIVATE,
+            __align2: 0,
+        });
+    }
+
+    let next = regions.iter().filter(|r| r.base > addr).map(|r| r.base).min()?;
+    Some(MemoryBasicInformation {
+        base_address: addr as usize,
+        allocation_base: 0,
+        allocation_protect: 0,
+        __align1: 0,
+        region_size: (next - addr) as usize,
+        state: MEM_FREE,
+        protect: PAGE_NOACCESS,
+        type_: 0,
+        __align2: 0,
+    })
 }
 
 type RpmFn = unsafe extern "system" fn(*mut c_void, *const c_void, *mut c_void, usize, *mut usize) -> i32;
@@ -738,26 +796,13 @@ pub unsafe extern "system" fn virtual_query_ex(
         if mbi.is_null() || length < core::mem::size_of::<MemoryBasicInformation>() {
             return 0;
         }
-        let addr = address as u64;
-        if let Some(Response::MemoryMap(regions)) = rpc::request(Request::MemoryMap(pid)) {
-            if let Some(r) = regions.iter().find(|r| addr >= r.base && addr < r.base + r.size) {
-                // protection is coarse; allocation history is not modeled
-                let info = MemoryBasicInformation {
-                    base_address: r.base as usize,
-                    allocation_base: r.base as usize,
-                    allocation_protect: protect_flags(r.readable, r.writable, r.executable),
-                    __align1: 0,
-                    region_size: r.size as usize,
-                    state: MEM_COMMIT,
-                    protect: protect_flags(r.readable, r.writable, r.executable),
-                    type_: MEM_PRIVATE,
-                    __align2: 0,
-                };
+        match region_for(pid, address as u64) {
+            Some(info) => {
                 *mbi = info;
                 return core::mem::size_of::<MemoryBasicInformation>();
             }
+            None => return 0,
         }
-        return 0;
     }
     let p = ORIGINALS.virtual_query_ex.load(Ordering::SeqCst);
     if p != 0 {
