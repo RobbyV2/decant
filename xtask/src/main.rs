@@ -28,6 +28,7 @@ fn main() -> ExitCode {
         "wine-smoke" => wine_smoke(),
         "inject-test" => inject_test(),
         "e2e" => e2e(),
+        "dynamic" => dynamic(),
         "demo" => demo(),
         other => {
             usage(other);
@@ -50,7 +51,7 @@ fn usage(unknown: &str) {
     }
     eprintln!(
         "usage: cargo xtask \
-         <setup|build-native|build-dll|test|test-live|wine-smoke|inject-test|e2e|demo>"
+         <setup|build-native|build-dll|test|test-live|wine-smoke|inject-test|e2e|dynamic|demo>"
     );
 }
 
@@ -208,6 +209,49 @@ fn inject_test() -> Result<()> {
     Ok(())
 }
 
+fn build_and_stage(root: &Path, stage_name: &str) -> Result<PathBuf> {
+    let out_dir = root.join("target").join(WIN_TARGET).join("debug");
+    let stage = root.join("target").join(stage_name);
+    std::fs::create_dir_all(&stage)
+        .with_context(|| format!("creating staging dir {}", stage.display()))?;
+    for name in ["decant_interpose.dll", "sample-tool.exe", "decant-launcher.exe"] {
+        let src = out_dir.join(name);
+        if !src.exists() {
+            bail!("expected build artifact missing: {}", src.display());
+        }
+        std::fs::copy(&src, stage.join(name)).with_context(|| format!("staging {name}"))?;
+    }
+    Ok(stage)
+}
+
+fn spawn_mock_daemon(root: &Path) -> Result<(std::process::Child, String)> {
+    let daemon_bin = root.join("target").join("debug").join("decant-daemon");
+    if !daemon_bin.exists() {
+        bail!("daemon binary missing: {}", daemon_bin.display());
+    }
+    let mut daemon = Command::new(&daemon_bin)
+        .args(["--backend", "mock", "--bind", "127.0.0.1:0"])
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawning decant-daemon")?;
+    let stdout = daemon
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("daemon stdout not captured"))?;
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).context("reading daemon listening line")?;
+    let endpoint = line
+        .split("listening on ")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("could not parse daemon port from: {line:?}"))?;
+    Ok((daemon, endpoint))
+}
+
 fn e2e() -> Result<()> {
     let root = repo_root();
 
@@ -224,46 +268,9 @@ fn e2e() -> Result<()> {
 
     setup()?;
 
-    let out_dir = root.join("target").join(WIN_TARGET).join("debug");
-    let stage = root.join("target").join("e2e-stage");
-    std::fs::create_dir_all(&stage)
-        .with_context(|| format!("creating staging dir {}", stage.display()))?;
-    for name in ["decant_interpose.dll", "sample-tool.exe", "decant-launcher.exe"] {
-        let src = out_dir.join(name);
-        if !src.exists() {
-            bail!("expected build artifact missing: {}", src.display());
-        }
-        std::fs::copy(&src, stage.join(name)).with_context(|| format!("staging {name}"))?;
-    }
+    let stage = build_and_stage(&root, "e2e-stage")?;
 
-    let daemon_bin = root.join("target").join("debug").join("decant-daemon");
-    if !daemon_bin.exists() {
-        bail!("daemon binary missing: {}", daemon_bin.display());
-    }
-    let mut daemon = Command::new(&daemon_bin)
-        .args(["--backend", "mock", "--bind", "127.0.0.1:0"])
-        .current_dir(&root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("spawning decant-daemon")?;
-
-    let endpoint = {
-        let stdout = daemon
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("daemon stdout not captured"))?;
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .context("reading daemon listening line")?;
-        line.split("listening on ")
-            .nth(1)
-            .and_then(|s| s.split_whitespace().next())
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("could not parse daemon port from: {line:?}"))?
-    };
+    let (mut daemon, endpoint) = spawn_mock_daemon(&root)?;
     println!("e2e: daemon up, DECANT_ENDPOINT={endpoint}");
 
     let launcher = stage.join("decant-launcher.exe");
@@ -306,6 +313,50 @@ fn e2e() -> Result<()> {
     }
 
     println!("e2e: PASS");
+    Ok(())
+}
+
+fn dynamic() -> Result<()> {
+    let root = repo_root();
+
+    let mut wbuild = cargo();
+    wbuild.args([
+        "build", "--target", WIN_TARGET, "-p", "decant-interpose", "-p", "sample-tool", "-p",
+        "decant-launcher",
+    ]);
+    run("cargo build carafe + sample-tool + launcher", &mut wbuild)?;
+    run("cargo build daemon", cargo().args(["build", "-p", "decant-daemon"]))?;
+
+    setup()?;
+
+    let stage = build_and_stage(&root, "dynamic-stage")?;
+
+    let (mut daemon, endpoint) = spawn_mock_daemon(&root)?;
+    println!("dynamic: daemon up, DECANT_ENDPOINT={endpoint}");
+
+    let launcher = stage.join("decant-launcher.exe");
+    let prefix = root.join("wine-env").join("prefix");
+    let run_result = run_under_wine(
+        &launcher,
+        &["sample-tool.exe", "--dynamic"],
+        &prefix,
+        &[("DECANT_AUTOHOOK", "1"), ("DECANT_ENDPOINT", &endpoint)],
+    );
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    let out = run_result.context("running sample-tool --dynamic under Wine via launcher")?;
+    for l in out.stdout.lines() {
+        println!("{l}");
+    }
+    if !out.stderr.trim().is_empty() {
+        eprintln!("sample-tool stderr\n{}", out.stderr.trim());
+    }
+    if out.status != 0 || !out.stdout.contains("sample-tool dynamic: ALL PASS") {
+        bail!("dynamic: FAIL (exit={}, missing 'sample-tool dynamic: ALL PASS')", out.status);
+    }
+    println!("dynamic: PASS");
     Ok(())
 }
 

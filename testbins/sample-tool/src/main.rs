@@ -127,6 +127,10 @@ fn main() -> ExitCode {
         return run_interception_selftest();
     }
 
+    if args.iter().any(|a| a == "--dynamic") {
+        return run_dynamic();
+    }
+
     if let Ok(pid) = std::env::var("DECANT_TARGET_PID") {
         return run_target(&pid);
     }
@@ -372,6 +376,133 @@ fn run_interception_selftest() -> ExitCode {
         println!("passthrough");
     }
     ExitCode::SUCCESS
+}
+
+type NtQSI = unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32;
+type OpenProcFn = unsafe extern "system" fn(u32, i32, u32) -> Handle;
+type RpmFn = unsafe extern "system" fn(Handle, *const c_void, *mut c_void, usize, *mut usize) -> i32;
+type WpmFn = unsafe extern "system" fn(Handle, *mut c_void, *const c_void, usize, *mut usize) -> i32;
+
+const SYSTEM_PROCESS_INFORMATION: u32 = 5;
+
+unsafe fn resolve(module: &[u8], name: &[u8]) -> *mut c_void {
+    unsafe {
+        let h = LoadLibraryA(module.as_ptr());
+        if h.is_null() {
+            return std::ptr::null_mut();
+        }
+        GetProcAddress(h, name.as_ptr())
+    }
+}
+
+fn find_dynamic_pid() -> Option<u32> {
+    unsafe {
+        let p = resolve(b"ntdll.dll\0", b"NtQuerySystemInformation\0");
+        if p.is_null() {
+            return None;
+        }
+        let nt_qsi: NtQSI = std::mem::transmute(p);
+        let mut need: u32 = 0;
+        nt_qsi(SYSTEM_PROCESS_INFORMATION, std::ptr::null_mut(), 0, &mut need);
+        if need == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; need as usize + 0x1000];
+        let st = nt_qsi(
+            SYSTEM_PROCESS_INFORMATION,
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len() as u32,
+            &mut need,
+        );
+        if st != 0 {
+            return None;
+        }
+        let mut off = 0usize;
+        loop {
+            let entry = buf.as_ptr().add(off);
+            let next = (entry as *const u32).read_unaligned();
+            let name_len = (entry.add(0x38) as *const u16).read_unaligned() as usize;
+            let name_buf = (entry.add(0x40) as *const u64).read_unaligned() as *const u16;
+            let pid = (entry.add(0x50) as *const u64).read_unaligned() as u32;
+            if !name_buf.is_null() && name_len > 0 {
+                let units = std::slice::from_raw_parts(name_buf, name_len / 2);
+                if String::from_utf16_lossy(units) == DEMO_MODULE_NAME {
+                    return Some(pid);
+                }
+            }
+            if next == 0 {
+                break;
+            }
+            off += next as usize;
+        }
+        None
+    }
+}
+
+fn run_dynamic() -> ExitCode {
+    let mut all_pass = true;
+
+    let pid = find_dynamic_pid();
+    let enum_ok = pid == Some(DEMO_TARGET_PID);
+    check(&mut all_pass, "dynamic_enumerate", enum_ok, &format!("found pid {pid:?}"));
+    let pid = match pid {
+        Some(p) => p,
+        None => {
+            println!("sample-tool dynamic: ABORT (NtQuerySystemInformation did not route)");
+            return ExitCode::from(30);
+        }
+    };
+
+    unsafe {
+        let open: OpenProcFn = std::mem::transmute(resolve(b"kernel32.dll\0", b"OpenProcess\0"));
+        let rpm: RpmFn = std::mem::transmute(resolve(b"kernel32.dll\0", b"ReadProcessMemory\0"));
+        let wpm: WpmFn = std::mem::transmute(resolve(b"kernel32.dll\0", b"WriteProcessMemory\0"));
+
+        let proc = open(PROCESS_ALL_ACCESS, 0, pid);
+        check(&mut all_pass, "dynamic_open", !proc.is_null(), &format!("handle={proc:?}"));
+
+        let mut magic = [0u8; 16];
+        let mut n: usize = 0;
+        let read_ok = rpm(
+            proc,
+            DEMO_MAGIC_ADDR as *const c_void,
+            magic.as_mut_ptr() as *mut c_void,
+            16,
+            &mut n,
+        ) != 0
+            && magic == DEMO_MAGIC;
+        check(&mut all_pass, "dynamic_read_magic", read_ok, &format!("got={:02X?}", &magic));
+
+        let payload: [u8; 8] = [0xAA, 0xBB, 0xCC, 0xDD, 0x01, 0x02, 0x03, 0x04];
+        let mut nb: usize = 0;
+        let wrote = wpm(
+            proc,
+            DEMO_SLOT_ADDR as *mut c_void,
+            payload.as_ptr() as *const c_void,
+            8,
+            &mut nb,
+        ) != 0;
+        let mut back = [0u8; 8];
+        let read_back = rpm(
+            proc,
+            DEMO_SLOT_ADDR as *const c_void,
+            back.as_mut_ptr() as *mut c_void,
+            8,
+            &mut n,
+        ) != 0;
+        let write_ok = wrote && read_back && back == payload;
+        check(&mut all_pass, "dynamic_write", write_ok, &format!("readback={:02X?}", &back));
+
+        CloseHandle(proc);
+    }
+
+    if all_pass {
+        println!("sample-tool dynamic: ALL PASS");
+        ExitCode::SUCCESS
+    } else {
+        println!("sample-tool dynamic: FAILED");
+        ExitCode::from(31)
+    }
 }
 
 fn install_via_loadlibrary() -> Result<(), ExitCode> {
