@@ -8,7 +8,7 @@
   <img src="https://img.shields.io/badge/target-x86__64-lightgrey" alt="x86_64">
 </p>
 
-Run an **unmodified** Windows memory-editing tool (Cheat Engine style) under Wine on Linux, with its memory reads and writes redirected to a **separate running Windows VM** via [memflow](https://github.com/memflow/memflow).
+Run an **unmodified** Windows memory-editing tool (like Cheat Engine) under Wine on Linux, with its memory reads and writes redirected to a **separate running Windows VM** via [memflow](https://github.com/memflow/memflow).
 
 The tool sees a local Windows process. The bytes come from the guest VM, read out-of-band by the hypervisor. Decant is passive introspection: it reads and writes *existing* guest memory from the outside, and does not execute guest code.
 
@@ -170,6 +170,23 @@ Usage notes (memflow over QEMU/KVM):
 - KVM needs root (`/dev/memflow` is `root:root`). The backend connects before binding the socket, so a failure exits with a message instead of leaving a partial server.
 - Write to stable memory (zero padding), not active heap. Actively-used slots get reclaimed during a test.
 
+## Running a tool under the interposer
+
+`wine-env/run.sh` runs any unmodified Windows tool under the isolated prefix with the
+carafe injected and pointed at a daemon. It co-locates `decant-launcher.exe` and
+`decant_interpose.dll` next to the target, starts it suspended, injects the carafe, and
+connects to `DECANT_ENDPOINT` (default `127.0.0.1:7878`).
+
+```bash
+DECANT_ENDPOINT=127.0.0.1:7878 wine-env/run.sh path/to/tool.exe [args]
+```
+
+The tool sees the guest: its process list (served from `NtQuerySystemInformation`),
+scans, and reads and writes all route to the daemon. Install a GUI tool into the prefix
+first with `WINEPREFIX="$PWD/wine-env/prefix" wine installer.exe`, then point `run.sh` at
+its executable. If a window fails to map after an interrupted run, reset the prefix with
+`WINEPREFIX="$PWD/wine-env/prefix" wineserver -k` before relaunching.
+
 ## Limits
 
 memflow reads and writes existing memory and enumerates or resolves. It does not run guest
@@ -190,7 +207,7 @@ Notes:
 
 - Hooks are event-driven; Decant polls. It cannot deliver a `SetWindowsHookEx`-style callback.
 - There is no atomic read-modify-write across the VM boundary, and a paged-out guest page reads as not-present (a `ReadFailed`, not truncated bytes).
-- Interception is by IAT patching, so a tool that imports the Win32 memory APIs directly (for example the bundled `sample-tool`) routes through the interposer and reaches the guest. A tool that resolves those APIs at runtime through a function pointer, or enumerates processes via `NtQuerySystemInformation` (for example Cheat Engine), is not captured by IAT patching and does not route. The carafe patches the static import slots; calls that never go through those slots are not seen.
+- Interception covers both static and runtime resolution. The carafe patches the IAT, so a tool that imports the Win32 memory APIs directly (the bundled `sample-tool`) routes through those slots; it also hooks `GetProcAddress`, so a tool that resolves the memory APIs at runtime through a function pointer reaches the interposer too. Process enumeration via `NtQuerySystemInformation`, the `NtOpenProcess` and `NtGetNextProcess` openers, `Toolhelp32ReadProcessMemory`, and the `NtQueryInformationProcess` image classes are served from the daemon as well. A tool is reached as long as its call goes through a public Win32/NT export. The runtime-resolution path is validated by `cargo xtask dynamic`, which drives a tool that resolves every memory API only through `GetProcAddress` and enumerates only through `NtQuerySystemInformation`. What stays unsupported is guest code execution (see the table above).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) section 3.
 
