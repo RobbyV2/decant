@@ -1,0 +1,20 @@
+[package]
+name = "decant"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Read and write a Windows VM guest's memory from Linux via memflow. Library facade over the memory backend, the scanner and resolver, and the daemon client."
+
+[features]
+default = []
+memflow = ["decant-memflow/memflow"]
+
+[dependencies]
+decant-protocol = { path = "../decant-protocol" }
+decant-backend = { path = "../decant-backend" }
+decant-core = { path = "../decant-core" }
+decant-client = { path = "../decant-client" }
+decant-memflow = { path = "../decant-memflow" }
+
+[dev-dependencies]
+decant-daemon = { path = "../decant-daemon" }

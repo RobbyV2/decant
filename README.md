@@ -67,6 +67,26 @@ Translating these once covers every Win32 API above them.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## Library
+
+Use Decant as a crate. Embed a backend in your own program, or connect to a daemon.
+
+```rust
+use decant::prelude::*;
+
+// In-process backend, the way memflow is used (MemflowBackend needs --features memflow):
+let backend = MemflowBackend::connect("kvm")?;
+let proc = backend.process_by_name("notepad.exe")?;
+let hits = scan(&backend, proc.pid, &Pattern::parse("DE CA ?? EF")?)?;
+let addr = resolve(&backend, proc.pid, 0x140010200, &[0x10])?;
+let bytes = backend.read(proc.pid, addr, 4)?;
+
+// Or talk to a running daemon over the network:
+let mut client = Client::new("127.0.0.1:7878");
+let procs = client.processes()?;
+client.write(Pid(1234), 0x140010400, &[0xAA; 4])?;
+```
+
 ## Quickstart (offline, no VM)
 
 ```bash
@@ -120,7 +140,7 @@ $ decant-cli diagnostics
 connector: memflow:kvm   reads: 42  writes: 3  unsupported_ops: 0
 ```
 
-Full set: `processes`, `modules <pid>`, `exports <pid> <module>`, `read <pid> <addr> <len>`, `write <pid> <addr> <hexbytes>`, `memory-map <pid>`, `scan <pid> "<AOB>"`, `resolve <pid> <base> <off>...`, `diagnostics`.
+Full set: `processes`, `modules <pid>`, `exports <pid> <module>`, `read <pid> <addr> <len>`, `write <pid> <addr> <hexbytes>`, `memory-map <pid>`, `scan <pid> "<AOB>"`, `resolve <pid> <base> <off>...`, `diagnostics`. Add `--json` for machine-readable output.
 
 ## Running the daemon
 
@@ -192,7 +212,9 @@ with `--target x86_64-pc-windows-gnu` (ADR-0003). x86_64 throughout (ADR-0004).
 
 | Path | Target | Role |
 |---|---|---|
+| `crates/decant` | host | Library facade: re-exports backends, scanner and resolver, and the client |
 | `crates/decant-protocol` | host + win-gnu | Wire contract and shared domain types; `write_msg`/`read_msg` framing |
+| `crates/decant-client` | host + win-gnu | Daemon client over decant-protocol |
 | `crates/decant-backend` | host | `MemoryBackend` trait, `MockBackend`, `MockGuest` |
 | `crates/decant-memflow` | host | `MemflowBackend` (VM, feature-gated) |
 | `crates/decant-core` | host | AOB scanner and pointer-chain resolver |

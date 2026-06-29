@@ -11,3 +11,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 decant-protocol = { path = "../decant-protocol" }
+decant-client = { path = "../decant-client" }

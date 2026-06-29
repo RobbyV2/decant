@@ -297,3 +297,28 @@ markers). Manual: build `-p decant-interpose -p mock-cheat -p decant-launcher
 --target x86_64-pc-windows-gnu`, co-locate the three artifacts, then under the
 prefix `wine mock-cheat.exe --cooperative` (cooperative bootstrap) and
 `DECANT_AUTOHOOK=1 wine decant-launcher.exe mock-cheat.exe` (launcher injection).
+
+## ADR-0007: Library facade (`decant`) and a shared client (`decant-client`)
+
+**Status:** Accepted
+
+**Context.** Decant is usable three ways: embed a backend in a Rust program the way
+memflow is used, connect to a running daemon, or drive it from the CLI. The RPC
+client logic existed twice, in the CLI and in the interposer, duplicating the
+connect, frame, and reconnect handling.
+
+**Decision.** One `decant-client` crate holds `Client` (lazy connect, reconnect-once,
+typed methods over `decant-protocol`). It depends only on `decant-protocol` and
+`thiserror`, so it builds for the host and for `x86_64-pc-windows-gnu`. The CLI, the
+interposer, and library users all use it. A top-level `decant` crate re-exports the
+backend trait, `MockBackend`/`MockGuest`, the scanner and resolver, `MemflowBackend`
+(behind the `memflow` feature), and `Client`, with a `prelude`, so a consumer writes
+`use decant::prelude::*`.
+
+**Consequences.**
+- The client lives in one place; the interposer `rpc` module is a thin wrapper over it.
+- Two usage modes from one import: an in-process backend (`MockBackend` or
+  `MemflowBackend`) with `scan`/`resolve`, or a remote `Client` against a daemon.
+- `decant-client` carries no host-only dependency, so the interposer keeps building
+  for windows-gnu.
+- The CLI gains `--json` for machine-readable output; the default stays human-readable.

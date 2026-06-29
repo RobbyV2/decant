@@ -1,16 +1,18 @@
-use std::io::Write as _;
-use std::net::TcpStream;
 use std::process::ExitCode;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-use decant_protocol::{read_msg, write_msg, Pid, Request, Response};
+use decant_client::Client;
+use decant_protocol::{Pid, Request, Response};
 
 #[derive(Debug, Parser)]
 #[command(name = "decant-cli", about = "Drive the Decant daemon")]
 struct Cli {
     #[arg(long, env = "DECANT_ENDPOINT", default_value = "127.0.0.1:7878")]
     endpoint: String,
+
+    #[arg(long)]
+    json: bool,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -41,101 +43,25 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    match cli.cmd {
-        Cmd::Processes => {
-            let resp = request(&cli.endpoint, Request::ListProcesses)?;
-            for p in expect_processes(resp)? {
-                println!("{:<8} {}", p.pid, p.name);
-            }
-        }
-        Cmd::Modules { pid } => {
-            let resp = request(&cli.endpoint, Request::ModuleList(Pid(pid)))?;
-            match resp {
-                Response::Modules(ms) => {
-                    for m in ms {
-                        println!("{:#018x}  {:>10}  {}", m.base, m.size, m.name);
-                    }
-                }
-                other => bail!(unexpected(other)),
-            }
-        }
-        Cmd::Exports { pid, module } => {
-            let resp = request(&cli.endpoint, Request::ModuleExports(Pid(pid), module))?;
-            match resp {
-                Response::Exports(ex) => {
-                    for (name, addr) in ex {
-                        println!("{addr:#018x}  {name}");
-                    }
-                }
-                other => bail!(unexpected(other)),
-            }
-        }
+    let mut client = Client::new(&cli.endpoint);
+
+    let (req, read_base): (Request, Option<u64>) = match cli.cmd {
+        Cmd::Processes => (Request::ListProcesses, None),
+        Cmd::Modules { pid } => (Request::ModuleList(Pid(pid)), None),
+        Cmd::Exports { pid, module } => (Request::ModuleExports(Pid(pid), module), None),
         Cmd::Read { pid, addr, len } => {
             let addr = parse_u64(&addr).context("parsing ADDR")?;
             let len = parse_u64(&len).context("parsing LEN")?;
-            let resp = request(&cli.endpoint, Request::Read { pid: Pid(pid), addr, len })?;
-            match resp {
-                Response::Data(bytes) => hexdump(addr, &bytes),
-                other => bail!(unexpected(other)),
-            }
+            (Request::Read { pid: Pid(pid), addr, len }, Some(addr))
         }
         Cmd::Write { pid, addr, hexbytes } => {
             let addr = parse_u64(&addr).context("parsing ADDR")?;
             let data = parse_hex(&hexbytes).context("parsing hex bytes")?;
-            let resp = request(&cli.endpoint, Request::Write { pid: Pid(pid), addr, data })?;
-            match resp {
-                Response::Written(n) => println!("wrote {n} bytes at {addr:#x}"),
-                other => bail!(unexpected(other)),
-            }
+            (Request::Write { pid: Pid(pid), addr, data }, None)
         }
-        Cmd::MemoryMap { pid } => {
-            let resp = request(&cli.endpoint, Request::MemoryMap(Pid(pid)))?;
-            match resp {
-                Response::MemoryMap(regions) => {
-                    for r in regions {
-                        let perms = [
-                            if r.readable { 'r' } else { '-' },
-                            if r.writable { 'w' } else { '-' },
-                            if r.executable { 'x' } else { '-' },
-                        ];
-                        let perms: String = perms.iter().collect();
-                        println!(
-                            "{:#018x}-{:#018x}  {perms}  ({} bytes)",
-                            r.base,
-                            r.base + r.size,
-                            r.size
-                        );
-                    }
-                }
-                other => bail!(unexpected(other)),
-            }
-        }
-        Cmd::Diagnostics => {
-            let resp = request(&cli.endpoint, Request::Diagnostics)?;
-            match resp {
-                Response::Diagnostics(d) => {
-                    println!("connector:       {}", d.connector);
-                    println!("reads:           {}", d.reads);
-                    println!("writes:          {}", d.writes);
-                    println!("unsupported ops: {}", d.unsupported_ops);
-                }
-                other => bail!(unexpected(other)),
-            }
-        }
-        Cmd::Scan { pid, pattern } => {
-            let resp = request(&cli.endpoint, Request::Scan { pid: Pid(pid), pattern })?;
-            match resp {
-                Response::ScanHits(hits) => {
-                    if hits.is_empty() {
-                        println!("(no matches)");
-                    }
-                    for addr in hits {
-                        println!("{addr:#018x}");
-                    }
-                }
-                other => bail!(unexpected(other)),
-            }
-        }
+        Cmd::MemoryMap { pid } => (Request::MemoryMap(Pid(pid)), None),
+        Cmd::Diagnostics => (Request::Diagnostics, None),
+        Cmd::Scan { pid, pattern } => (Request::Scan { pid: Pid(pid), pattern }, None),
         Cmd::Resolve { pid, base, offsets } => {
             let base = parse_u64(&base).context("parsing BASE")?;
             let offsets = offsets
@@ -143,54 +69,83 @@ fn run() -> Result<()> {
                 .map(|o| parse_u64(o))
                 .collect::<Result<Vec<_>>>()
                 .context("parsing offsets")?;
-            let resp = request(&cli.endpoint, Request::Resolve { pid: Pid(pid), base, offsets })?;
-            match resp {
-                Response::Resolved { address, value } => {
-                    print!("{address:#018x}");
-                    if value.len() == 8 {
-                        let v = u64::from_le_bytes(value.clone().try_into().unwrap());
-                        print!("  ->  u64={v:#x} ({v})");
-                    }
-                    println!();
-                }
-                other => bail!(unexpected(other)),
+            (Request::Resolve { pid: Pid(pid), base, offsets }, None)
+        }
+    };
+
+    let resp = client.send(req).context("daemon request")?;
+    emit(resp, cli.json, read_base)
+}
+
+fn emit(resp: Response, json: bool, read_base: Option<u64>) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+        return Ok(());
+    }
+    match resp {
+        Response::Processes(ps) => {
+            for p in ps {
+                println!("{:<8} {}", p.pid, p.name);
             }
         }
+        Response::Modules(ms) => {
+            for m in ms {
+                println!("{:#018x}  {:>10}  {}", m.base, m.size, m.name);
+            }
+        }
+        Response::Exports(ex) => {
+            for (name, addr) in ex {
+                println!("{addr:#018x}  {name}");
+            }
+        }
+        Response::Data(bytes) => hexdump(read_base.unwrap_or(0), &bytes),
+        Response::Written(n) => println!("wrote {n} bytes"),
+        Response::MemoryMap(regions) => {
+            for r in regions {
+                let perms: String = [
+                    if r.readable { 'r' } else { '-' },
+                    if r.writable { 'w' } else { '-' },
+                    if r.executable { 'x' } else { '-' },
+                ]
+                .iter()
+                .collect();
+                println!("{:#018x}-{:#018x}  {perms}  ({} bytes)", r.base, r.base + r.size, r.size);
+            }
+        }
+        Response::Diagnostics(d) => {
+            println!("connector:       {}", d.connector);
+            println!("reads:           {}", d.reads);
+            println!("writes:          {}", d.writes);
+            println!("unsupported ops: {}", d.unsupported_ops);
+        }
+        Response::ScanHits(hits) => {
+            if hits.is_empty() {
+                println!("(no matches)");
+            }
+            for addr in hits {
+                println!("{addr:#018x}");
+            }
+        }
+        Response::Resolved { address, value } => {
+            print!("{address:#018x}");
+            if let Ok(bytes) = <[u8; 8]>::try_from(value.as_slice()) {
+                let v = u64::from_le_bytes(bytes);
+                print!("  ->  u64={v:#x} ({v})");
+            }
+            println!();
+        }
+        Response::Err(e) => bail!("daemon error: {e}"),
+        other => bail!("unexpected response: {other:?}"),
     }
     Ok(())
 }
 
-fn request(endpoint: &str, req: Request) -> Result<Response> {
-    let mut stream = TcpStream::connect(endpoint)
-        .with_context(|| format!("connecting to daemon at {endpoint}"))?;
-    write_msg(&mut stream, &req).context("sending request")?;
-    stream.flush().ok();
-    let resp: Response = read_msg(&mut stream).context("reading response")?;
-    Ok(resp)
-}
-
-fn expect_processes(resp: Response) -> Result<Vec<decant_protocol::ProcessInfo>> {
-    match resp {
-        Response::Processes(p) => Ok(p),
-        other => Err(anyhow!(unexpected(other))),
-    }
-}
-
-fn unexpected(resp: Response) -> String {
-    match resp {
-        Response::Err(e) => format!("daemon error: {e}"),
-        other => format!("unexpected response: {other:?}"),
-    }
-}
-
 fn parse_u64(s: &str) -> Result<u64> {
     let s = s.trim();
-    let v = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        u64::from_str_radix(hex, 16)?
-    } else {
-        s.parse::<u64>()?
-    };
-    Ok(v)
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => Ok(u64::from_str_radix(hex, 16)?),
+        None => Ok(s.parse::<u64>()?),
+    }
 }
 
 fn parse_hex(s: &str) -> Result<Vec<u8>> {

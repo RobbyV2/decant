@@ -1,0 +1,10 @@
+[package]
+name = "decant-client"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Client for the Decant daemon over decant-protocol. Builds for host and windows-gnu."
+
+[dependencies]
+decant-protocol = { path = "../decant-protocol" }
+thiserror.workspace = true
