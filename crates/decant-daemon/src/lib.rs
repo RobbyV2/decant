@@ -95,6 +95,11 @@ pub fn dispatch(req: Request, backend: &dyn MemoryBackend, diag: &Diag) -> Respo
                 Err(e) => Response::Err(core_err_to_proto(e)),
             }
         }
+        Request::ReportUnsupported { op } => {
+            diag.unsupported_ops.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(%op, "unsupported operation refused at the interposer");
+            Response::Pong
+        }
     }
 }
 

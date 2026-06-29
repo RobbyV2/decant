@@ -274,29 +274,39 @@ fn e2e() -> Result<()> {
         &prefix,
         &[("DECANT_AUTOHOOK", "1"), ("DECANT_ENDPOINT", &endpoint)],
     );
+
+    let diag = decant_client::Client::new(&endpoint)
+        .diagnostics()
+        .context("querying daemon diagnostics");
+
     let _ = daemon.kill();
     let _ = daemon.wait();
 
     let out = run_result.context("running mock-cheat under Wine via launcher")?;
 
-    println!("--- mock-cheat output ---");
+    println!("mock-cheat output");
     for l in out.stdout.lines() {
         println!("{l}");
     }
     if !out.stderr.trim().is_empty() {
-        eprintln!("--- mock-cheat stderr ---\n{}", out.stderr.trim());
+        eprintln!("mock-cheat stderr\n{}", out.stderr.trim());
     }
-    println!("-------------------------");
 
-    if out.status == 0 && out.stdout.contains("mock-cheat: ALL PASS") {
-        println!("e2e: PASS");
-        Ok(())
-    } else {
+    if out.status != 0 || !out.stdout.contains("mock-cheat: ALL PASS") {
         bail!(
             "e2e: FAIL (exit={}, missing 'mock-cheat: ALL PASS'). See check lines above.",
             out.status
         );
     }
+
+    let diag = diag?;
+    println!("e2e: daemon reports unsupported_ops={}", diag.unsupported_ops);
+    if diag.unsupported_ops < 1 {
+        bail!("e2e: FAIL (expected unsupported_ops >= 1 after the refused VirtualAllocEx)");
+    }
+
+    println!("e2e: PASS");
+    Ok(())
 }
 
 fn demo() -> Result<()> {

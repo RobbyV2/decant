@@ -118,6 +118,20 @@ architecture:
    synthesize an allocation or a thread.** Read, write, scan, and pointer-resolve
    are fully supported; anything beyond these limits fails clearly.
 
+The carafe intercepts the execution-export surface that carries a guest process
+handle and refuses it clearly rather than reporting a false success:
+`VirtualAllocEx`/`VirtualFreeEx`, `NtAllocateVirtualMemory`/`NtFreeVirtualMemory`,
+`CreateRemoteThread`/`CreateRemoteThreadEx`, and `NtCreateThreadEx` return their
+documented failure sentinel (null or `STATUS_NOT_SUPPORTED`) when the handle is
+synthetic, report the refusal to the daemon (incrementing
+`Diagnostics::unsupported_ops`), and write a message to the tool's stderr.
+
+`SetWindowsHookEx` and `QueueUserAPC` are deliberately left forwarded. Neither
+carries a guest process handle: an event hook targets the local Wine session and
+an APC targets a thread handle Decant never mints, so installing an event hook or
+queueing an APC against the guest is not expressible through the handle model and
+is not attempted. Intercepting them would only break the tool's own legitimate use.
+
 (Note the layering distinction: the carafe DLL *is* injected into the Wine-hosted
 tool, which is host-side Wine process manipulation. The
 unsupported-operation limit is specifically about the *guest VM*, which memflow

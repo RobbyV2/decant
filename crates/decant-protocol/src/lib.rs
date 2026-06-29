@@ -97,6 +97,7 @@ pub enum Request {
     Diagnostics,
     Scan { pid: Pid, pattern: String },
     Resolve { pid: Pid, base: u64, offsets: Vec<u64> },
+    ReportUnsupported { op: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +187,7 @@ mod tests {
         roundtrip_req(Request::Diagnostics);
         roundtrip_req(Request::Scan { pid: Pid(7), pattern: "DE CA ?? 00".into() });
         roundtrip_req(Request::Resolve { pid: Pid(7), base: 0x1000, offsets: vec![0x10, 0x18] });
+        roundtrip_req(Request::ReportUnsupported { op: "VirtualAllocEx".into() });
     }
 
     #[test]

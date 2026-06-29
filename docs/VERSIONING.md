@@ -94,3 +94,11 @@ This is an accepted limitation:
   (`docs/ARCHITECTURE.md` section 3): even a raw syscall in the *guest* cannot make memflow
   run guest code. The limitation concerns interception visibility in the Wine-hosted
   tool; it does not give the tool new power over the guest.
+
+A second coverage boundary: `SetWindowsHookEx` and `QueueUserAPC` are forwarded
+to the real Wine builtin, not intercepted. Neither carries a guest process
+handle. An event hook targets the local Wine session and an APC targets a thread
+handle Decant never mints, so installing an event hook or queueing an APC against
+the guest is not expressible through the handle model and is not attempted.
+Interposing them would only break the tool's own legitimate use of the local
+Wine session.

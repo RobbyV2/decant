@@ -16,6 +16,22 @@ const DEMO_SLOT_ADDR: u64 = 0x0001_4001_0400;
 
 const PROCESS_ALL_ACCESS: u32 = 0x001F_FFFF;
 const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+const MEM_COMMIT_RESERVE: u32 = 0x3000;
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const PAGE_NOACCESS: u32 = 0x01;
+
+#[repr(C)]
+struct MemoryBasicInformation {
+    base_address: usize,
+    allocation_base: usize,
+    allocation_protect: u32,
+    align1: u32,
+    region_size: usize,
+    state: u32,
+    protect: u32,
+    type_: u32,
+    align2: u32,
+}
 
 #[repr(C)]
 struct ProcessEntry32 {
@@ -55,6 +71,19 @@ extern "system" {
     fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> Handle;
     fn Process32First(snapshot: Handle, entry: *mut ProcessEntry32) -> i32;
     fn Process32Next(snapshot: Handle, entry: *mut ProcessEntry32) -> i32;
+    fn VirtualAllocEx(
+        process: Handle,
+        address: *mut c_void,
+        size: usize,
+        alloc_type: u32,
+        protect: u32,
+    ) -> *mut c_void;
+    fn VirtualQueryEx(
+        process: Handle,
+        address: *const c_void,
+        mbi: *mut MemoryBasicInformation,
+        length: usize,
+    ) -> usize;
 }
 
 #[link(name = "psapi")]
@@ -161,6 +190,24 @@ fn run_checks() -> ExitCode {
     } != 0
         && probe == sentinel;
     check(&mut all_pass, "real_handle_forward", real_ok, &format!("own-memory readback={:02X?}", &probe));
+
+    let alloc = unsafe {
+        VirtualAllocEx(proc, std::ptr::null_mut(), 0x1000, MEM_COMMIT_RESERVE, PAGE_EXECUTE_READWRITE)
+    };
+    let alloc_refused = alloc.is_null();
+    check(&mut all_pass, "alloc_ex_refused", alloc_refused, &format!("VirtualAllocEx={alloc:?}"));
+
+    let mut mbi: MemoryBasicInformation = unsafe { std::mem::zeroed() };
+    let n = unsafe {
+        VirtualQueryEx(
+            proc,
+            DEMO_MAGIC_ADDR as *const c_void,
+            &mut mbi,
+            std::mem::size_of::<MemoryBasicInformation>(),
+        )
+    };
+    let query_ok = n == std::mem::size_of::<MemoryBasicInformation>() && mbi.protect != PAGE_NOACCESS;
+    check(&mut all_pass, "query_ex_region", query_ok, &format!("ret={n} protect={:#x}", mbi.protect));
 
     let close_ok = unsafe { CloseHandle(proc) } != 0;
     check(&mut all_pass, "close_synthetic", close_ok, "CloseHandle(synthetic)==TRUE");
