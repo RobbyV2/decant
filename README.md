@@ -15,7 +15,7 @@ The tool sees a local Windows process. The bytes come from the guest VM, read ou
 ```console
 $ decant-cli read 2980 0x00007ff756d00000 16
 0x00007ff756d00000  4d 5a 90 00 03 00 00 00  04 00 00 00 ff ff 00 00   MZ..............
-#                   real bytes from the VM's explorer.exe, served to a Wine-hosted tool
+#                   bytes from the VM's explorer.exe, served to a Wine-hosted tool
 ```
 
 ## How it works
@@ -23,7 +23,7 @@ $ decant-cli read 2980 0x00007ff756d00000 16
 ```
   ┌──────────────────────────────────────────────┐
   │  Windows guest VM  (QEMU/KVM)                │
-  │    target.exe, real and unmodified           │
+  │    target.exe, unmodified                    │
   └──────────────────▲───────────────────────────┘
                      │  physical RAM read out-of-band (memflow)
   ┌──────────────────┴───────────────────────────┐
@@ -63,7 +63,7 @@ Translating these once covers every Win32 API above them.
 ## Backends
 
 - `MockBackend`: scriptable mock guest, runs offline.
-- `MemflowBackend` (`--features memflow`): reads real guest physical RAM.
+- `MemflowBackend` (`--features memflow`): reads guest physical RAM.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -150,7 +150,7 @@ Mock backend (no VM, default; develop the whole stack against a mock guest):
 decant-daemon --backend mock --bind 127.0.0.1:7878
 ```
 
-VM backend (memflow over QEMU/KVM, runs as root; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), ADR-0005):
+VM backend (memflow over QEMU/KVM, runs as root; see the memflow backend section of [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
 
 ```bash
 cargo build -p decant-daemon --features memflow
@@ -182,10 +182,12 @@ DECANT_ENDPOINT=127.0.0.1:7878 wine-env/run.sh path/to/tool.exe [args]
 ```
 
 The tool sees the guest: its process list (served from `NtQuerySystemInformation`),
-scans, and reads and writes all route to the daemon. Install a GUI tool into the prefix
-first with `WINEPREFIX="$PWD/wine-env/prefix" wine installer.exe`, then point `run.sh` at
-its executable. If a window fails to map after an interrupted run, reset the prefix with
-`WINEPREFIX="$PWD/wine-env/prefix" wineserver -k` before relaunching.
+scans, and reads and writes all route to the daemon. A full-region scan reads the guest's
+committed memory one request per caller read; the backend reuses the resolved process and
+the daemon disables Nagle, so region scans run at interactive speed (see the memflow backend section of the architecture doc). Install
+a GUI tool into the prefix first with `WINEPREFIX="$PWD/wine-env/prefix" wine installer.exe`,
+then point `run.sh` at its executable. If a window fails to map after an interrupted run,
+reset the prefix with `WINEPREFIX="$PWD/wine-env/prefix" wineserver -k` before relaunching.
 
 ## Limits
 
@@ -207,26 +209,27 @@ Notes:
 
 - Hooks are event-driven; Decant polls. It cannot deliver a `SetWindowsHookEx`-style callback.
 - There is no atomic read-modify-write across the VM boundary, and a paged-out guest page reads as not-present (a `ReadFailed`, not truncated bytes).
-- Interception covers both static and runtime resolution. The carafe patches the IAT, so a tool that imports the Win32 memory APIs directly (the bundled `sample-tool`) routes through those slots; it also hooks `GetProcAddress`, so a tool that resolves the memory APIs at runtime through a function pointer reaches the interposer too. Process enumeration via `NtQuerySystemInformation`, the `NtOpenProcess` and `NtGetNextProcess` openers, `Toolhelp32ReadProcessMemory`, and the `NtQueryInformationProcess` image classes are served from the daemon as well. A tool is reached as long as its call goes through a public Win32/NT export. The runtime-resolution path is validated by `cargo xtask dynamic`, which drives a tool that resolves every memory API only through `GetProcAddress` and enumerates only through `NtQuerySystemInformation`. What stays unsupported is guest code execution (see the table above).
+- Cheat Engine and other tools that resolve the memory APIs at runtime are supported. Such a tool does not import `ReadProcessMemory`; it looks the address up with `GetProcAddress` at runtime, and it lists processes through `NtQuerySystemInformation` rather than toolhelp. Patching the import table alone would see neither. The carafe also hooks `GetProcAddress` (returning its own functions for the names it interposes) and synthesizes `NtQuerySystemInformation`, along with `NtOpenProcess`, `NtGetNextProcess`, `Toolhelp32ReadProcessMemory`, and the `NtQueryInformationProcess` image classes, so a runtime-resolving tool's process list, scans, and edits all route to the guest. A tool that imports the APIs directly (the bundled `sample-tool`) routes through the import-table patch instead. Either way the binding stays on public Win32/NT exports. `cargo xtask dynamic` exercises the runtime-resolution path with a tool that resolves every memory API only through `GetProcAddress` and enumerates only through `NtQuerySystemInformation`. What stays unsupported is guest code execution (see the table above).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) section 3.
 
 ## Version-agnosticism
 
-The carafe binds only to the public Win32/NT export ABI and the PE format (IAT patching), never
-Wine internals (`__wine_unix_call`, the wineserver protocol, syscall-dispatch thunks). That
+The carafe binds only to the public Win32/NT export ABI and the PE format (IAT patching plus
+`GetProcAddress` hooking), never Wine internals (`__wine_unix_call`, the wineserver protocol,
+syscall-dispatch thunks). That
 surface is the most stable part of Wine, so the DLL runs on any Wine version without a recompile
 tied to Wine's layout.
 
 - Delivery: launcher-driven remote-thread injection (`decant-launcher`). Suspended-create, then `LoadLibrary` via `CreateRemoteThread`, then `DllMain` installs the IAT hooks. The target stays unmodified.
 - Limitation: a tool that issues a raw `syscall` instruction, never calling the named `Nt*` export, bypasses export-level interception. Catching it would need Wine-internal syscall-dispatch hooking, which Decant avoids to keep portability.
 
-See the Version-agnosticism section and ADR-0006 in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+See the injection and interception, and version-agnosticism sections of [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Crate layout
 
 Mixed-target Cargo workspace. Host crates are `default-members`; the Windows crates build only
-with `--target x86_64-pc-windows-gnu` (ADR-0003). x86_64 throughout (ADR-0004).
+with `--target x86_64-pc-windows-gnu`. x86_64 throughout.
 
 | Path | Target | Role |
 |---|---|---|
@@ -252,7 +255,7 @@ with `--target x86_64-pc-windows-gnu` (ADR-0003). x86_64 throughout (ADR-0004).
 Decant reads and writes guest memory, runs AOB scans, resolves pointer chains, and
 provides an interposer that redirects an unmodified tool's Win32 calls. The memflow
 backend is validated against a Windows 10 guest; the interposer vector is documented
-in ADR-0006.
+in the injection and interception section of the architecture doc.
 
 79 tests, run offline with no VM.
 
@@ -269,7 +272,7 @@ cargo test -- --ignored  # VM mode, gated on DECANT_LIVE=1 and a running guest
 Writes are verified by read-back, not by the return value. Unsupported operations return a
 structured error, asserted in tests so they cannot become silent corruption.
 
-Design rationale and the ADR log are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The architecture and internals are documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## License
 
