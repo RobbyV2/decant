@@ -133,6 +133,7 @@ pub fn serve(
 ) -> io::Result<()> {
     for stream in listener.incoming() {
         let stream = stream?;
+        let _ = stream.set_nodelay(true);
         let peer = stream.peer_addr().ok();
         let backend = Arc::clone(&backend);
         let diag = Arc::clone(&diag);

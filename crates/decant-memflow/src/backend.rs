@@ -7,6 +7,7 @@ use memflow::prelude::v1::*;
 
 pub struct MemflowBackend {
     os: Mutex<OsInstanceArcBox<'static>>,
+    proc_cache: Mutex<Option<(u32, IntoProcessInstanceArcBox<'static>)>>,
     connector: String,
 }
 
@@ -40,11 +41,34 @@ impl MemflowBackend {
             )
         })?;
 
-        Ok(MemflowBackend { os: Mutex::new(os), connector: connector.to_string() })
+        Ok(MemflowBackend {
+            os: Mutex::new(os),
+            proc_cache: Mutex::new(None),
+            connector: connector.to_string(),
+        })
     }
 
     pub fn connector(&self) -> &str {
         &self.connector
+    }
+
+    // Reuse a resolved process across calls; re-resolving per read makes memflow
+    // rebuild the address translation every time and dominates scan latency. Keyed by
+    // pid, refreshed when the pid changes.
+    fn with_process<R>(
+        &self,
+        pid: Pid,
+        f: impl FnOnce(&mut IntoProcessInstanceArcBox<'static>) -> Result<R>,
+    ) -> Result<R> {
+        let os = self.os.lock().unwrap();
+        let mut cache = self.proc_cache.lock().unwrap();
+        if cache.as_ref().map(|(p, _)| *p) != Some(pid.0) {
+            let proc = os.clone().into_process_by_pid(pid.0).map_err(|_| {
+                BackendError::NoSuchProcess { pid: Some(pid.0), name: None }
+            })?;
+            *cache = Some((pid.0, proc));
+        }
+        f(&mut cache.as_mut().unwrap().1)
     }
 }
 
@@ -114,27 +138,21 @@ impl MemoryBackend for MemflowBackend {
     }
 
     fn read(&self, pid: Pid, addr: u64, len: usize) -> Result<Vec<u8>> {
-        let mut os = self.os.lock().unwrap();
-        let mut proc = os.process_by_pid(pid.0).map_err(|_| BackendError::NoSuchProcess {
-            pid: Some(pid.0),
-            name: None,
-        })?;
-        proc.read_raw(Address::from(addr), len).map_err(|e| BackendError::ReadFailed {
-            addr,
-            len: len as u64,
-            reason: format!("{e:?}"),
+        self.with_process(pid, |proc| {
+            proc.read_raw(Address::from(addr), len).map_err(|e| BackendError::ReadFailed {
+                addr,
+                len: len as u64,
+                reason: format!("{e:?}"),
+            })
         })
     }
 
     fn write(&self, pid: Pid, addr: u64, data: &[u8]) -> Result<usize> {
-        let mut os = self.os.lock().unwrap();
-        let mut proc = os.process_by_pid(pid.0).map_err(|_| BackendError::NoSuchProcess {
-            pid: Some(pid.0),
-            name: None,
-        })?;
-        proc.write_raw(Address::from(addr), data)
-            .map_err(|e| BackendError::WriteFailed { addr, reason: format!("{e:?}") })?;
-        Ok(data.len())
+        self.with_process(pid, |proc| {
+            proc.write_raw(Address::from(addr), data)
+                .map_err(|e| BackendError::WriteFailed { addr, reason: format!("{e:?}") })?;
+            Ok(data.len())
+        })
     }
 
     fn memory_map(&self, pid: Pid) -> Result<Vec<MemRegion>> {
