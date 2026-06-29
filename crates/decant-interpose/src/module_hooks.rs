@@ -17,7 +17,7 @@ const MEM_PRIVATE: u32 = 0x20000;
 const MEMORY_BASIC_INFORMATION_CLASS: u32 = 0;
 
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn GetModuleHandleW(module_name: *const u16) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, proc_name: *const u8) -> *mut c_void;
 }
@@ -67,7 +67,7 @@ pub unsafe extern "system" fn get_module_information(
     module: *mut c_void,
     mi: *mut ModuleInformation,
     cb: u32,
-) -> i32 {
+) -> i32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         let pid = match handle_table::pid_for(h) {
@@ -102,7 +102,7 @@ pub unsafe extern "system" fn get_module_information(
             }
         }
     }
-}
+}}
 
 pub unsafe extern "system" fn enum_process_modules_ex(
     process: *mut c_void,
@@ -110,7 +110,7 @@ pub unsafe extern "system" fn enum_process_modules_ex(
     cb: u32,
     needed: *mut u32,
     filter: u32,
-) -> i32 {
+) -> i32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         let pid = match handle_table::pid_for(h) {
@@ -143,14 +143,14 @@ pub unsafe extern "system" fn enum_process_modules_ex(
             }
         }
     }
-}
+}}
 
 pub unsafe extern "system" fn get_mapped_file_name_a(
     process: *mut c_void,
     addr: *const c_void,
     file_name: *mut u8,
     size: u32,
-) -> u32 {
+) -> u32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         match name_containing(h, addr as u64) {
@@ -167,14 +167,14 @@ pub unsafe extern "system" fn get_mapped_file_name_a(
             }
         }
     }
-}
+}}
 
 pub unsafe extern "system" fn get_mapped_file_name_w(
     process: *mut c_void,
     addr: *const c_void,
     file_name: *mut u16,
     size: u32,
-) -> u32 {
+) -> u32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         match name_containing(h, addr as u64) {
@@ -191,7 +191,7 @@ pub unsafe extern "system" fn get_mapped_file_name_w(
             }
         }
     }
-}
+}}
 
 pub unsafe extern "system" fn nt_query_virtual_memory(
     process: *mut c_void,
@@ -200,7 +200,7 @@ pub unsafe extern "system" fn nt_query_virtual_memory(
     info: *mut c_void,
     len: usize,
     ret: *mut usize,
-) -> i32 {
+) -> i32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         let pid = match handle_table::pid_for(h) {
@@ -250,22 +250,22 @@ pub unsafe extern "system" fn nt_query_virtual_memory(
             }
         }
     }
-}
+}}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(core::iter::once(0)).collect()
 }
 
-unsafe fn resolve(module_w: &[u16], name: &[u8]) -> usize {
+unsafe fn resolve(module_w: &[u16], name: &[u8]) -> usize { unsafe {
     let h = GetModuleHandleW(module_w.as_ptr());
     match h.is_null() {
         true => 0,
         false => GetProcAddress(h, name.as_ptr()) as usize,
     }
-}
+}}
 
 // the mapped-file name is the module name; the protection is coarse
-pub unsafe fn install() -> u32 {
+pub unsafe fn install() -> u32 { unsafe {
     let k32 = wide("kernel32.dll");
     let ntdll = wide("ntdll.dll");
     let psapi = wide("psapi.dll");
@@ -295,7 +295,7 @@ pub unsafe fn install() -> u32 {
 
     let mut total = 0u32;
     macro_rules! patch {
-        ($name:expr, $hook:expr) => {
+        ($name:expr_2021, $hook:expr_2021) => {
             total += iat::patch_all_modules(None, $name, $hook as *mut c_void);
         };
     }
@@ -311,4 +311,4 @@ pub unsafe fn install() -> u32 {
     patch!(b"NtQueryVirtualMemory", nt_query_virtual_memory);
 
     total
-}
+}}

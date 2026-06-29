@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::process::ExitCode;
 
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn LoadLibraryA(lp_lib_file_name: *const u8) -> *mut c_void;
     fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const u8) -> *mut c_void;
 }

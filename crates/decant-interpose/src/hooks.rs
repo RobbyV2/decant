@@ -138,7 +138,7 @@ fn put_wide(buf: &mut [u16], s: &str) {
     buf[i] = 0;
 }
 
-pub(crate) unsafe fn put_ansi_counted(ptr: *mut u8, size: u32, s: &str) -> u32 {
+pub(crate) unsafe fn put_ansi_counted(ptr: *mut u8, size: u32, s: &str) -> u32 { unsafe {
     if ptr.is_null() || size == 0 {
         return 0;
     }
@@ -147,9 +147,9 @@ pub(crate) unsafe fn put_ansi_counted(ptr: *mut u8, size: u32, s: &str) -> u32 {
     core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, n);
     *ptr.add(n) = 0;
     n as u32
-}
+}}
 
-pub(crate) unsafe fn put_wide_counted(ptr: *mut u16, size: u32, s: &str) -> u32 {
+pub(crate) unsafe fn put_wide_counted(ptr: *mut u16, size: u32, s: &str) -> u32 { unsafe {
     if ptr.is_null() || size == 0 {
         return 0;
     }
@@ -163,7 +163,7 @@ pub(crate) unsafe fn put_wide_counted(ptr: *mut u16, size: u32, s: &str) -> u32 
     }
     *ptr.add(i) = 0;
     i as u32
-}
+}}
 
 pub unsafe extern "system" fn open_process(_access: u32, _inherit: i32, pid: u32) -> *mut c_void {
     match rpc::request(Request::ProcessByPid(Pid(pid))) {
@@ -178,7 +178,7 @@ unsafe fn synth_read(
     buffer: *mut c_void,
     size: usize,
     bytes_read: *mut usize,
-) -> usize {
+) -> usize { unsafe {
     if !bytes_read.is_null() {
         *bytes_read = 0;
     }
@@ -203,7 +203,7 @@ unsafe fn synth_read(
         }
         _ => 0,
     }
-}
+}}
 
 unsafe fn synth_write(
     handle: usize,
@@ -211,7 +211,7 @@ unsafe fn synth_write(
     buffer: *const c_void,
     size: usize,
     bytes_written: *mut usize,
-) -> usize {
+) -> usize { unsafe {
     if !bytes_written.is_null() {
         *bytes_written = 0;
     }
@@ -233,7 +233,7 @@ unsafe fn synth_write(
         }
         _ => 0,
     }
-}
+}}
 
 pub unsafe extern "system" fn read_process_memory(
     process: *mut c_void,
@@ -241,7 +241,7 @@ pub unsafe extern "system" fn read_process_memory(
     buffer: *mut c_void,
     size: usize,
     bytes_read: *mut usize,
-) -> i32 {
+) -> i32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         let n = synth_read(h, base_address as u64, buffer, size, bytes_read);
@@ -256,7 +256,7 @@ pub unsafe extern "system" fn read_process_memory(
         *bytes_read = 0;
     }
     0
-}
+}}
 
 pub unsafe extern "system" fn write_process_memory(
     process: *mut c_void,
@@ -264,7 +264,7 @@ pub unsafe extern "system" fn write_process_memory(
     buffer: *const c_void,
     size: usize,
     bytes_written: *mut usize,
-) -> i32 {
+) -> i32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         let n = synth_write(h, base_address as u64, buffer, size, bytes_written);
@@ -279,7 +279,7 @@ pub unsafe extern "system" fn write_process_memory(
         *bytes_written = 0;
     }
     0
-}
+}}
 
 pub unsafe extern "system" fn nt_read_virtual_memory(
     process: *mut c_void,
@@ -287,7 +287,7 @@ pub unsafe extern "system" fn nt_read_virtual_memory(
     buffer: *mut c_void,
     size: usize,
     bytes_read: *mut usize,
-) -> i32 {
+) -> i32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         let n = synth_read(h, base_address as u64, buffer, size, bytes_read);
@@ -299,7 +299,7 @@ pub unsafe extern "system" fn nt_read_virtual_memory(
         return f(process, base_address, buffer, size, bytes_read);
     }
     STATUS_UNSUCCESSFUL
-}
+}}
 
 pub unsafe extern "system" fn nt_write_virtual_memory(
     process: *mut c_void,
@@ -307,7 +307,7 @@ pub unsafe extern "system" fn nt_write_virtual_memory(
     buffer: *mut c_void,
     size: usize,
     bytes_written: *mut usize,
-) -> i32 {
+) -> i32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         let n = synth_write(h, base_address as u64, buffer, size, bytes_written);
@@ -319,9 +319,9 @@ pub unsafe extern "system" fn nt_write_virtual_memory(
         return f(process, base_address, buffer, size, bytes_written);
     }
     STATUS_UNSUCCESSFUL
-}
+}}
 
-pub unsafe extern "system" fn close_handle(handle: *mut c_void) -> i32 {
+pub unsafe extern "system" fn close_handle(handle: *mut c_void) -> i32 { unsafe {
     let h = handle as usize;
     if handle_table::is_synthetic(h) {
         handle_table::free(h);
@@ -333,9 +333,9 @@ pub unsafe extern "system" fn close_handle(handle: *mut c_void) -> i32 {
         return f(handle);
     }
     1
-}
+}}
 
-pub unsafe extern "system" fn nt_close(handle: *mut c_void) -> i32 {
+pub unsafe extern "system" fn nt_close(handle: *mut c_void) -> i32 { unsafe {
     let h = handle as usize;
     if handle_table::is_synthetic(h) {
         handle_table::free(h);
@@ -347,7 +347,7 @@ pub unsafe extern "system" fn nt_close(handle: *mut c_void) -> i32 {
         return f(handle);
     }
     STATUS_SUCCESS
-}
+}}
 
 pub unsafe extern "system" fn create_toolhelp32_snapshot(flags: u32, pid: u32) -> *mut c_void {
     if flags & TH32CS_SNAPPROCESS != 0 {
@@ -371,7 +371,7 @@ pub unsafe extern "system" fn create_toolhelp32_snapshot(flags: u32, pid: u32) -
     invalid_handle()
 }
 
-unsafe fn fill_process_ansi(handle: usize, entry: *mut ProcessEntry32, reset: bool) -> i32 {
+unsafe fn fill_process_ansi(handle: usize, entry: *mut ProcessEntry32, reset: bool) -> i32 { unsafe {
     if entry.is_null() {
         return 0;
     }
@@ -386,9 +386,9 @@ unsafe fn fill_process_ansi(handle: usize, entry: *mut ProcessEntry32, reset: bo
         }
         None => 0,
     }
-}
+}}
 
-unsafe fn fill_process_wide(handle: usize, entry: *mut ProcessEntry32W, reset: bool) -> i32 {
+unsafe fn fill_process_wide(handle: usize, entry: *mut ProcessEntry32W, reset: bool) -> i32 { unsafe {
     if entry.is_null() {
         return 0;
     }
@@ -403,22 +403,22 @@ unsafe fn fill_process_wide(handle: usize, entry: *mut ProcessEntry32W, reset: b
         }
         None => 0,
     }
-}
+}}
 
-pub unsafe extern "system" fn process32_first(snapshot: *mut c_void, entry: *mut ProcessEntry32) -> i32 {
+pub unsafe extern "system" fn process32_first(snapshot: *mut c_void, entry: *mut ProcessEntry32) -> i32 { unsafe {
     fill_process_ansi(snapshot as usize, entry, true)
-}
-pub unsafe extern "system" fn process32_next(snapshot: *mut c_void, entry: *mut ProcessEntry32) -> i32 {
+}}
+pub unsafe extern "system" fn process32_next(snapshot: *mut c_void, entry: *mut ProcessEntry32) -> i32 { unsafe {
     fill_process_ansi(snapshot as usize, entry, false)
-}
-pub unsafe extern "system" fn process32_first_w(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32 {
+}}
+pub unsafe extern "system" fn process32_first_w(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32 { unsafe {
     fill_process_wide(snapshot as usize, entry, true)
-}
-pub unsafe extern "system" fn process32_next_w(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32 {
+}}
+pub unsafe extern "system" fn process32_next_w(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32 { unsafe {
     fill_process_wide(snapshot as usize, entry, false)
-}
+}}
 
-unsafe fn fill_module_ansi(handle: usize, entry: *mut ModuleEntry32, reset: bool) -> i32 {
+unsafe fn fill_module_ansi(handle: usize, entry: *mut ModuleEntry32, reset: bool) -> i32 { unsafe {
     if entry.is_null() {
         return 0;
     }
@@ -435,9 +435,9 @@ unsafe fn fill_module_ansi(handle: usize, entry: *mut ModuleEntry32, reset: bool
         }
         None => 0,
     }
-}
+}}
 
-unsafe fn fill_module_wide(handle: usize, entry: *mut ModuleEntry32W, reset: bool) -> i32 {
+unsafe fn fill_module_wide(handle: usize, entry: *mut ModuleEntry32W, reset: bool) -> i32 { unsafe {
     if entry.is_null() {
         return 0;
     }
@@ -454,22 +454,22 @@ unsafe fn fill_module_wide(handle: usize, entry: *mut ModuleEntry32W, reset: boo
         }
         None => 0,
     }
-}
+}}
 
-pub unsafe extern "system" fn module32_first(snapshot: *mut c_void, entry: *mut ModuleEntry32) -> i32 {
+pub unsafe extern "system" fn module32_first(snapshot: *mut c_void, entry: *mut ModuleEntry32) -> i32 { unsafe {
     fill_module_ansi(snapshot as usize, entry, true)
-}
-pub unsafe extern "system" fn module32_next(snapshot: *mut c_void, entry: *mut ModuleEntry32) -> i32 {
+}}
+pub unsafe extern "system" fn module32_next(snapshot: *mut c_void, entry: *mut ModuleEntry32) -> i32 { unsafe {
     fill_module_ansi(snapshot as usize, entry, false)
-}
-pub unsafe extern "system" fn module32_first_w(snapshot: *mut c_void, entry: *mut ModuleEntry32W) -> i32 {
+}}
+pub unsafe extern "system" fn module32_first_w(snapshot: *mut c_void, entry: *mut ModuleEntry32W) -> i32 { unsafe {
     fill_module_wide(snapshot as usize, entry, true)
-}
-pub unsafe extern "system" fn module32_next_w(snapshot: *mut c_void, entry: *mut ModuleEntry32W) -> i32 {
+}}
+pub unsafe extern "system" fn module32_next_w(snapshot: *mut c_void, entry: *mut ModuleEntry32W) -> i32 { unsafe {
     fill_module_wide(snapshot as usize, entry, false)
-}
+}}
 
-pub unsafe extern "system" fn enum_processes(pids: *mut u32, cb: u32, needed: *mut u32) -> i32 {
+pub unsafe extern "system" fn enum_processes(pids: *mut u32, cb: u32, needed: *mut u32) -> i32 { unsafe {
     if let Some(Response::Processes(list)) = rpc::request(Request::ListProcesses) {
         let cap = (cb as usize) / core::mem::size_of::<u32>();
         let n = list.len().min(cap);
@@ -484,14 +484,14 @@ pub unsafe extern "system" fn enum_processes(pids: *mut u32, cb: u32, needed: *m
         return 1;
     }
     0
-}
+}}
 
 pub unsafe extern "system" fn enum_process_modules(
     process: *mut c_void,
     modules: *mut *mut c_void,
     cb: u32,
     needed: *mut u32,
-) -> i32 {
+) -> i32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         let pid = match handle_table::pid_for(h) {
@@ -519,7 +519,7 @@ pub unsafe extern "system" fn enum_process_modules(
         return f(process, modules, cb, needed);
     }
     0
-}
+}}
 
 unsafe fn module_name_for(handle: usize, module: *mut c_void) -> Option<String> {
     let pid = handle_table::pid_for(handle)?;
@@ -540,7 +540,7 @@ pub unsafe extern "system" fn get_module_base_name_a(
     module: *mut c_void,
     base_name: *mut u8,
     size: u32,
-) -> u32 {
+) -> u32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         return match module_name_for(h, module) {
@@ -554,14 +554,14 @@ pub unsafe extern "system" fn get_module_base_name_a(
         return f(process, module, base_name, size);
     }
     0
-}
+}}
 
 pub unsafe extern "system" fn get_module_base_name_w(
     process: *mut c_void,
     module: *mut c_void,
     base_name: *mut u16,
     size: u32,
-) -> u32 {
+) -> u32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         return match module_name_for(h, module) {
@@ -575,14 +575,14 @@ pub unsafe extern "system" fn get_module_base_name_w(
         return f(process, module, base_name, size);
     }
     0
-}
+}}
 
 pub unsafe extern "system" fn get_module_file_name_ex_a(
     process: *mut c_void,
     module: *mut c_void,
     file_name: *mut u8,
     size: u32,
-) -> u32 {
+) -> u32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         return match module_name_for(h, module) {
@@ -596,14 +596,14 @@ pub unsafe extern "system" fn get_module_file_name_ex_a(
         return f(process, module, file_name, size);
     }
     0
-}
+}}
 
 pub unsafe extern "system" fn get_module_file_name_ex_w(
     process: *mut c_void,
     module: *mut c_void,
     file_name: *mut u16,
     size: u32,
-) -> u32 {
+) -> u32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         return match module_name_for(h, module) {
@@ -617,7 +617,7 @@ pub unsafe extern "system" fn get_module_file_name_ex_w(
         return f(process, module, file_name, size);
     }
     0
-}
+}}
 
 pub unsafe extern "system" fn virtual_protect_ex(
     _process: *mut c_void,
@@ -625,12 +625,12 @@ pub unsafe extern "system" fn virtual_protect_ex(
     _size: usize,
     _new_protect: u32,
     old_protect: *mut u32,
-) -> i32 {
+) -> i32 { unsafe {
     if !old_protect.is_null() {
         *old_protect = PAGE_READWRITE;
     }
     1
-}
+}}
 
 type VqExFn = unsafe extern "system" fn(*mut c_void, *const c_void, *mut MemoryBasicInformation, usize) -> usize;
 type VAllocExFn = unsafe extern "system" fn(*mut c_void, *mut c_void, usize, u32, u32) -> *mut c_void;
@@ -646,7 +646,7 @@ pub unsafe extern "system" fn virtual_query_ex(
     address: *const c_void,
     mbi: *mut MemoryBasicInformation,
     length: usize,
-) -> usize {
+) -> usize { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         let pid = match handle_table::pid_for(h) {
@@ -683,7 +683,7 @@ pub unsafe extern "system" fn virtual_query_ex(
         return f(process, address, mbi, length);
     }
     0
-}
+}}
 
 pub unsafe extern "system" fn virtual_alloc_ex(
     process: *mut c_void,
@@ -691,7 +691,7 @@ pub unsafe extern "system" fn virtual_alloc_ex(
     size: usize,
     alloc_type: u32,
     protect: u32,
-) -> *mut c_void {
+) -> *mut c_void { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         report_unsupported("VirtualAllocEx");
@@ -703,14 +703,14 @@ pub unsafe extern "system" fn virtual_alloc_ex(
         return f(process, address, size, alloc_type, protect);
     }
     core::ptr::null_mut()
-}
+}}
 
 pub unsafe extern "system" fn virtual_free_ex(
     process: *mut c_void,
     address: *mut c_void,
     size: usize,
     free_type: u32,
-) -> i32 {
+) -> i32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         report_unsupported("VirtualFreeEx");
@@ -722,7 +722,7 @@ pub unsafe extern "system" fn virtual_free_ex(
         return f(process, address, size, free_type);
     }
     0
-}
+}}
 
 pub unsafe extern "system" fn nt_allocate_virtual_memory(
     process: *mut c_void,
@@ -731,7 +731,7 @@ pub unsafe extern "system" fn nt_allocate_virtual_memory(
     size: *mut usize,
     alloc_type: u32,
     protect: u32,
-) -> i32 {
+) -> i32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         report_unsupported("NtAllocateVirtualMemory");
@@ -743,14 +743,14 @@ pub unsafe extern "system" fn nt_allocate_virtual_memory(
         return f(process, base, zerobits, size, alloc_type, protect);
     }
     STATUS_NOT_SUPPORTED
-}
+}}
 
 pub unsafe extern "system" fn nt_free_virtual_memory(
     process: *mut c_void,
     base: *mut *mut c_void,
     size: *mut usize,
     free_type: u32,
-) -> i32 {
+) -> i32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         report_unsupported("NtFreeVirtualMemory");
@@ -762,7 +762,7 @@ pub unsafe extern "system" fn nt_free_virtual_memory(
         return f(process, base, size, free_type);
     }
     STATUS_NOT_SUPPORTED
-}
+}}
 
 pub unsafe extern "system" fn create_remote_thread(
     process: *mut c_void,
@@ -772,7 +772,7 @@ pub unsafe extern "system" fn create_remote_thread(
     param: *mut c_void,
     flags: u32,
     tid: *mut u32,
-) -> *mut c_void {
+) -> *mut c_void { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         report_unsupported("CreateRemoteThread");
@@ -784,7 +784,7 @@ pub unsafe extern "system" fn create_remote_thread(
         return f(process, attrs, stack, start, param, flags, tid);
     }
     core::ptr::null_mut()
-}
+}}
 
 pub unsafe extern "system" fn create_remote_thread_ex(
     process: *mut c_void,
@@ -795,7 +795,7 @@ pub unsafe extern "system" fn create_remote_thread_ex(
     flags: u32,
     tid: *mut u32,
     attr_list: *mut c_void,
-) -> *mut c_void {
+) -> *mut c_void { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         report_unsupported("CreateRemoteThreadEx");
@@ -807,7 +807,7 @@ pub unsafe extern "system" fn create_remote_thread_ex(
         return f(process, attrs, stack, start, param, flags, tid, attr_list);
     }
     core::ptr::null_mut()
-}
+}}
 
 pub unsafe extern "system" fn nt_create_thread_ex(
     thread: *mut *mut c_void,
@@ -821,7 +821,7 @@ pub unsafe extern "system" fn nt_create_thread_ex(
     stacksize: usize,
     maxstack: usize,
     attrlist: *mut c_void,
-) -> i32 {
+) -> i32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         report_unsupported("NtCreateThreadEx");
@@ -836,14 +836,14 @@ pub unsafe extern "system" fn nt_create_thread_ex(
         );
     }
     STATUS_NOT_SUPPORTED
-}
+}}
 
-pub unsafe fn install_all() -> u32 {
+pub unsafe fn install_all() -> u32 { unsafe {
     originals::capture();
 
     let mut total = 0u32;
     macro_rules! patch {
-        ($name:expr, $hook:expr) => {
+        ($name:expr_2021, $hook:expr_2021) => {
             total += iat::patch_all_modules(None, $name, $hook as *mut c_void);
         };
     }
@@ -895,4 +895,4 @@ pub unsafe fn install_all() -> u32 {
     total += crate::module_hooks::install();
 
     total
-}
+}}

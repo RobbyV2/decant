@@ -1,7 +1,7 @@
 use core::ffi::c_void;
 
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn GetModuleHandleW(module_name: *const u16) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, proc_name: *const u8) -> *mut c_void;
     fn VirtualProtect(address: *mut c_void, size: usize, new_protect: u32, old_protect: *mut u32) -> i32;
@@ -49,11 +49,11 @@ struct ImageImportDescriptor {
 }
 
 #[inline]
-unsafe fn rva<T>(base: *const u8, rva: u32) -> *mut T {
+unsafe fn rva<T>(base: *const u8, rva: u32) -> *mut T { unsafe {
     base.add(rva as usize) as *mut T
-}
+}}
 
-unsafe fn cstr_eq_ignore_case(ptr: *const u8, want: &[u8]) -> bool {
+unsafe fn cstr_eq_ignore_case(ptr: *const u8, want: &[u8]) -> bool { unsafe {
     let mut i = 0usize;
     loop {
         let c = *ptr.add(i);
@@ -65,9 +65,9 @@ unsafe fn cstr_eq_ignore_case(ptr: *const u8, want: &[u8]) -> bool {
         }
         i += 1;
     }
-}
+}}
 
-unsafe fn cstr_eq(ptr: *const u8, want: &[u8]) -> bool {
+unsafe fn cstr_eq(ptr: *const u8, want: &[u8]) -> bool { unsafe {
     let mut i = 0usize;
     loop {
         let c = *ptr.add(i);
@@ -79,9 +79,9 @@ unsafe fn cstr_eq(ptr: *const u8, want: &[u8]) -> bool {
         }
         i += 1;
     }
-}
+}}
 
-unsafe fn write_iat_slot(slot: *mut c_void, value: u64) -> bool {
+unsafe fn write_iat_slot(slot: *mut c_void, value: u64) -> bool { unsafe {
     let mut old: u32 = 0;
     if VirtualProtect(slot, 8, PAGE_READWRITE, &mut old as *mut u32) == 0 {
         return false;
@@ -90,7 +90,7 @@ unsafe fn write_iat_slot(slot: *mut c_void, value: u64) -> bool {
     let mut discard: u32 = 0;
     VirtualProtect(slot, 8, old, &mut discard as *mut u32);
     true
-}
+}}
 
 // patching these reenters the exports we forward to and loops
 const SYSTEM_DLLS: &[&[u8]] = &[
@@ -106,7 +106,7 @@ const SYSTEM_DLLS: &[&[u8]] = &[
     b"decant_interpose.dll",
 ];
 
-unsafe fn is_system_module(base: *mut c_void) -> bool {
+unsafe fn is_system_module(base: *mut c_void) -> bool { unsafe {
     if base.is_null() {
         return false;
     }
@@ -133,14 +133,14 @@ unsafe fn is_system_module(base: *mut c_void) -> bool {
     }
     let name_ptr = base.add(name_rva as usize);
     SYSTEM_DLLS.iter().any(|s| cstr_eq_ignore_case(name_ptr, s))
-}
+}}
 
 pub unsafe fn patch_module_iat(
     base: *mut c_void,
     module_filter: Option<&[u8]>,
     func_name: &[u8],
     replacement: *mut c_void,
-) -> u32 {
+) -> u32 { unsafe {
     if base.is_null() {
         return 0;
     }
@@ -211,13 +211,13 @@ pub unsafe fn patch_module_iat(
     }
 
     patched
-}
+}}
 
 pub unsafe fn patch_all_modules(
     module_filter: Option<&[u8]>,
     func_name: &[u8],
     replacement: *mut c_void,
-) -> u32 {
+) -> u32 { unsafe {
     let mut total = 0u32;
 
     let main_base = GetModuleHandleW(core::ptr::null());
@@ -251,4 +251,4 @@ pub unsafe fn patch_all_modules(
     }
 
     total
-}
+}}

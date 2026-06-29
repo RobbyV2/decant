@@ -35,7 +35,7 @@ struct StartupInfoW {
 }
 
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn CreateProcessW(
         application_name: *const u16,
         command_line: *mut u16,
