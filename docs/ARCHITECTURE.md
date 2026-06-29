@@ -453,6 +453,19 @@ at the real Wine builtin, so unimplemented exports forward with no proxy
 DLL, no `.def`, and no export-table to maintain (contrast a `WINEDLLOVERRIDES` proxy,
 which must re-export *every* symbol of the shadowed DLL).
 
+**Runtime resolution.** A tool that resolves the memory APIs at load time has them in
+its IAT; one that resolves them later through `GetProcAddress` does not. The carafe
+hooks `GetProcAddress` itself, returning its own replacement for any export it
+interposes, so runtime-resolved calls reach the daemon through the same path. Process
+enumeration via `NtQuerySystemInformation` (the `SystemProcessInformation` class) is
+synthesized from the daemon's process list, and the `NtOpenProcess` and
+`NtGetNextProcess` openers, `Toolhelp32ReadProcessMemory`, and the
+`NtQueryInformationProcess` image classes are served the same way. The export-name set
+the IAT installer patches and the set the `GetProcAddress` redirector recognizes come
+from one list, so they cannot drift. `cargo xtask dynamic` exercises this with a tool
+that resolves every memory API only through `GetProcAddress` and enumerates only
+through `NtQuerySystemInformation`.
+
 **Vectors evaluated and results (literal Wine stdout):**
 
 | Vector | What | Result on wine-11.11 |
