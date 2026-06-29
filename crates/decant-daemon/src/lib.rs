@@ -98,6 +98,31 @@ pub fn dispatch(req: Request, backend: &dyn MemoryBackend, diag: &Diag) -> Respo
             finish(backend.write(pid, addr, &data), |n| Response::Written(n as u64), diag)
         }
         Request::MemoryMap(pid) => finish(backend.memory_map(pid), Response::MemoryMap, diag),
+        Request::Scan { pid, pattern } => match decant_core::scanner::scan_str(backend, pid, &pattern)
+        {
+            Ok(hits) => Response::ScanHits(hits),
+            Err(e) => Response::Err(core_err_to_proto(e)),
+        },
+        Request::Resolve { pid, base, offsets } => {
+            match decant_core::resolve(backend, pid, base, &offsets) {
+                Ok(address) => {
+                    // Best-effort: read the 8 bytes at the resolved address so the
+                    // caller sees the pointed-to value without a second round-trip.
+                    diag.reads.fetch_add(1, Ordering::Relaxed);
+                    let value = backend.read(pid, address, 8).unwrap_or_default();
+                    Response::Resolved { address, value }
+                }
+                Err(e) => Response::Err(core_err_to_proto(e)),
+            }
+        }
+    }
+}
+
+/// Map a `decant-core` analysis error onto the wire-stable [`ProtoError`].
+fn core_err_to_proto(e: decant_core::CoreError) -> ProtoError {
+    match e {
+        decant_core::CoreError::Pattern(message) => ProtoError::Backend { message },
+        decant_core::CoreError::Backend(be) => be.into(),
     }
 }
 

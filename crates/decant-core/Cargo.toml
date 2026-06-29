@@ -12,3 +12,4 @@ thiserror.workspace = true
 
 [dev-dependencies]
 # proptest added in Phase 2 for scanner/resolver property tests.
+proptest = "1"

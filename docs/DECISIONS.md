@@ -123,10 +123,31 @@ testbins). No 32-bit (`i686`) support.
 
 ## ADR-0005 — Verified memflow connector API (QEMU/KVM)
 
-**Status:** Accepted (Phase 1). Verified empirically against **memflow 0.2.4** —
-both by web research (docs.rs + GitHub source) and by an actual `cargo build
---features memflow` that typechecked the whole surface (the only defect a missing
-`mut`). `crates/decant-memflow/src/backend.rs` is the implementation.
+**Status:** Accepted (Phase 1) — **LIVE-VALIDATED 2026-06-29** against a real
+QEMU/KVM Windows-10 guest (see "Live validation" below). Originally verified by web
+research (docs.rs + GitHub source) and by an actual `cargo build --features memflow`
+that typechecked the whole surface (the only defect a missing `mut`).
+`crates/decant-memflow/src/backend.rs` is the implementation.
+
+**Live validation (2026-06-29).** The Phase 1 *and* Phase 2 live gates passed against
+a running `win10` guest (Windows 10 `10.0.19045`):
+- A `memflow` **0.2.4** core (what `decant-memflow` links) successfully loaded the
+  installed **0.2.1** connector/OS plugins — confirming the ABI gate is the integer
+  `MEMFLOW_PLUGIN_VERSION` (`=1`), *not* the crate version (ADR-0005 §9 risk retired
+  in practice). The KVM connector built the win32 kernel, downloaded `ntkrnlmp.pdb`.
+- **Connector args:** the connector takes the target as memflow's **default (unnamed)
+  arg** — the qemu process PID passed *bare* (`DECANT_CONNECTOR_ARGS="<pid>"`). A
+  `pid=` *named* arg fails `Error(Connector, ArgValidation)` because `pid` is not a
+  declared named arg. `MEMFLOW_PLUGIN_PATH` must point at the dir holding the
+  `libmemflow_{kvm,win32}.so` plugins. KVM needs root (`/dev/memflow` is `root:root`).
+- **Read:** `read` of `explorer.exe`'s image base returned `4d 5a 90 00 …` (the real
+  `MZ`/PE header); modules (`ntdll.dll`, `KERNEL32.DLL`, …) enumerated correctly.
+- **Write:** a reversible write into stable heap padding changed the bytes and
+  read back the pattern, then restored the originals byte-for-byte (PASS).
+- **Resolve:** a planted 2-hop pointer chain resolved live to the terminal value.
+- **Caveat observed:** writing into *actively-used* heap is racy — a second target
+  slot was reclaimed/rewritten by the guest between operations (spec §9 atomicity /
+  hot-data caveat). Prefer stable padding or a purpose-built target for writes.
 
 **Crate pins.** `memflow = { version = "0.2", features = ["plugins"], optional =
 true }`. The `plugins` feature provides the runtime `Inventory`. We deliberately do

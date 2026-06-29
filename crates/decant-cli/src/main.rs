@@ -139,11 +139,39 @@ fn run() -> Result<()> {
                 other => bail!(unexpected(other)),
             }
         }
-        Cmd::Scan { .. } | Cmd::Resolve { .. } => {
-            bail!(
-                "scan/resolve land in Phase 2 (the AOB scanner + pointer-chain resolver \
-                 in decant-core). Not wired to the daemon yet."
-            );
+        Cmd::Scan { pid, pattern } => {
+            let resp = request(&cli.endpoint, Request::Scan { pid: Pid(pid), pattern })?;
+            match resp {
+                Response::ScanHits(hits) => {
+                    if hits.is_empty() {
+                        println!("(no matches)");
+                    }
+                    for addr in hits {
+                        println!("{addr:#018x}");
+                    }
+                }
+                other => bail!(unexpected(other)),
+            }
+        }
+        Cmd::Resolve { pid, base, offsets } => {
+            let base = parse_u64(&base).context("parsing BASE")?;
+            let offsets = offsets
+                .iter()
+                .map(|o| parse_u64(o))
+                .collect::<Result<Vec<_>>>()
+                .context("parsing offsets")?;
+            let resp = request(&cli.endpoint, Request::Resolve { pid: Pid(pid), base, offsets })?;
+            match resp {
+                Response::Resolved { address, value } => {
+                    print!("{address:#018x}");
+                    if value.len() == 8 {
+                        let v = u64::from_le_bytes(value.clone().try_into().unwrap());
+                        print!("  ->  u64={v:#x} ({v})");
+                    }
+                    println!();
+                }
+                other => bail!(unexpected(other)),
+            }
         }
     }
     Ok(())

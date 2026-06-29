@@ -12,7 +12,10 @@ use std::net::TcpListener;
 use std::process::{Command, Output};
 use std::sync::Arc;
 
-use decant_backend::fixtures::{demo_backend, DEMO_MAGIC_ADDR, DEMO_SLOT_ADDR};
+use decant_backend::fixtures::{
+    demo_backend, DEMO_CHAIN_HEAD, DEMO_CHAIN_NODE, DEMO_CHAIN_OFFSET, DEMO_MAGIC, DEMO_MAGIC_ADDR,
+    DEMO_SLOT_ADDR,
+};
 use decant_backend::MemoryBackend;
 use decant_daemon::{serve, Diag};
 
@@ -94,6 +97,26 @@ fn diagnostics_reports_the_mock_connector() {
     let s = stdout_of(&cli(port, &["diagnostics"]));
     assert!(s.contains("connector:"), "got: {s}");
     assert!(s.contains("mock"), "got: {s}");
+}
+
+#[test]
+fn scan_finds_the_planted_magic() {
+    let port = start_server();
+    let pattern: String =
+        DEMO_MAGIC.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+    let s = stdout_of(&cli(port, &["scan", "1234", &pattern]));
+    assert!(s.contains(&format!("{DEMO_MAGIC_ADDR:#018x}")), "got: {s}");
+}
+
+#[test]
+fn resolve_walks_the_pointer_chain() {
+    let port = start_server();
+    let base = format!("{DEMO_CHAIN_HEAD:#x}");
+    let off = format!("{DEMO_CHAIN_OFFSET:#x}");
+    let s = stdout_of(&cli(port, &["resolve", "1234", &base, &off]));
+    // Final address is NODE + offset, value is 1337 (0x539).
+    assert!(s.contains(&format!("{:#018x}", DEMO_CHAIN_NODE + DEMO_CHAIN_OFFSET)), "got: {s}");
+    assert!(s.contains("1337") || s.contains("0x539"), "got: {s}");
 }
 
 #[test]

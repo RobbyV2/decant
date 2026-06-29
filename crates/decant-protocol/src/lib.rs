@@ -135,6 +135,14 @@ pub enum Request {
     Write { pid: Pid, addr: u64, data: Vec<u8> },
     MemoryMap(Pid),
     Diagnostics,
+    // --- Phase 2 analysis (appended; bincode variant indices above are unchanged,
+    //     so this extension is wire-compatible with the frozen set above). ---
+    /// AOB/signature scan; `pattern` is space-separated hex bytes with `??`
+    /// wildcards, e.g. `"DE CA ?? 00 4D"`.
+    Scan { pid: Pid, pattern: String },
+    /// Resolve a pointer chain: `address = base; for off in offsets { address =
+    /// deref_u64(address) + off }`.
+    Resolve { pid: Pid, base: u64, offsets: Vec<u64> },
 }
 
 /// A response from the cellar to the carafe. `Err` carries a structured
@@ -152,6 +160,12 @@ pub enum Response {
     MemoryMap(Vec<MemRegion>),
     Diagnostics(Diagnostics),
     Err(ProtoError),
+    // --- Phase 2 analysis (appended; see Request note). ---
+    /// Absolute addresses where a scan pattern matched.
+    ScanHits(Vec<u64>),
+    /// A resolved pointer chain: the final `address` plus the 8 bytes read there
+    /// (`value`, empty if that address was unreadable).
+    Resolved { address: u64, value: Vec<u8> },
 }
 
 /// Hard ceiling on a single framed message (64 MiB). Guards the reader against a
@@ -227,6 +241,8 @@ mod tests {
         roundtrip_req(Request::Write { pid: Pid(7), addr: 0xdead, data: vec![1, 2, 3, 4] });
         roundtrip_req(Request::MemoryMap(Pid(7)));
         roundtrip_req(Request::Diagnostics);
+        roundtrip_req(Request::Scan { pid: Pid(7), pattern: "DE CA ?? 00".into() });
+        roundtrip_req(Request::Resolve { pid: Pid(7), base: 0x1000, offsets: vec![0x10, 0x18] });
     }
 
     #[test]
@@ -255,6 +271,8 @@ mod tests {
         }]));
         roundtrip_resp(Response::Diagnostics(Diagnostics::default()));
         roundtrip_resp(Response::Err(ProtoError::ExecutionWall { op: "VirtualAllocEx".into() }));
+        roundtrip_resp(Response::ScanHits(vec![0x1400010100, 0x1400010200]));
+        roundtrip_resp(Response::Resolved { address: 0x1400010290, value: vec![0x39, 5, 0, 0] });
     }
 
     #[test]
