@@ -28,6 +28,9 @@ pub struct Originals {
     pub create_remote_thread: AtomicUsize,
     pub create_remote_thread_ex: AtomicUsize,
     pub nt_create_thread_ex: AtomicUsize,
+    pub get_proc_address: AtomicUsize,
+    pub nt_query_system_information: AtomicUsize,
+    pub nt_query_information_process: AtomicUsize,
 }
 
 impl Originals {
@@ -52,6 +55,9 @@ impl Originals {
             create_remote_thread: AtomicUsize::new(0),
             create_remote_thread_ex: AtomicUsize::new(0),
             nt_create_thread_ex: AtomicUsize::new(0),
+            get_proc_address: AtomicUsize::new(0),
+            nt_query_system_information: AtomicUsize::new(0),
+            nt_query_information_process: AtomicUsize::new(0),
         }
     }
 }
@@ -122,4 +128,7 @@ pub unsafe fn capture() { unsafe {
     store(&ORIGINALS.create_remote_thread, resolve(&k32, b"CreateRemoteThread\0"));
     store(&ORIGINALS.create_remote_thread_ex, resolve(&k32, b"CreateRemoteThreadEx\0"));
     store(&ORIGINALS.nt_create_thread_ex, resolve(&ntdll, b"NtCreateThreadEx\0"));
+    store(&ORIGINALS.get_proc_address, resolve(&k32, b"GetProcAddress\0"));
+    store(&ORIGINALS.nt_query_system_information, resolve(&ntdll, b"NtQuerySystemInformation\0"));
+    store(&ORIGINALS.nt_query_information_process, resolve(&ntdll, b"NtQueryInformationProcess\0"));
 }}

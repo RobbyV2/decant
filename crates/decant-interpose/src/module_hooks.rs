@@ -264,6 +264,19 @@ unsafe fn resolve(module_w: &[u16], name: &[u8]) -> usize { unsafe {
     }
 }}
 
+pub(crate) unsafe fn redirect(name: *const u8) -> *mut c_void { unsafe {
+    if iat::cstr_eq(name, b"GetModuleInformation") { return get_module_information as *mut c_void; }
+    if iat::cstr_eq(name, b"K32GetModuleInformation") { return get_module_information as *mut c_void; }
+    if iat::cstr_eq(name, b"EnumProcessModulesEx") { return enum_process_modules_ex as *mut c_void; }
+    if iat::cstr_eq(name, b"K32EnumProcessModulesEx") { return enum_process_modules_ex as *mut c_void; }
+    if iat::cstr_eq(name, b"GetMappedFileNameA") { return get_mapped_file_name_a as *mut c_void; }
+    if iat::cstr_eq(name, b"K32GetMappedFileNameA") { return get_mapped_file_name_a as *mut c_void; }
+    if iat::cstr_eq(name, b"GetMappedFileNameW") { return get_mapped_file_name_w as *mut c_void; }
+    if iat::cstr_eq(name, b"K32GetMappedFileNameW") { return get_mapped_file_name_w as *mut c_void; }
+    if iat::cstr_eq(name, b"NtQueryVirtualMemory") { return nt_query_virtual_memory as *mut c_void; }
+    core::ptr::null_mut()
+}}
+
 // the mapped-file name is the module name; the protection is coarse
 pub unsafe fn install() -> u32 { unsafe {
     let k32 = wide("kernel32.dll");

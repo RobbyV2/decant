@@ -67,7 +67,7 @@ unsafe fn cstr_eq_ignore_case(ptr: *const u8, want: &[u8]) -> bool { unsafe {
     }
 }}
 
-unsafe fn cstr_eq(ptr: *const u8, want: &[u8]) -> bool { unsafe {
+pub(crate) unsafe fn cstr_eq(ptr: *const u8, want: &[u8]) -> bool { unsafe {
     let mut i = 0usize;
     loop {
         let c = *ptr.add(i);
