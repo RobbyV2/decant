@@ -223,7 +223,7 @@ with `--target x86_64-pc-windows-gnu` (ADR-0003). x86_64 throughout (ADR-0004).
 | `crates/decant-wine-harness` | host | launches exes under Wine for `cargo test` |
 | `crates/decant-interpose` | win-gnu (cdylib) | interposer DLL (the carafe), IAT patching |
 | `testbins/guest-target` | win-gnu | sample target for VM tests |
-| `testbins/mock-cheat` | win-gnu | stand-in tool for harness tests |
+| `testbins/sample-tool` | win-gnu | stand-in tool for harness tests |
 | `testbins/decant-launcher` | win-gnu | suspended-create and remote-thread DLL injector |
 | `testbins/dll-smoke` | win-gnu | loads `hello-dll`, checks the toolchain under Wine |
 | `testbins/hello-dll` | win-gnu (cdylib) | minimal PE32+ DLL exporting `add` |

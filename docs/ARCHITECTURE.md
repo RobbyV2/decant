@@ -196,7 +196,7 @@ crates are members but built only with `--target x86_64-pc-windows-gnu`.
 | `testbins/hello-dll` | win-gnu (cdylib) | minimal PE32+ DLL exporting `add` |
 | `testbins/dll-smoke` | win-gnu (exe) | loads `hello-dll`, proves the toolchain under Wine |
 | `testbins/guest-target` | win-gnu | sample target for live tests (stub) |
-| `testbins/mock-cheat` | win-gnu | stand-in cheat tool for harness tests (stub) |
+| `testbins/sample-tool` | win-gnu | stand-in cheat tool for harness tests (stub) |
 | `xtask` | host | build/test orchestration (`test`, `wine-smoke`) |
 
 Domain types (`Pid`, `ProcessInfo`, `ModuleInfo`, `MemRegion`, `Diagnostics`,

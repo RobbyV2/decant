@@ -15,7 +15,7 @@ cargo build -p decant-daemon -p decant-cli
 
 echo "Building Windows testbins"
 cargo build --target x86_64-pc-windows-gnu \
-    -p decant-interpose -p mock-cheat -p decant-launcher
+    -p decant-interpose -p sample-tool -p decant-launcher
 
 daemon="$root/target/debug/decant-daemon"
 cli="$root/target/debug/decant-cli"
@@ -62,7 +62,7 @@ echo "Resolve the pointer chain from $chain_head"
 echo "Diagnostics"
 "$cli" diagnostics
 
-echo "Running mock-cheat under Wine through the launcher"
+echo "Running sample-tool under Wine through the launcher"
 cargo run -p xtask -- e2e
 
 echo "demo: PASS"

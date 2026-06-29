@@ -22,7 +22,7 @@ members = [
     "crates/decant-wine-harness",
     "crates/decant-interpose",
     "testbins/guest-target",
-    "testbins/mock-cheat",
+    "testbins/sample-tool",
     "testbins/decant-launcher",
     "testbins/dll-smoke",
     "testbins/hello-dll",

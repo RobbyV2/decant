@@ -257,14 +257,14 @@ which must re-export *every* symbol of the shadowed DLL).
 
 | Vector | What | Result on wine-11.11 |
 |---|---|---|
-| cooperative bootstrap | `mock-cheat --cooperative` `LoadLibraryA`s the carafe, `GetProcAddress`es `decant_install_hooks`, calls it, then `ReadProcessMemory` | **PASS**. `decant_install_hooks patched 1 slot(s)` then `INTERCEPTED` |
-| baseline (control) | `mock-cheat` with no injection | `passthrough` (proves the probe discriminates) |
-| `AppInit_DLLs` | set `AppInit_DLLs`/`LoadAppInit_DLLs=1`/`RequireSignedAppInit_DLLs=0`; run unmodified `mock-cheat` (which imports `user32`) | **FAIL: not supported on Wine.** The DLL is never loaded. Disassembly of `kernelbase!LoadAppInitDlls` shows a **no-op stub** (its body is `test [dbg_flag],8` / optional `FIXME` / `ret`); no builtin contains the `AppInit_DLLs` registry-value string, and nothing invokes it during process init. A real-Windows-only path. |
-| `WINEDLLOVERRIDES` proxy | name the carafe to shadow a DLL the tool imports | **Rejected by design.** `mock-cheat` imports only `kernel32`/`user32`; both are early/KnownDLL-class loads the proxy trick can't cleanly shadow (the KnownDLL early-load problem), and a proxy must re-export the *entire* shadowed surface. Viable only for tools that import an incidental DLL (DXVK/ReShade style); not general. Not implemented. |
-| launcher injection | `decant-launcher mock-cheat.exe` (suspended-create + `CreateRemoteThread`/`LoadLibrary`), `DECANT_AUTOHOOK=1`; `mock-cheat` **unmodified** | **PASS**. `INTERCEPTED`. Control with `DECANT_AUTOHOOK` unset: DLL is confirmed injected (loaddll trace shows `decant_interpose.dll … native`); `DllMain` declines to install, giving `passthrough`, isolating the install step as the cause. |
+| cooperative bootstrap | `sample-tool --cooperative` `LoadLibraryA`s the carafe, `GetProcAddress`es `decant_install_hooks`, calls it, then `ReadProcessMemory` | **PASS**. `decant_install_hooks patched 1 slot(s)` then `INTERCEPTED` |
+| baseline (control) | `sample-tool` with no injection | `passthrough` (proves the probe discriminates) |
+| `AppInit_DLLs` | set `AppInit_DLLs`/`LoadAppInit_DLLs=1`/`RequireSignedAppInit_DLLs=0`; run unmodified `sample-tool` (which imports `user32`) | **FAIL: not supported on Wine.** The DLL is never loaded. Disassembly of `kernelbase!LoadAppInitDlls` shows a **no-op stub** (its body is `test [dbg_flag],8` / optional `FIXME` / `ret`); no builtin contains the `AppInit_DLLs` registry-value string, and nothing invokes it during process init. A real-Windows-only path. |
+| `WINEDLLOVERRIDES` proxy | name the carafe to shadow a DLL the tool imports | **Rejected by design.** `sample-tool` imports only `kernel32`/`user32`; both are early/KnownDLL-class loads the proxy trick can't cleanly shadow (the KnownDLL early-load problem), and a proxy must re-export the *entire* shadowed surface. Viable only for tools that import an incidental DLL (DXVK/ReShade style); not general. Not implemented. |
+| launcher injection | `decant-launcher sample-tool.exe` (suspended-create + `CreateRemoteThread`/`LoadLibrary`), `DECANT_AUTOHOOK=1`; `sample-tool` **unmodified** | **PASS**. `INTERCEPTED`. Control with `DECANT_AUTOHOOK` unset: DLL is confirmed injected (loaddll trace shows `decant_interpose.dll … native`); `DllMain` declines to install, giving `passthrough`, isolating the install step as the cause. |
 
 The `0xCC` marker is the observable: the hook fills the caller's buffer with `0xCC`
-and returns `TRUE`, so `mock-cheat` distinguishes a rerouted call (`INTERCEPTED`)
+and returns `TRUE`, so `sample-tool` distinguishes a rerouted call (`INTERCEPTED`)
 from real bytes (`passthrough`). Daemon marshaling replaces the hook body in the
 end-to-end path; this check only proves the call is rerouted.
 
@@ -291,12 +291,12 @@ docs and exercised by the carafe-injection adversarial review (`docs/TESTING.md`
 cannot escape the unsupported-operation limit regardless; the limitation is about
 interception *visibility* in the Wine-hosted tool, not new power over the guest.)
 
-**Reproduce:** `cargo xtask inject-test` (builds carafe + `mock-cheat` + launcher, stages
+**Reproduce:** `cargo xtask inject-test` (builds carafe + `sample-tool` + launcher, stages
 them, runs the cooperative bootstrap + baseline + launcher injection under the isolated prefix, asserts the
-markers). Manual: build `-p decant-interpose -p mock-cheat -p decant-launcher
+markers). Manual: build `-p decant-interpose -p sample-tool -p decant-launcher
 --target x86_64-pc-windows-gnu`, co-locate the three artifacts, then under the
-prefix `wine mock-cheat.exe --cooperative` (cooperative bootstrap) and
-`DECANT_AUTOHOOK=1 wine decant-launcher.exe mock-cheat.exe` (launcher injection).
+prefix `wine sample-tool.exe --cooperative` (cooperative bootstrap) and
+`DECANT_AUTOHOOK=1 wine decant-launcher.exe sample-tool.exe` (launcher injection).
 
 ## ADR-0007: Library facade (`decant`) and a shared client (`decant-client`)
 
