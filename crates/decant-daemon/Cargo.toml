@@ -9,6 +9,12 @@ description = "The cellar: native Linux TCP daemon serving decant-protocol over 
 name = "decant-daemon"
 path = "src/main.rs"
 
+[features]
+# Enables the real VM backend. Off by default so the host autonomous suite builds
+# hermetically; turn on for the live VM: `cargo build -p decant-daemon --features memflow`.
+default = []
+memflow = ["decant-memflow/memflow"]
+
 [dependencies]
 decant-protocol = { path = "../decant-protocol" }
 decant-backend = { path = "../decant-backend" }

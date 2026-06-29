@@ -13,3 +13,8 @@ path = "src/main.rs"
 decant-protocol = { path = "../decant-protocol" }
 anyhow.workspace = true
 clap.workspace = true
+
+[dev-dependencies]
+# For the end-to-end test: host the real server in-process and drive the CLI binary.
+decant-daemon = { path = "../decant-daemon" }
+decant-backend = { path = "../decant-backend" }

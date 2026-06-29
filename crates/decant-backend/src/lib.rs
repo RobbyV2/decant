@@ -25,6 +25,8 @@ pub use decant_protocol::{MemRegion, ModuleInfo, Pid, ProcessInfo, ProtoError};
 mod mock;
 pub use mock::{MockBackend, MockGuest};
 
+pub mod fixtures;
+
 /// The result type every backend method returns.
 pub type Result<T> = std::result::Result<T, BackendError>;
 

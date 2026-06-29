@@ -121,25 +121,64 @@ testbins). No 32-bit (`i686`) support.
 
 ---
 
-## ADR-0005 — Verified memflow connector API *(placeholder)*
+## ADR-0005 — Verified memflow connector API (QEMU/KVM)
 
-**Status:** Pending (to be resolved in Phase 1)
+**Status:** Accepted (Phase 1). Verified empirically against **memflow 0.2.4** —
+both by web research (docs.rs + GitHub source) and by an actual `cargo build
+--features memflow` that typechecked the whole surface (the only defect a missing
+`mut`). `crates/decant-memflow/src/backend.rs` is the implementation.
 
-**Context.** `MemflowBackend` must call memflow's real API: connector inventory
-construction (QEMU/KVM), the OS object, `process_by_pid`/`process_by_name`, module
-enumeration, export-table resolution, virtual `read_raw`/`write_raw`, and the
-VAD/page-map walk that backs `memory_map`. The exact crate versions and method
-names **must not be guessed** — per the operating rules they have to be verified
-empirically against the pinned docs.rs pages and a live connector.
+**Crate pins.** `memflow = { version = "0.2", features = ["plugins"], optional =
+true }`. The `plugins` feature provides the runtime `Inventory`. We deliberately do
+**not** depend on `memflow-win32` at compile time (its published 0.2.0 predates core
+0.2.4 and risks source skew, ADR-0005 research §9). Instead the Windows OS layer is
+loaded as a runtime `.os` plugin (`inventory.builder().os("win32")`).
 
-**Decision.** *Deferred.* No memflow API surface is committed to until verified.
-The `decant-memflow` crate is a stub and its `memflow` feature is a hard
-`compile_error!` until this ADR is filled in.
+**Connector model = runtime plugins.** The `qemu`/`kvm` connector and the `win32`
+OS are `.so`/`.os` plugins discovered by `Inventory::scan()`, NOT linked. So
+`decant-memflow` compiles with no VM, but `connect()` only succeeds on the VM host
+where the plugins are installed. **This is why the autonomous suite needs no VM and
+the live gate is the user's.**
 
-**To record here when resolved:** pinned `memflow` / `memflow-win32` (or
-successor) crate versions; the exact connector-inventory call; the OS/process/
-module/export method names actually used; how virtual→physical translation and the
-region/permission map are obtained; and any capability gaps found.
+**User-side install (on the VM host, x86_64 Linux):**
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.memflow.io | sh   # memflowup
+memflowup install memflow-qemu memflow-win32     # (+ memflow-kvm for KVM)
+# QEMU connector reads the qemu process via procfs → needs CAP_SYS_PTRACE:
+sudo setcap 'CAP_SYS_PTRACE=ep' target/release/decant-daemon       # or run as root
+```
+KVM instead needs the `memflow.ko` module (DKMS) + a `memflow` group/udev rule.
+
+**Bootstrap.** `Inventory::scan()` →
+`inventory.builder().connector("qemu").args(<ConnectorArgs>).os("win32").build()` →
+`OsInstanceArcBox<'static>`. The QEMU VM name is the connector arg, supplied via
+`DECANT_CONNECTOR_ARGS` (memflow `key=value,flag` syntax); `--connector` /
+`DECANT_CONNECTOR` selects the plugin (`qemu`/`kvm`).
+
+**Impedance mismatch (important).** memflow handles take `&mut self` and are not
+`Sync`; our `MemoryBackend` is `&self` + `Send + Sync`. Resolution: store the OS
+handle in a `Mutex`; every call locks, re-resolves the process by pid, and operates.
+Correctness over throughput — a per-pid handle cache is a future optimization.
+
+**Trait → memflow mapping (all verified to compile):**
+
+| `MemoryBackend` | memflow call |
+|---|---|
+| `list_processes` | `os.process_info_list()` → `{Pid(i.pid), i.name.to_string()}` |
+| `process_by_pid` / `_name` | `os.process_info_by_pid(u32)` / `process_info_by_name(&str)` |
+| `module_list` | `os.process_by_pid(pid)?.module_list()` → `{name, base.to_umem(), size}` |
+| `module_by_name` | `proc.module_by_name(&str)` |
+| `module_exports` | `proc.module_export_list(&minfo)` → `(name, base + offset)` (RVA→VA) |
+| `read` | `proc.read_raw(Address::from(addr), len)` (`PartialResult`) |
+| `write` | `proc.write_raw(Address::from(addr), data)` |
+| `memory_map` | `proc.mapped_mem_vec(-1)` → `CTup3<Address, umem, PageType>`; `w = PageType::WRITEABLE`, `x = !PageType::NOEXEC` |
+
+**Known caveats / honesty (spec §9):** `read_raw`/`write_raw` return a
+`PartialResult` — paged-out guest pages yield a partial error; we surface that as a
+hard `ReadFailed`/`WriteFailed` rather than returning silently-truncated bytes.
+`memory_map` permission flags are coarse (page-table derived, not full Win32
+`PAGE_*`). `Pid` is `u32`. Live-untested in this environment (no VM) — the API is
+compile-verified; the user runs the live gate per `docs/TESTING.md`.
 
 ---
 

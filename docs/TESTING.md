@@ -154,3 +154,46 @@ phase lands:
   bogus handle. Then have the tool issue a **raw syscall** that bypasses the
   export layer (see `docs/VERSIONING.md`, the known hole) and confirm Decant's
   docs/diagnostics make that bypass visible rather than pretending coverage.
+
+## Phase 1 live gate — runbook (run on the VM host)
+
+The autonomous suite proves the daemon + CLI against `--backend mock` with no VM.
+The *live* gate proves the same path against a real Windows-10 guest via memflow.
+
+Prerequisites (one-time): install the memflow connector + win32 plugins and grant
+ptrace, per `docs/DECISIONS.md` ADR-0005:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.memflow.io | sh   # memflowup
+memflowup install memflow-qemu memflow-win32                       # qemu path
+cargo build --release -p decant-daemon --features memflow
+sudo setcap 'CAP_SYS_PTRACE=ep' target/release/decant-daemon       # or run as root
+```
+
+Run the gate (with the Windows VM booted under QEMU):
+
+```sh
+# Point the connector at your VM (memflow key=value,flag syntax). The VM name is
+# the qemu connector's target argument.
+export DECANT_CONNECTOR=qemu
+export DECANT_CONNECTOR_ARGS="<your-vm-name>"
+
+# 1. start the daemon on the real backend (capability detection: a missing plugin
+#    or unreachable VM exits here with a clear message, not a silent failure).
+target/release/decant-daemon --backend memflow --bind 127.0.0.1:7878 &
+
+# 2. list real guest processes — expect explorer.exe etc.
+cargo run -q -p decant-cli -- processes
+
+# 3. pick a pid, read a plausible range, then write a scratch location and read it
+#    back changed (the read+write proof):
+cargo run -q -p decant-cli -- modules <pid>
+cargo run -q -p decant-cli -- read  <pid> <addr> 64
+cargo run -q -p decant-cli -- write <pid> <addr> deadbeef
+cargo run -q -p decant-cli -- read  <pid> <addr> 4      # shows de ad be ef
+cargo run -q -p decant-cli -- diagnostics               # connector: memflow:qemu
+```
+
+Gate passes when step 2 lists real processes and step 3's read-back shows the
+written bytes. (`read_raw`/`write_raw` surface paged-out memory as a clean
+`ReadFailed`/`WriteFailed`, never silently-truncated data.)
