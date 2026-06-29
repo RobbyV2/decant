@@ -2,7 +2,7 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn GetModuleHandleW(module_name: *const u16) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, proc_name: *const u8) -> *mut c_void;
     fn LoadLibraryA(lib_file_name: *const u8) -> *mut c_void;
@@ -62,15 +62,15 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(core::iter::once(0)).collect()
 }
 
-unsafe fn resolve(module_w: &[u16], name: &[u8]) -> usize {
+unsafe fn resolve(module_w: &[u16], name: &[u8]) -> usize { unsafe {
     let h = GetModuleHandleW(module_w.as_ptr());
     if h.is_null() {
         return 0;
     }
     GetProcAddress(h, name.as_ptr()) as usize
-}
+}}
 
-pub unsafe fn capture() {
+pub unsafe fn capture() { unsafe {
     LoadLibraryA(b"psapi.dll\0".as_ptr());
     LoadLibraryA(b"ntdll.dll\0".as_ptr());
 
@@ -122,4 +122,4 @@ pub unsafe fn capture() {
     store(&ORIGINALS.create_remote_thread, resolve(&k32, b"CreateRemoteThread\0"));
     store(&ORIGINALS.create_remote_thread_ex, resolve(&k32, b"CreateRemoteThreadEx\0"));
     store(&ORIGINALS.nt_create_thread_ex, resolve(&ntdll, b"NtCreateThreadEx\0"));
-}
+}}

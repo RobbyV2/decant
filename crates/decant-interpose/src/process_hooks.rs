@@ -9,7 +9,7 @@ use crate::iat;
 use crate::rpc;
 
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn GetModuleHandleW(module_name: *const u16) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, proc_name: *const u8) -> *mut c_void;
 }
@@ -37,13 +37,13 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(core::iter::once(0)).collect()
 }
 
-unsafe fn resolve(module_w: &[u16], name: &[u8]) -> usize {
+unsafe fn resolve(module_w: &[u16], name: &[u8]) -> usize { unsafe {
     let h = GetModuleHandleW(module_w.as_ptr());
     if h.is_null() {
         return 0;
     }
     GetProcAddress(h, name.as_ptr()) as usize
-}
+}}
 
 unsafe fn process_name(handle: usize) -> Option<String> {
     let pid = handle_table::pid_for(handle)?;
@@ -57,7 +57,7 @@ pub unsafe extern "system" fn get_process_image_file_name_a(
     process: *mut c_void,
     filename: *mut u8,
     size: u32,
-) -> u32 {
+) -> u32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         return match process_name(h) {
@@ -71,13 +71,13 @@ pub unsafe extern "system" fn get_process_image_file_name_a(
         return f(process, filename, size);
     }
     0
-}
+}}
 
 pub unsafe extern "system" fn get_process_image_file_name_w(
     process: *mut c_void,
     filename: *mut u16,
     size: u32,
-) -> u32 {
+) -> u32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         return match process_name(h) {
@@ -91,14 +91,14 @@ pub unsafe extern "system" fn get_process_image_file_name_w(
         return f(process, filename, size);
     }
     0
-}
+}}
 
 pub unsafe extern "system" fn query_full_process_image_name_a(
     process: *mut c_void,
     flags: u32,
     exe_name: *mut u8,
     size: *mut u32,
-) -> i32 {
+) -> i32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         return match process_name(h) {
@@ -119,14 +119,14 @@ pub unsafe extern "system" fn query_full_process_image_name_a(
         return f(process, flags, exe_name, size);
     }
     0
-}
+}}
 
 pub unsafe extern "system" fn query_full_process_image_name_w(
     process: *mut c_void,
     flags: u32,
     exe_name: *mut u16,
     size: *mut u32,
-) -> i32 {
+) -> i32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         return match process_name(h) {
@@ -147,9 +147,9 @@ pub unsafe extern "system" fn query_full_process_image_name_w(
         return f(process, flags, exe_name, size);
     }
     0
-}
+}}
 
-pub unsafe extern "system" fn is_wow64_process(process: *mut c_void, wow64: *mut i32) -> i32 {
+pub unsafe extern "system" fn is_wow64_process(process: *mut c_void, wow64: *mut i32) -> i32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         if !wow64.is_null() {
@@ -163,9 +163,9 @@ pub unsafe extern "system" fn is_wow64_process(process: *mut c_void, wow64: *mut
         return f(process, wow64);
     }
     0
-}
+}}
 
-pub unsafe extern "system" fn get_process_id(process: *mut c_void) -> u32 {
+pub unsafe extern "system" fn get_process_id(process: *mut c_void) -> u32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         return match handle_table::pid_for(h) {
@@ -179,9 +179,9 @@ pub unsafe extern "system" fn get_process_id(process: *mut c_void) -> u32 {
         return f(process);
     }
     0
-}
+}}
 
-pub unsafe extern "system" fn get_exit_code_process(process: *mut c_void, code: *mut u32) -> i32 {
+pub unsafe extern "system" fn get_exit_code_process(process: *mut c_void, code: *mut u32) -> i32 { unsafe {
     let h = process as usize;
     if handle_table::is_synthetic(h) {
         if !code.is_null() {
@@ -195,9 +195,9 @@ pub unsafe extern "system" fn get_exit_code_process(process: *mut c_void, code: 
         return f(process, code);
     }
     0
-}
+}}
 
-pub unsafe fn install() -> u32 {
+pub unsafe fn install() -> u32 { unsafe {
     let k32 = wide("kernel32.dll");
     let psapi = wide("psapi.dll");
 
@@ -230,4 +230,4 @@ pub unsafe fn install() -> u32 {
     total += iat::patch_all_modules(None, b"GetProcessId", get_process_id as *mut c_void);
     total += iat::patch_all_modules(None, b"GetExitCodeProcess", get_exit_code_process as *mut c_void);
     total
-}
+}}

@@ -52,7 +52,7 @@ struct ProcessEntry32 {
 }
 
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn LoadLibraryA(lp_lib_file_name: *const u8) -> Handle;
     fn GetProcAddress(h_module: Handle, lp_proc_name: *const u8) -> *mut c_void;
     fn GetCurrentProcess() -> Handle;
@@ -91,7 +91,7 @@ extern "system" {
 }
 
 #[link(name = "psapi")]
-extern "system" {
+unsafe extern "system" {
     fn EnumProcessModules(
         process: Handle,
         modules: *mut Handle,

@@ -21,20 +21,20 @@ mod platform {
     const DLL_PROCESS_ATTACH: u32 = 1;
 
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn GetEnvironmentVariableA(name: *const u8, buf: *mut u8, size: u32) -> u32;
     }
 
-    pub unsafe fn install_hooks() -> u32 {
+    pub unsafe fn install_hooks() -> u32 { unsafe {
         crate::hooks::install_all()
-    }
+    }}
 
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub extern "system" fn decant_install_hooks() -> i32 {
         unsafe { install_hooks() as i32 }
     }
 
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub extern "system" fn DllMain(_hinst: *mut c_void, reason: u32, _reserved: *mut c_void) -> i32 {
         if reason == DLL_PROCESS_ATTACH && autohook_enabled() {
             unsafe {
