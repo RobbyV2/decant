@@ -925,10 +925,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mock-cheat"
-version = "0.1.0"
-
-[[package]]
 name = "no-std-compat"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1241,6 +1237,10 @@ dependencies = [
  "tempfile",
  "wait-timeout",
 ]
+
+[[package]]
+name = "sample-tool"
+version = "0.1.0"
 
 [[package]]
 name = "scopeguard"

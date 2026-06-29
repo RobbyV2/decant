@@ -14,6 +14,10 @@ const DEMO_CHAIN_OFFSET: u64 = 0x10;
 const DEMO_CHAIN_VALUE: u32 = 1337;
 const DEMO_SLOT_ADDR: u64 = 0x0001_4001_0400;
 
+// guest-target layout: magic at base, counter at base+0x10, slot at base+0x18
+const TARGET_MAGIC: [u8; 16] = *b"DECANT::LIVE\x00\xCA\xFE\x55";
+const TARGET_SENTINEL: u64 = 0xDECA_F1ED_5107_C0DE;
+
 const PROCESS_ALL_ACCESS: u32 = 0x001F_FFFF;
 const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
 const MEM_COMMIT_RESERVE: u32 = 0x3000;
@@ -123,7 +127,74 @@ fn main() -> ExitCode {
         return run_interception_selftest();
     }
 
+    if let Ok(pid) = std::env::var("DECANT_TARGET_PID") {
+        return run_target(&pid);
+    }
+
     run_checks()
+}
+
+fn parse_u64(s: &str) -> Option<u64> {
+    let s = s.trim();
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(h) => u64::from_str_radix(h, 16).ok(),
+        None => s.parse::<u64>().ok(),
+    }
+}
+
+fn run_target(pid_s: &str) -> ExitCode {
+    let pid = match parse_u64(pid_s) {
+        Some(v) => v as u32,
+        None => return ExitCode::from(20),
+    };
+    let base = match std::env::var("DECANT_TARGET_BASE").ok().and_then(|s| parse_u64(&s)) {
+        Some(v) => v,
+        None => {
+            eprintln!("set DECANT_TARGET_BASE to guest-target's struct base");
+            return ExitCode::from(21);
+        }
+    };
+    let counter_addr = base + 0x10;
+    let slot_addr = base + 0x18;
+
+    let proc = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, pid) };
+    if proc.is_null() {
+        println!("open_process: FAIL (pid {pid})");
+        return ExitCode::from(22);
+    }
+    println!("open_process: ok (pid {pid}, handle={proc:?})");
+
+    let mut magic = [0u8; 16];
+    let magic_ok = rpm(proc, base, &mut magic) && magic == TARGET_MAGIC;
+    println!("read_magic: {} got={:02X?}", if magic_ok { "MATCH" } else { "mismatch" }, &magic);
+
+    let mut c1b = [0u8; 8];
+    rpm(proc, counter_addr, &mut c1b);
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let mut c2b = [0u8; 8];
+    rpm(proc, counter_addr, &mut c2b);
+    let (c1, c2) = (u64::from_le_bytes(c1b), u64::from_le_bytes(c2b));
+    println!("counter: {c1} -> {c2} (incrementing: {})", if c2 > c1 { "yes" } else { "no" });
+
+    let wrote = wpm(proc, slot_addr, &TARGET_SENTINEL.to_le_bytes());
+    let mut sb = [0u8; 8];
+    let rb = rpm(proc, slot_addr, &mut sb);
+    let slot_ok = wrote && rb && u64::from_le_bytes(sb) == TARGET_SENTINEL;
+    println!(
+        "write_sentinel: {} (slot readback={:#018x})",
+        if slot_ok { "ok" } else { "bad" },
+        u64::from_le_bytes(sb)
+    );
+
+    unsafe { CloseHandle(proc) };
+
+    if magic_ok && slot_ok {
+        println!("sample-tool target: PASS");
+        ExitCode::SUCCESS
+    } else {
+        println!("sample-tool target: FAIL");
+        ExitCode::from(23)
+    }
 }
 
 fn run_checks() -> ExitCode {
@@ -133,7 +204,7 @@ fn run_checks() -> ExitCode {
     let open_ok = !proc.is_null();
     check(&mut all_pass, "open_process", open_ok, &format!("handle={proc:?}"));
     if !open_ok {
-        println!("mock-cheat: ABORT (OpenProcess failed; is the daemon reachable?)");
+        println!("sample-tool: ABORT (OpenProcess failed; is the daemon reachable?)");
         return ExitCode::from(10);
     }
 
@@ -213,10 +284,10 @@ fn run_checks() -> ExitCode {
     check(&mut all_pass, "close_synthetic", close_ok, "CloseHandle(synthetic)==TRUE");
 
     if all_pass {
-        println!("mock-cheat: ALL PASS");
+        println!("sample-tool: ALL PASS");
         ExitCode::SUCCESS
     } else {
-        println!("mock-cheat: FAILED (see check lines above)");
+        println!("sample-tool: FAILED (see check lines above)");
         ExitCode::from(11)
     }
 }
@@ -309,19 +380,19 @@ fn install_via_loadlibrary() -> Result<(), ExitCode> {
     unsafe {
         let module = LoadLibraryA(dll.as_ptr());
         if module.is_null() {
-            eprintln!("mock-cheat: LoadLibraryA(decant_interpose.dll) failed");
+            eprintln!("sample-tool: LoadLibraryA(decant_interpose.dll) failed");
             return Err(ExitCode::from(2));
         }
         let proc = GetProcAddress(module, sym.as_ptr());
         if proc.is_null() {
-            eprintln!("mock-cheat: GetProcAddress(decant_install_hooks) failed");
+            eprintln!("sample-tool: GetProcAddress(decant_install_hooks) failed");
             return Err(ExitCode::from(3));
         }
         let install: extern "system" fn() -> i32 = std::mem::transmute(proc);
         let patched = install();
-        eprintln!("mock-cheat: decant_install_hooks patched {patched} slot(s)");
+        eprintln!("sample-tool: decant_install_hooks patched {patched} slot(s)");
         if patched < 1 {
-            eprintln!("mock-cheat: installer patched nothing");
+            eprintln!("sample-tool: installer patched nothing");
             return Err(ExitCode::from(4));
         }
     }

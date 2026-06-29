@@ -11,7 +11,7 @@ const WIN_TARGET: &str = "x86_64-pc-windows-gnu";
 const WIN_CRATES: &[&str] = &[
     "decant-interpose",
     "guest-target",
-    "mock-cheat",
+    "sample-tool",
     "decant-launcher",
     "dll-smoke",
     "hello-dll",
@@ -158,10 +158,10 @@ fn inject_test() -> Result<()> {
 
     let mut build = cargo();
     build.args([
-        "build", "--target", WIN_TARGET, "-p", "decant-interpose", "-p", "mock-cheat",
+        "build", "--target", WIN_TARGET, "-p", "decant-interpose", "-p", "sample-tool",
         "-p", "decant-launcher",
     ]);
-    run("cargo build carafe + mock-cheat + launcher", &mut build)?;
+    run("cargo build carafe + sample-tool + launcher", &mut build)?;
 
     setup()?;
 
@@ -169,7 +169,7 @@ fn inject_test() -> Result<()> {
     let stage = root.join("target").join("inject-test-stage");
     std::fs::create_dir_all(&stage)
         .with_context(|| format!("creating staging dir {}", stage.display()))?;
-    for name in ["decant_interpose.dll", "mock-cheat.exe", "decant-launcher.exe"] {
+    for name in ["decant_interpose.dll", "sample-tool.exe", "decant-launcher.exe"] {
         let src = out_dir.join(name);
         if !src.exists() {
             bail!("expected build artifact missing: {}", src.display());
@@ -178,7 +178,7 @@ fn inject_test() -> Result<()> {
     }
 
     let prefix = root.join("wine-env").join("prefix");
-    let mock = stage.join("mock-cheat.exe");
+    let mock = stage.join("sample-tool.exe");
     let launcher = stage.join("decant-launcher.exe");
     let autohook = [("DECANT_AUTOHOOK", "1")];
 
@@ -196,7 +196,7 @@ fn inject_test() -> Result<()> {
         bail!("baseline FAIL: expected passthrough (the test cannot discriminate!)");
     }
 
-    let r2 = run_under_wine(&launcher, &["mock-cheat.exe", "--inject-test"], &prefix, &autohook)
+    let r2 = run_under_wine(&launcher, &["sample-tool.exe", "--inject-test"], &prefix, &autohook)
         .context("running launcher injection")?;
     println!("inject-test launcher injection: stdout={:?}", r2.stdout.trim());
     if !r2.ok_with("INTERCEPTED") {
@@ -213,10 +213,10 @@ fn e2e() -> Result<()> {
 
     let mut wbuild = cargo();
     wbuild.args([
-        "build", "--target", WIN_TARGET, "-p", "decant-interpose", "-p", "mock-cheat", "-p",
+        "build", "--target", WIN_TARGET, "-p", "decant-interpose", "-p", "sample-tool", "-p",
         "decant-launcher",
     ]);
-    run("cargo build carafe + mock-cheat + launcher", &mut wbuild)?;
+    run("cargo build carafe + sample-tool + launcher", &mut wbuild)?;
     run(
         "cargo build daemon + cli",
         cargo().args(["build", "-p", "decant-daemon", "-p", "decant-cli"]),
@@ -228,7 +228,7 @@ fn e2e() -> Result<()> {
     let stage = root.join("target").join("e2e-stage");
     std::fs::create_dir_all(&stage)
         .with_context(|| format!("creating staging dir {}", stage.display()))?;
-    for name in ["decant_interpose.dll", "mock-cheat.exe", "decant-launcher.exe"] {
+    for name in ["decant_interpose.dll", "sample-tool.exe", "decant-launcher.exe"] {
         let src = out_dir.join(name);
         if !src.exists() {
             bail!("expected build artifact missing: {}", src.display());
@@ -270,7 +270,7 @@ fn e2e() -> Result<()> {
     let prefix = root.join("wine-env").join("prefix");
     let run_result = run_under_wine(
         &launcher,
-        &["mock-cheat.exe"],
+        &["sample-tool.exe"],
         &prefix,
         &[("DECANT_AUTOHOOK", "1"), ("DECANT_ENDPOINT", &endpoint)],
     );
@@ -282,19 +282,19 @@ fn e2e() -> Result<()> {
     let _ = daemon.kill();
     let _ = daemon.wait();
 
-    let out = run_result.context("running mock-cheat under Wine via launcher")?;
+    let out = run_result.context("running sample-tool under Wine via launcher")?;
 
-    println!("mock-cheat output");
+    println!("sample-tool output");
     for l in out.stdout.lines() {
         println!("{l}");
     }
     if !out.stderr.trim().is_empty() {
-        eprintln!("mock-cheat stderr\n{}", out.stderr.trim());
+        eprintln!("sample-tool stderr\n{}", out.stderr.trim());
     }
 
-    if out.status != 0 || !out.stdout.contains("mock-cheat: ALL PASS") {
+    if out.status != 0 || !out.stdout.contains("sample-tool: ALL PASS") {
         bail!(
-            "e2e: FAIL (exit={}, missing 'mock-cheat: ALL PASS'). See check lines above.",
+            "e2e: FAIL (exit={}, missing 'sample-tool: ALL PASS'). See check lines above.",
             out.status
         );
     }
