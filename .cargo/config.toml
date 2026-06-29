@@ -1,0 +1,16 @@
+# Cross-compilation wiring for the Windows-gnu target.
+#
+# We deliberately do NOT set a global `[build] target`: that would force EVERY
+# crate (including the native Linux daemon/cli) to build for Windows. Instead the
+# host crates build for the default host triple, and the Windows crates are built
+# with an explicit `--target x86_64-pc-windows-gnu` (see xtask / wine-env scripts).
+#
+# The Rust `x86_64-pc-windows-gnu` target ships its own bundled mingw linker, but
+# we pin the system mingw-w64 toolchain explicitly so the build is reproducible
+# against the toolchain `wine-env/setup.sh` verifies is installed.
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"
+
+[alias]
+xtask = "run --package xtask --"

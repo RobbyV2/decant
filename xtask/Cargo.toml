@@ -1,0 +1,10 @@
+[package]
+name = "xtask"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Build/test orchestration: cargo xtask <setup|build-native|build-dll|test|test-live|wine-smoke|demo>."
+
+[dependencies]
+anyhow.workspace = true
+decant-wine-harness = { path = "../crates/decant-wine-harness" }

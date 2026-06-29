@@ -1,0 +1,55 @@
+# Decant — cargo workspace.
+#
+# IMPORTANT: this is a *mixed-target* workspace. Most crates build for the host
+# (native Linux: daemon, cli, core, backend, protocol). A handful build ONLY for
+# `x86_64-pc-windows-gnu` (the interposer DLL and the test binaries that run under
+# Wine or inside the VM). A bare `cargo build` must NOT try to build the Windows
+# crates for Linux, so `default-members` lists host crates only. The Windows crates
+# are still members (shared lockfile + target dir) and are built explicitly via
+# `cargo build -p <crate> --target x86_64-pc-windows-gnu` (see xtask).
+[workspace]
+resolver = "2"
+members = [
+    "xtask",
+    "crates/decant-protocol",
+    "crates/decant-backend",
+    "crates/decant-memflow",
+    "crates/decant-core",
+    "crates/decant-daemon",
+    "crates/decant-cli",
+    "crates/decant-wine-harness",
+    "crates/decant-interpose",
+    "testbins/guest-target",
+    "testbins/mock-cheat",
+    "testbins/dll-smoke",
+    "testbins/hello-dll",
+]
+# Host-only crates. `cargo build`/`cargo test` with no `-p`/`--target` touch only these.
+default-members = [
+    "xtask",
+    "crates/decant-protocol",
+    "crates/decant-backend",
+    "crates/decant-memflow",
+    "crates/decant-core",
+    "crates/decant-daemon",
+    "crates/decant-cli",
+    "crates/decant-wine-harness",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/decant"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+anyhow = "1"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 2

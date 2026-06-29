@@ -1,0 +1,20 @@
+[package]
+name = "decant-memflow"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "MemflowBackend — the real connector over guest physical RAM. Feature-gated; the memflow dependency is added in Phase 1 after empirical API verification (spec operating rule #3)."
+
+[features]
+# Phase 1 will add `memflow = ["dep:memflow", "dep:memflow-win32", ...]` once the
+# exact crate versions and method names are verified against docs.rs and recorded
+# in docs/DECISIONS.md. Until then the crate compiles as an empty stub so the
+# host workspace builds hermetically with no network/connector dependency.
+default = []
+# Declared so `#[cfg(feature = "memflow")]` is a recognized cfg. Enabling it is a
+# hard compile_error until Phase 1 wires the real connector.
+memflow = []
+
+[dependencies]
+decant-protocol = { path = "../decant-protocol" }
+decant-backend = { path = "../decant-backend" }

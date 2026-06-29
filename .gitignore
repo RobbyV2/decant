@@ -1,0 +1,4 @@
+/target
+
+# Isolated, disposable Wine prefix created by wine-env/setup.sh.
+/wine-env/prefix

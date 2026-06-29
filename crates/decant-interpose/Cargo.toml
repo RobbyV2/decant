@@ -1,0 +1,13 @@
+[package]
+name = "decant-interpose"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "The carafe: the Windows interposer DLL. Implements a few Win32/NT exports against the daemon, forwards the rest to the real Wine builtin. Built only for x86_64-pc-windows-gnu."
+
+[lib]
+name = "decant_interpose"
+crate-type = ["cdylib"]
+
+[dependencies]
+decant-protocol = { path = "../decant-protocol" }

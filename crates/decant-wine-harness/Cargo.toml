@@ -1,0 +1,9 @@
+[package]
+name = "decant-wine-harness"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Test helper: launch a Windows exe in the isolated Wine prefix with the interposer attached, capture stdout/exit."
+
+[dependencies]
+anyhow.workspace = true

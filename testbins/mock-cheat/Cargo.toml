@@ -1,0 +1,10 @@
+[package]
+name = "mock-cheat"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Runs UNDER WINE: exercises OpenProcess/RPM/WPM/toolhelp against the interposer. Built only for x86_64-pc-windows-gnu."
+
+[[bin]]
+name = "mock-cheat"
+path = "src/main.rs"

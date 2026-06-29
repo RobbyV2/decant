@@ -1,0 +1,10 @@
+[package]
+name = "guest-target"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Runs INSIDE the VM: a self-verifying target with a magic AOB header, a live counter, and a writable slot. Built only for x86_64-pc-windows-gnu."
+
+[[bin]]
+name = "guest-target"
+path = "src/main.rs"

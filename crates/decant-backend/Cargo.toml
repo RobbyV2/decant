@@ -1,0 +1,13 @@
+[package]
+name = "decant-backend"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "The MemoryBackend seam: the one trait everything reads/writes guest memory through, plus the scriptable MockBackend/MockGuest (the tasting)."
+
+[dependencies]
+decant-protocol = { path = "../decant-protocol" }
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1"

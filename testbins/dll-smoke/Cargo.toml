@@ -1,0 +1,10 @@
+[package]
+name = "dll-smoke"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Phase 0 cross-compile proof: a tiny exe that LoadLibrary's hello_dll.dll and calls add(2, 3). Built only for x86_64-pc-windows-gnu."
+
+[[bin]]
+name = "dll-smoke"
+path = "src/main.rs"

@@ -1,0 +1,20 @@
+[package]
+name = "decant-daemon"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "The cellar: native Linux TCP daemon serving decant-protocol over a MemoryBackend."
+
+[[bin]]
+name = "decant-daemon"
+path = "src/main.rs"
+
+[dependencies]
+decant-protocol = { path = "../decant-protocol" }
+decant-backend = { path = "../decant-backend" }
+decant-core = { path = "../decant-core" }
+decant-memflow = { path = "../decant-memflow" }
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "hello-dll"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Phase 0 cross-compile proof: a minimal Rust cdylib exporting add(a, b). Built only for x86_64-pc-windows-gnu."
+
+[lib]
+name = "hello_dll"
+crate-type = ["cdylib"]
