@@ -8,3 +8,4 @@ description = "Build/test orchestration: cargo xtask <setup|build-native|build-d
 [dependencies]
 anyhow.workspace = true
 decant-wine-harness = { path = "../crates/decant-wine-harness" }
+decant-client = { path = "../crates/decant-client" }

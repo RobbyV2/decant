@@ -11,13 +11,48 @@ use crate::rpc;
 const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
 const TH32CS_SNAPMODULE: u32 = 0x0000_0008;
 const TH32CS_SNAPMODULE32: u32 = 0x0000_0010;
+const PAGE_NOACCESS: u32 = 0x01;
+const PAGE_READONLY: u32 = 0x02;
 const PAGE_READWRITE: u32 = 0x04;
+const PAGE_EXECUTE_READ: u32 = 0x20;
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const MEM_COMMIT: u32 = 0x1000;
+const MEM_PRIVATE: u32 = 0x20000;
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_UNSUCCESSFUL: i32 = 0xC000_0001u32 as i32;
+const STATUS_NOT_SUPPORTED: i32 = 0xC000_00BBu32 as i32;
+
+#[repr(C)]
+pub struct MemoryBasicInformation {
+    pub base_address: usize,
+    pub allocation_base: usize,
+    pub allocation_protect: u32,
+    pub __align1: u32,
+    pub region_size: usize,
+    pub state: u32,
+    pub protect: u32,
+    pub type_: u32,
+    pub __align2: u32,
+}
 
 #[inline]
 fn invalid_handle() -> *mut c_void {
     usize::MAX as *mut c_void
+}
+
+fn report_unsupported(op: &str) {
+    let _ = rpc::request(Request::ReportUnsupported { op: op.to_string() });
+    eprintln!("decant: refused unsupported operation {op}; the guest cannot execute code through the handle model");
+}
+
+fn protect_flags(readable: bool, writable: bool, executable: bool) -> u32 {
+    match (readable, writable, executable) {
+        (_, true, true) => PAGE_EXECUTE_READWRITE,
+        (_, true, false) => PAGE_READWRITE,
+        (_, false, true) => PAGE_EXECUTE_READ,
+        (true, false, false) => PAGE_READONLY,
+        _ => PAGE_NOACCESS,
+    }
 }
 
 type RpmFn = unsafe extern "system" fn(*mut c_void, *const c_void, *mut c_void, usize, *mut usize) -> i32;
@@ -597,6 +632,212 @@ pub unsafe extern "system" fn virtual_protect_ex(
     1
 }
 
+type VqExFn = unsafe extern "system" fn(*mut c_void, *const c_void, *mut MemoryBasicInformation, usize) -> usize;
+type VAllocExFn = unsafe extern "system" fn(*mut c_void, *mut c_void, usize, u32, u32) -> *mut c_void;
+type VFreeExFn = unsafe extern "system" fn(*mut c_void, *mut c_void, usize, u32) -> i32;
+type NtAllocFn = unsafe extern "system" fn(*mut c_void, *mut *mut c_void, usize, *mut usize, u32, u32) -> i32;
+type NtFreeFn = unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut usize, u32) -> i32;
+type CrtFn = unsafe extern "system" fn(*mut c_void, *mut c_void, usize, *mut c_void, *mut c_void, u32, *mut u32) -> *mut c_void;
+type CrtExFn = unsafe extern "system" fn(*mut c_void, *mut c_void, usize, *mut c_void, *mut c_void, u32, *mut u32, *mut c_void) -> *mut c_void;
+type NtCreateThreadExFn = unsafe extern "system" fn(*mut *mut c_void, u32, *mut c_void, *mut c_void, *mut c_void, *mut c_void, u32, usize, usize, usize, *mut c_void) -> i32;
+
+pub unsafe extern "system" fn virtual_query_ex(
+    process: *mut c_void,
+    address: *const c_void,
+    mbi: *mut MemoryBasicInformation,
+    length: usize,
+) -> usize {
+    let h = process as usize;
+    if handle_table::is_synthetic(h) {
+        let pid = match handle_table::pid_for(h) {
+            Some(p) => p,
+            None => return 0,
+        };
+        if mbi.is_null() || length < core::mem::size_of::<MemoryBasicInformation>() {
+            return 0;
+        }
+        let addr = address as u64;
+        if let Some(Response::MemoryMap(regions)) = rpc::request(Request::MemoryMap(pid)) {
+            if let Some(r) = regions.iter().find(|r| addr >= r.base && addr < r.base + r.size) {
+                // protection is coarse; allocation history is not modeled
+                let info = MemoryBasicInformation {
+                    base_address: r.base as usize,
+                    allocation_base: r.base as usize,
+                    allocation_protect: protect_flags(r.readable, r.writable, r.executable),
+                    __align1: 0,
+                    region_size: r.size as usize,
+                    state: MEM_COMMIT,
+                    protect: protect_flags(r.readable, r.writable, r.executable),
+                    type_: MEM_PRIVATE,
+                    __align2: 0,
+                };
+                *mbi = info;
+                return core::mem::size_of::<MemoryBasicInformation>();
+            }
+        }
+        return 0;
+    }
+    let p = ORIGINALS.virtual_query_ex.load(Ordering::SeqCst);
+    if p != 0 {
+        let f: VqExFn = core::mem::transmute(p);
+        return f(process, address, mbi, length);
+    }
+    0
+}
+
+pub unsafe extern "system" fn virtual_alloc_ex(
+    process: *mut c_void,
+    address: *mut c_void,
+    size: usize,
+    alloc_type: u32,
+    protect: u32,
+) -> *mut c_void {
+    let h = process as usize;
+    if handle_table::is_synthetic(h) {
+        report_unsupported("VirtualAllocEx");
+        return core::ptr::null_mut();
+    }
+    let p = ORIGINALS.virtual_alloc_ex.load(Ordering::SeqCst);
+    if p != 0 {
+        let f: VAllocExFn = core::mem::transmute(p);
+        return f(process, address, size, alloc_type, protect);
+    }
+    core::ptr::null_mut()
+}
+
+pub unsafe extern "system" fn virtual_free_ex(
+    process: *mut c_void,
+    address: *mut c_void,
+    size: usize,
+    free_type: u32,
+) -> i32 {
+    let h = process as usize;
+    if handle_table::is_synthetic(h) {
+        report_unsupported("VirtualFreeEx");
+        return 0;
+    }
+    let p = ORIGINALS.virtual_free_ex.load(Ordering::SeqCst);
+    if p != 0 {
+        let f: VFreeExFn = core::mem::transmute(p);
+        return f(process, address, size, free_type);
+    }
+    0
+}
+
+pub unsafe extern "system" fn nt_allocate_virtual_memory(
+    process: *mut c_void,
+    base: *mut *mut c_void,
+    zerobits: usize,
+    size: *mut usize,
+    alloc_type: u32,
+    protect: u32,
+) -> i32 {
+    let h = process as usize;
+    if handle_table::is_synthetic(h) {
+        report_unsupported("NtAllocateVirtualMemory");
+        return STATUS_NOT_SUPPORTED;
+    }
+    let p = ORIGINALS.nt_allocate_virtual_memory.load(Ordering::SeqCst);
+    if p != 0 {
+        let f: NtAllocFn = core::mem::transmute(p);
+        return f(process, base, zerobits, size, alloc_type, protect);
+    }
+    STATUS_NOT_SUPPORTED
+}
+
+pub unsafe extern "system" fn nt_free_virtual_memory(
+    process: *mut c_void,
+    base: *mut *mut c_void,
+    size: *mut usize,
+    free_type: u32,
+) -> i32 {
+    let h = process as usize;
+    if handle_table::is_synthetic(h) {
+        report_unsupported("NtFreeVirtualMemory");
+        return STATUS_NOT_SUPPORTED;
+    }
+    let p = ORIGINALS.nt_free_virtual_memory.load(Ordering::SeqCst);
+    if p != 0 {
+        let f: NtFreeFn = core::mem::transmute(p);
+        return f(process, base, size, free_type);
+    }
+    STATUS_NOT_SUPPORTED
+}
+
+pub unsafe extern "system" fn create_remote_thread(
+    process: *mut c_void,
+    attrs: *mut c_void,
+    stack: usize,
+    start: *mut c_void,
+    param: *mut c_void,
+    flags: u32,
+    tid: *mut u32,
+) -> *mut c_void {
+    let h = process as usize;
+    if handle_table::is_synthetic(h) {
+        report_unsupported("CreateRemoteThread");
+        return core::ptr::null_mut();
+    }
+    let p = ORIGINALS.create_remote_thread.load(Ordering::SeqCst);
+    if p != 0 {
+        let f: CrtFn = core::mem::transmute(p);
+        return f(process, attrs, stack, start, param, flags, tid);
+    }
+    core::ptr::null_mut()
+}
+
+pub unsafe extern "system" fn create_remote_thread_ex(
+    process: *mut c_void,
+    attrs: *mut c_void,
+    stack: usize,
+    start: *mut c_void,
+    param: *mut c_void,
+    flags: u32,
+    tid: *mut u32,
+    attr_list: *mut c_void,
+) -> *mut c_void {
+    let h = process as usize;
+    if handle_table::is_synthetic(h) {
+        report_unsupported("CreateRemoteThreadEx");
+        return core::ptr::null_mut();
+    }
+    let p = ORIGINALS.create_remote_thread_ex.load(Ordering::SeqCst);
+    if p != 0 {
+        let f: CrtExFn = core::mem::transmute(p);
+        return f(process, attrs, stack, start, param, flags, tid, attr_list);
+    }
+    core::ptr::null_mut()
+}
+
+pub unsafe extern "system" fn nt_create_thread_ex(
+    thread: *mut *mut c_void,
+    access: u32,
+    objattrs: *mut c_void,
+    process: *mut c_void,
+    start: *mut c_void,
+    param: *mut c_void,
+    flags: u32,
+    zerobits: usize,
+    stacksize: usize,
+    maxstack: usize,
+    attrlist: *mut c_void,
+) -> i32 {
+    let h = process as usize;
+    if handle_table::is_synthetic(h) {
+        report_unsupported("NtCreateThreadEx");
+        return STATUS_NOT_SUPPORTED;
+    }
+    let p = ORIGINALS.nt_create_thread_ex.load(Ordering::SeqCst);
+    if p != 0 {
+        let f: NtCreateThreadExFn = core::mem::transmute(p);
+        return f(
+            thread, access, objattrs, process, start, param, flags, zerobits, stacksize, maxstack,
+            attrlist,
+        );
+    }
+    STATUS_NOT_SUPPORTED
+}
+
 pub unsafe fn install_all() -> u32 {
     originals::capture();
 
@@ -640,6 +881,15 @@ pub unsafe fn install_all() -> u32 {
     patch!(b"K32GetModuleFileNameExW", get_module_file_name_ex_w);
 
     patch!(b"VirtualProtectEx", virtual_protect_ex);
+    patch!(b"VirtualQueryEx", virtual_query_ex);
+
+    patch!(b"VirtualAllocEx", virtual_alloc_ex);
+    patch!(b"VirtualFreeEx", virtual_free_ex);
+    patch!(b"NtAllocateVirtualMemory", nt_allocate_virtual_memory);
+    patch!(b"NtFreeVirtualMemory", nt_free_virtual_memory);
+    patch!(b"CreateRemoteThread", create_remote_thread);
+    patch!(b"CreateRemoteThreadEx", create_remote_thread_ex);
+    patch!(b"NtCreateThreadEx", nt_create_thread_ex);
 
     total
 }

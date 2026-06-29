@@ -20,6 +20,14 @@ pub struct Originals {
     pub get_module_base_name_w: AtomicUsize,
     pub get_module_file_name_ex_a: AtomicUsize,
     pub get_module_file_name_ex_w: AtomicUsize,
+    pub virtual_query_ex: AtomicUsize,
+    pub virtual_alloc_ex: AtomicUsize,
+    pub virtual_free_ex: AtomicUsize,
+    pub nt_allocate_virtual_memory: AtomicUsize,
+    pub nt_free_virtual_memory: AtomicUsize,
+    pub create_remote_thread: AtomicUsize,
+    pub create_remote_thread_ex: AtomicUsize,
+    pub nt_create_thread_ex: AtomicUsize,
 }
 
 impl Originals {
@@ -36,6 +44,14 @@ impl Originals {
             get_module_base_name_w: AtomicUsize::new(0),
             get_module_file_name_ex_a: AtomicUsize::new(0),
             get_module_file_name_ex_w: AtomicUsize::new(0),
+            virtual_query_ex: AtomicUsize::new(0),
+            virtual_alloc_ex: AtomicUsize::new(0),
+            virtual_free_ex: AtomicUsize::new(0),
+            nt_allocate_virtual_memory: AtomicUsize::new(0),
+            nt_free_virtual_memory: AtomicUsize::new(0),
+            create_remote_thread: AtomicUsize::new(0),
+            create_remote_thread_ex: AtomicUsize::new(0),
+            nt_create_thread_ex: AtomicUsize::new(0),
         }
     }
 }
@@ -97,4 +113,13 @@ pub unsafe fn capture() {
         if p != 0 { p } else { resolve(&k32, b"K32GetModuleFileNameExW\0") }
     };
     store(&ORIGINALS.get_module_file_name_ex_w, gmfn_w);
+
+    store(&ORIGINALS.virtual_query_ex, resolve(&k32, b"VirtualQueryEx\0"));
+    store(&ORIGINALS.virtual_alloc_ex, resolve(&k32, b"VirtualAllocEx\0"));
+    store(&ORIGINALS.virtual_free_ex, resolve(&k32, b"VirtualFreeEx\0"));
+    store(&ORIGINALS.nt_allocate_virtual_memory, resolve(&ntdll, b"NtAllocateVirtualMemory\0"));
+    store(&ORIGINALS.nt_free_virtual_memory, resolve(&ntdll, b"NtFreeVirtualMemory\0"));
+    store(&ORIGINALS.create_remote_thread, resolve(&k32, b"CreateRemoteThread\0"));
+    store(&ORIGINALS.create_remote_thread_ex, resolve(&k32, b"CreateRemoteThreadEx\0"));
+    store(&ORIGINALS.nt_create_thread_ex, resolve(&ntdll, b"NtCreateThreadEx\0"));
 }
