@@ -22,23 +22,23 @@ $ decant-cli read 2980 0x00007ff756d00000 16
 
 ```
   ┌──────────────────────────────────────────────┐
-  │  Windows guest VM  (QEMU/KVM)                 │
-  │    target.exe, real and unmodified            │
+  │  Windows guest VM  (QEMU/KVM)                │
+  │    target.exe, real and unmodified           │
   └──────────────────▲───────────────────────────┘
                      │  physical RAM read out-of-band (memflow)
   ┌──────────────────┴───────────────────────────┐
-  │  Linux host                                   │
-  │                                               │
-  │   decant-daemon (the cellar)                  │
-  │     owns the MemoryBackend, dispatches reqs   │
-  │                  ▲                            │
-  │                  │  TCP 127.0.0.1             │
-  │                  │  length-prefixed bincode   │
-  │                  │  (decant-protocol)         │
-  │   Wine process   │                            │
-  │     [ unmodified tool ]                       │
-  │     + decant-interpose.dll (the carafe) ──────┘
-  │       intercepts Win32/NT memory exports
+  │  Linux host                                  │
+  │                                              │
+  │   decant-daemon (the cellar)                 │
+  │     owns the MemoryBackend, dispatches reqs  │
+  │                  ▲                           │
+  │                  │  TCP 127.0.0.1            │
+  │                  │  length-prefixed bincode  │
+  │                  │  (decant-protocol)        │
+  │   Wine process   │                           │
+  │     [ unmodified tool ]                      │
+  │     + decant-interpose.dll (the carafe)      │
+  │       intercepts Win32/NT memory exports     │
   └──────────────────────────────────────────────┘
 ```
 
