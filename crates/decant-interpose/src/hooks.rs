@@ -138,7 +138,7 @@ fn put_wide(buf: &mut [u16], s: &str) {
     buf[i] = 0;
 }
 
-unsafe fn put_ansi_counted(ptr: *mut u8, size: u32, s: &str) -> u32 {
+pub(crate) unsafe fn put_ansi_counted(ptr: *mut u8, size: u32, s: &str) -> u32 {
     if ptr.is_null() || size == 0 {
         return 0;
     }
@@ -149,7 +149,7 @@ unsafe fn put_ansi_counted(ptr: *mut u8, size: u32, s: &str) -> u32 {
     n as u32
 }
 
-unsafe fn put_wide_counted(ptr: *mut u16, size: u32, s: &str) -> u32 {
+pub(crate) unsafe fn put_wide_counted(ptr: *mut u16, size: u32, s: &str) -> u32 {
     if ptr.is_null() || size == 0 {
         return 0;
     }
@@ -890,6 +890,9 @@ pub unsafe fn install_all() -> u32 {
     patch!(b"CreateRemoteThread", create_remote_thread);
     patch!(b"CreateRemoteThreadEx", create_remote_thread_ex);
     patch!(b"NtCreateThreadEx", nt_create_thread_ex);
+
+    total += crate::process_hooks::install();
+    total += crate::module_hooks::install();
 
     total
 }

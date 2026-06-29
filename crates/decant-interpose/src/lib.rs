@@ -8,7 +8,11 @@ mod hooks;
 #[cfg(windows)]
 mod iat;
 #[cfg(windows)]
+mod module_hooks;
+#[cfg(windows)]
 mod originals;
+#[cfg(windows)]
+mod process_hooks;
 
 #[cfg(windows)]
 mod platform {
