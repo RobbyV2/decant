@@ -1,0 +1,10 @@
+[package]
+name = "decant-launcher"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Phase 3 spike rung-2c: launches a target exe SUSPENDED under Wine and injects the carafe via CreateRemoteThread+LoadLibrary (public exports only). Built only for x86_64-pc-windows-gnu."
+
+[[bin]]
+name = "decant-launcher"
+path = "src/main.rs"

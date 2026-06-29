@@ -203,23 +203,97 @@ compile-verified; the user runs the live gate per `docs/TESTING.md`.
 
 ---
 
-## ADR-0006 — Injection / interposition vector *(placeholder)*
+## ADR-0006 — Injection / interposition vector: IAT patching, delivered by remote-thread injection
 
-**Status:** Pending (to be resolved in Phase 3)
+**Status:** Accepted (Phase 3 spike) — **WINE-VALIDATED 2026-06-29** on wine-11.11
+against the isolated repo-local prefix. Reproduce with `cargo xtask spike`.
 
-**Context.** The carafe (`decant-interpose.dll`) must get itself loaded into the
-unmodified tool under Wine *and* take over the relevant Win32/NT memory exports.
-Candidate vectors (to be spiked, not assumed): `WINEDLLOVERRIDES` builtin/native
-substitution, an `AppInit`-style load, IAT/EAT patching from a loader, or
-inline-hooking the `Nt*` prologues. Each has different fragility and different
-exposure to Wine internals.
+**Context.** The carafe (`decant-interpose.dll`) must (1) get itself loaded into an
+*unmodified* tool running under Wine, and (2) take over the relevant Win32/NT memory
+exports — all while binding **only** to the public Win32/NT export ABI + the PE
+format, never Wine internals (rule #4, `docs/VERSIONING.md`). Two questions, spiked
+separately: the **interception mechanism** and the **delivery vector**.
 
-**Decision.** *Deferred.* The injection vector is chosen by the Phase 3 spike and
-recorded here as an ADR *before* `decant-interpose` is implemented. Phase 0 ships
-an empty `cdylib` so the cross-compile target is wired and builds.
+**Decision.**
 
-**To record here when resolved:** the chosen vector; why it beat the alternatives;
-exactly which public exports are interposed and how the real builtin is reached for
-forwarding; and the residual fragility (e.g. if it lands on inline-hooking `Nt*`
-prologues — see `docs/VERSIONING.md`). The chosen mechanism must bind only to the
-public export ABI, never Wine internals.
+- **Interception mechanism = Import Address Table (IAT) patching.** The carafe walks
+  a loaded module's PE import directory (DOS header → NT headers → data-directory
+  entry 1 → `IMAGE_IMPORT_DESCRIPTOR` array → INT/IAT thunk pairs) and, for each
+  import matching a target name (e.g. `kernel32.dll!ReadProcessMemory`), overwrites
+  the 8-byte IAT slot with a pointer to the carafe's replacement. It patches the main
+  exe via `GetModuleHandleW(NULL)` and every other loaded module via
+  `psapi!EnumProcessModules`. The only image mutation is a pointer in a data table,
+  guarded by `VirtualProtect(PAGE_READWRITE)` and restored afterward. Implemented in
+  `crates/decant-interpose/src/lib.rs` (`patch_module_iat` / `patch_all_modules` /
+  `write_iat_slot`).
+
+- **Delivery vector = launcher-driven remote-thread injection** (spike rung 2c).
+  `testbins/decant-launcher` does `CreateProcessW(target, CREATE_SUSPENDED)` →
+  `VirtualAllocEx`+`WriteProcessMemory` (the DLL path) → `CreateRemoteThread` at
+  `kernel32!LoadLibraryA` → wait → `ResumeThread`. The carafe's `DllMain`
+  (`DLL_PROCESS_ATTACH`) self-installs the IAT hooks, so the target is *unmodified*.
+  This is the `wine-env/run.sh <tool>` entry point Decant ships (spec §8): the user
+  runs their tool *through* the launcher.
+
+**Public-export-only surface (rule #4).** Every primitive is on the stable side of
+the Wine boundary:
+- Mechanism: `GetModuleHandleW`, `GetProcAddress`, `VirtualProtect`,
+  `psapi!EnumProcessModules`, and the **frozen PE image format**.
+- Vector: `CreateProcessW`, `VirtualAllocEx`, `WriteProcessMemory`,
+  `GetModuleHandleA`/`GetProcAddress`, `CreateRemoteThread`, `ResumeThread`.
+None of `__wine_unix_call`, the wineserver protocol, internal cross-DLL import paths,
+or syscall-dispatch thunks is touched. **There is no inline prologue patching** — we
+rewrite a pointer table the loader already built, not code bytes — so the single
+"fragile spot" flagged in `docs/VERSIONING.md` §3 is **avoided entirely**; nothing
+needs per-Wine-version re-validation.
+
+**Forwarding for the unimplemented ~95%.** IAT patching is inherently surgical: only
+the named slots we choose to patch are redirected; every other import keeps pointing
+at the real Wine builtin, so unimplemented exports forward for free with no proxy
+DLL, no `.def`, and no export-table to maintain (contrast a `WINEDLLOVERRIDES` proxy,
+which must re-export *every* symbol of the shadowed DLL).
+
+**The spike — rungs tried and results (literal Wine stdout):**
+
+| Rung | What | Result on wine-11.11 |
+|---|---|---|
+| 1 — cooperative bootstrap | `mock-cheat --cooperative` `LoadLibraryA`s the carafe, `GetProcAddress`es `decant_install_hooks`, calls it, then `ReadProcessMemory` | **PASS** — `decant_install_hooks patched 1 slot(s)` then `INTERCEPTED` |
+| baseline (control) | `mock-cheat` with no injection | `passthrough` (proves the probe discriminates) |
+| 2a — `AppInit_DLLs` | set `AppInit_DLLs`/`LoadAppInit_DLLs=1`/`RequireSignedAppInit_DLLs=0`; run unmodified `mock-cheat` (which imports `user32`) | **FAIL — not supported on Wine.** The DLL is never loaded. Disassembly of `kernelbase!LoadAppInitDlls` shows a **no-op stub** (its body is `test [dbg_flag],8` / optional `FIXME` / `ret`); no builtin contains the `AppInit_DLLs` registry-value string, and nothing invokes it during process init. A real-Windows-only path. |
+| 2b — `WINEDLLOVERRIDES` proxy | name the carafe to shadow a DLL the tool imports | **Rejected by design.** `mock-cheat` imports only `kernel32`/`user32`; both are early/KnownDLL-class loads the proxy trick can't cleanly shadow (the KnownDLL early-load problem), and a proxy must re-export the *entire* shadowed surface. Viable only for tools that import an incidental DLL (DXVK/ReShade style); not general. Not implemented. |
+| 2c — launcher injection | `decant-launcher mock-cheat.exe` (suspended-create + `CreateRemoteThread`/`LoadLibrary`), `DECANT_AUTOHOOK=1`; `mock-cheat` **unmodified** | **PASS** — `INTERCEPTED`. Control with `DECANT_AUTOHOOK` unset: DLL is confirmed injected (loaddll trace shows `decant_interpose.dll … native`) but `DllMain` declines to install → `passthrough`, isolating the install step as the cause. |
+
+The `0xCC` marker is the observable: the hook fills the caller's buffer with `0xCC`
+and returns `TRUE`, so `mock-cheat` distinguishes a rerouted call (`INTERCEPTED`)
+from real bytes (`passthrough`). Daemon marshaling replaces the hook body later in
+Phase 3; the spike only proves the call is rerouted.
+
+**Why this beats the alternatives.** It is the only spiked vector that interposes an
+*unmodified* tool on stock Wine 11.11 using public exports + PE only: `AppInit_DLLs`
+is a Wine stub; the override-proxy needs a shadowable incidental import and a full
+re-export surface; inline `Nt*` prologue hooking is version-fragile (`VERSIONING.md`
+§3) and unnecessary because the export-level IAT patch already covers any tool that
+calls the memory APIs by name. Remote-thread injection + IAT patching keeps Decant
+entirely on the version-portable side.
+
+**Residual fragility:** none from this vector. The IAT patch depends only on the PE
+format and four documented exports; the launcher on six. No prologue bytes, no Wine
+build coupling.
+
+**KNOWN HOLE (documented, not solved — `docs/VERSIONING.md` §4).** A tool that issues
+a **raw `syscall` instruction** (syscall number in a register, executed directly,
+never calling the named `Nt*` export) **bypasses IAT interception entirely** — no
+import slot is ever read, so there is nothing to patch. Catching it would require
+operating at the syscall-dispatch layer (SUD / `seccomp-unotify`), which is exactly
+the Wine-internal, version-fragile territory rule #4 forbids. Decant deliberately
+keeps version-portability and does not cover raw-syscall tools; this is stated in the
+docs and exercised by the Phase 3 red-team (`docs/TESTING.md`). (Such a call still
+cannot escape the execution wall regardless — the hole is about interception
+*visibility* in the Wine-hosted tool, not new power over the guest.)
+
+**Reproduce:** `cargo xtask spike` (builds carafe + `mock-cheat` + launcher, stages
+them, runs rung 1 + baseline + rung 2c under the isolated prefix, asserts the
+markers). Manual: build `-p decant-interpose -p mock-cheat -p decant-launcher
+--target x86_64-pc-windows-gnu`, co-locate the three artifacts, then under the
+prefix `wine mock-cheat.exe --cooperative` (rung 1) and
+`DECANT_AUTOHOOK=1 wine decant-launcher.exe mock-cheat.exe` (rung 2c).

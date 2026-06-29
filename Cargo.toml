@@ -21,10 +21,16 @@ members = [
     "crates/decant-interpose",
     "testbins/guest-target",
     "testbins/mock-cheat",
+    "testbins/decant-launcher",
     "testbins/dll-smoke",
     "testbins/hello-dll",
 ]
 # Host-only crates. `cargo build`/`cargo test` with no `-p`/`--target` touch only these.
+#
+# `decant-interpose` is a windows-gnu cdylib, but its handle-table + rpc cores are
+# platform-agnostic (no Win32), so it is listed here too: that runs the handle-table
+# red-team under `cargo test` on the host with no Wine (the Win32-binding modules are
+# `#[cfg(windows)]` and simply compile out on the host).
 default-members = [
     "xtask",
     "crates/decant-protocol",
@@ -34,6 +40,7 @@ default-members = [
     "crates/decant-daemon",
     "crates/decant-cli",
     "crates/decant-wine-harness",
+    "crates/decant-interpose",
 ]
 
 [workspace.package]
