@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Rust-2021-orange" alt="Rust">
+  <img src="https://img.shields.io/badge/edition-2024-orange" alt="Rust">
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License">
   <img src="https://img.shields.io/badge/target-x86__64-lightgrey" alt="x86_64">
 </p>
@@ -91,7 +91,7 @@ client.write(Pid(1234), 0x140010400, &[0xAA; 4])?;
 
 ```bash
 cargo build          # host crates (default-members) only
-cargo test           # 77 tests against the mock backend; no VM, no mingw
+cargo test           # 79 tests against the mock backend; no VM, no mingw
 ```
 
 For the Wine and cross-compile path:
@@ -150,7 +150,7 @@ Mock backend (no VM, default; develop the whole stack against a mock guest):
 decant-daemon --backend mock --bind 127.0.0.1:7878
 ```
 
-VM backend (memflow over QEMU/KVM, runs as root; see [docs/TESTING.md](docs/TESTING.md) and ADR-0005):
+VM backend (memflow over QEMU/KVM, runs as root; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), ADR-0005):
 
 ```bash
 cargo build -p decant-daemon --features memflow
@@ -190,6 +190,7 @@ Notes:
 
 - Hooks are event-driven; Decant polls. It cannot deliver a `SetWindowsHookEx`-style callback.
 - There is no atomic read-modify-write across the VM boundary, and a paged-out guest page reads as not-present (a `ReadFailed`, not truncated bytes).
+- Interception is by IAT patching, so a tool that imports the Win32 memory APIs directly (for example the bundled `sample-tool`) routes through the interposer and reaches the guest. A tool that resolves those APIs at runtime through a function pointer, or enumerates processes via `NtQuerySystemInformation` (for example Cheat Engine), is not captured by IAT patching and does not route. The carafe patches the static import slots; calls that never go through those slots are not seen.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) section 3.
 
@@ -203,7 +204,7 @@ tied to Wine's layout.
 - Delivery: launcher-driven remote-thread injection (`decant-launcher`). Suspended-create, then `LoadLibrary` via `CreateRemoteThread`, then `DllMain` installs the IAT hooks. The target stays unmodified.
 - Limitation: a tool that issues a raw `syscall` instruction, never calling the named `Nt*` export, bypasses export-level interception. Catching it would need Wine-internal syscall-dispatch hooking, which Decant avoids to keep portability.
 
-See [docs/VERSIONING.md](docs/VERSIONING.md) and ADR-0006 in [docs/DECISIONS.md](docs/DECISIONS.md).
+See the Version-agnosticism section and ADR-0006 in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Crate layout
 
@@ -236,11 +237,11 @@ provides an interposer that redirects an unmodified tool's Win32 calls. The memf
 backend is validated against a Windows 10 guest; the interposer vector is documented
 in ADR-0006.
 
-77 tests, run offline with no VM.
+79 tests, run offline with no VM.
 
 ## Testing
 
-Two modes behind one trait; see [docs/TESTING.md](docs/TESTING.md).
+Two modes behind one trait: a mock backend offline, and memflow against a VM.
 
 ```bash
 cargo test               # mock mode: protocol, dispatch, scanner/resolver, CLI; no VM
@@ -251,7 +252,7 @@ cargo test -- --ignored  # VM mode, gated on DECANT_LIVE=1 and a running guest
 Writes are verified by read-back, not by the return value. Unsupported operations return a
 structured error, asserted in tests so they cannot become silent corruption.
 
-Design rationale and the ADR log are in [docs/DECISIONS.md](docs/DECISIONS.md).
+Design rationale and the ADR log are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## License
 
