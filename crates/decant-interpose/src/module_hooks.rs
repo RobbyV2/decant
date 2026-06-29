@@ -12,8 +12,6 @@ const TRUE: i32 = 1;
 const FALSE: i32 = 0;
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
-const MEM_COMMIT: u32 = 0x1000;
-const MEM_PRIVATE: u32 = 0x20000;
 const MEMORY_BASIC_INFORMATION_CLASS: u32 = 0;
 
 #[link(name = "kernel32")]
@@ -40,16 +38,6 @@ type EnumModsExFn = unsafe extern "system" fn(*mut c_void, *mut *mut c_void, u32
 type MappedAFn = unsafe extern "system" fn(*mut c_void, *const c_void, *mut u8, u32) -> u32;
 type MappedWFn = unsafe extern "system" fn(*mut c_void, *const c_void, *mut u16, u32) -> u32;
 type NtQvmFn = unsafe extern "system" fn(*mut c_void, *const c_void, u32, *mut c_void, usize, *mut usize) -> i32;
-
-fn protect_of(readable: bool, writable: bool, executable: bool) -> u32 {
-    match (readable, writable, executable) {
-        (_, true, true) => 0x40,
-        (_, true, false) => 0x04,
-        (true, false, true) => 0x20,
-        (true, false, false) => 0x02,
-        _ => 0x01,
-    }
-}
 
 unsafe fn name_containing(handle: usize, addr: u64) -> Option<String> {
     let pid = handle_table::pid_for(handle)?;
@@ -213,32 +201,15 @@ pub unsafe extern "system" fn nt_query_virtual_memory(
         {
             return STATUS_INVALID_PARAMETER;
         }
-        let addr = base_address as u64;
-        match rpc::request(Request::MemoryMap(pid)) {
-            Some(Response::MemoryMap(regions)) => {
-                match regions.iter().find(|r| addr >= r.base && addr < r.base + r.size) {
-                    Some(r) => {
-                        let protect = protect_of(r.readable, r.writable, r.executable);
-                        *(info as *mut MemoryBasicInformation) = MemoryBasicInformation {
-                            base_address: r.base as usize,
-                            allocation_base: r.base as usize,
-                            allocation_protect: protect,
-                            __align1: 0,
-                            region_size: r.size as usize,
-                            state: MEM_COMMIT,
-                            protect,
-                            type_: MEM_PRIVATE,
-                            __align2: 0,
-                        };
-                        if !ret.is_null() {
-                            *ret = core::mem::size_of::<MemoryBasicInformation>();
-                        }
-                        STATUS_SUCCESS
-                    }
-                    None => STATUS_INVALID_PARAMETER,
+        match crate::hooks::region_for(pid, base_address as u64) {
+            Some(info_val) => {
+                *(info as *mut MemoryBasicInformation) = info_val;
+                if !ret.is_null() {
+                    *ret = core::mem::size_of::<MemoryBasicInformation>();
                 }
+                STATUS_SUCCESS
             }
-            _ => STATUS_INVALID_PARAMETER,
+            None => STATUS_INVALID_PARAMETER,
         }
     } else {
         let p = NT_QUERY_VIRTUAL_MEMORY_ORIG.load(Ordering::SeqCst);
