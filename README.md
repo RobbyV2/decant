@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/decant_lockup_dark.png" alt="Decant" width="420">
+  <img src="assets/decant_banner_dark_sm.png" alt="Decant">
 </p>
 
 <p align="center">
