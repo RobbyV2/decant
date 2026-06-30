@@ -19,9 +19,9 @@ proptest! {
         let mut pb = MockGuest::builder()
             .process("t.exe", Pid(1))
             .region(base, "rw-");
-        for k in 0..n {
+        for (k, &off) in offsets.iter().enumerate() {
             let next = if k + 1 < n { d(k + 1) } else { final_addr };
-            pb = pb.u64_at(d(k), next.wrapping_sub(offsets[k]));
+            pb = pb.u64_at(d(k), next.wrapping_sub(off));
         }
         let backend = MockBackend::new(pb.done().build());
 
