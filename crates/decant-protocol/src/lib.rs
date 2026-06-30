@@ -49,12 +49,29 @@ pub struct Diagnostics {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProtoError {
-    NoSuchProcess { pid: Option<u32>, name: Option<String> },
-    NoSuchModule { pid: u32, module: String },
-    ReadFailed { addr: u64, len: u64, reason: String },
-    WriteFailed { addr: u64, reason: String },
-    Unsupported { op: String },
-    Backend { message: String },
+    NoSuchProcess {
+        pid: Option<u32>,
+        name: Option<String>,
+    },
+    NoSuchModule {
+        pid: u32,
+        module: String,
+    },
+    ReadFailed {
+        addr: u64,
+        len: u64,
+        reason: String,
+    },
+    WriteFailed {
+        addr: u64,
+        reason: String,
+    },
+    Unsupported {
+        op: String,
+    },
+    Backend {
+        message: String,
+    },
 }
 
 impl std::fmt::Display for ProtoError {
@@ -73,7 +90,10 @@ impl std::fmt::Display for ProtoError {
                 write!(f, "write at {addr:#x} failed: {reason}")
             }
             ProtoError::Unsupported { op } => {
-                write!(f, "unsupported operation: {op} requires guest execution, which memflow cannot perform")
+                write!(
+                    f,
+                    "unsupported operation: {op} requires guest execution, which memflow cannot perform"
+                )
             }
             ProtoError::Backend { message } => write!(f, "backend error: {message}"),
         }
@@ -91,13 +111,30 @@ pub enum Request {
     ModuleList(Pid),
     ModuleByName(Pid, String),
     ModuleExports(Pid, String),
-    Read { pid: Pid, addr: u64, len: u64 },
-    Write { pid: Pid, addr: u64, data: Vec<u8> },
+    Read {
+        pid: Pid,
+        addr: u64,
+        len: u64,
+    },
+    Write {
+        pid: Pid,
+        addr: u64,
+        data: Vec<u8>,
+    },
     MemoryMap(Pid),
     Diagnostics,
-    Scan { pid: Pid, pattern: String },
-    Resolve { pid: Pid, base: u64, offsets: Vec<u64> },
-    ReportUnsupported { op: String },
+    Scan {
+        pid: Pid,
+        pattern: String,
+    },
+    Resolve {
+        pid: Pid,
+        base: u64,
+        offsets: Vec<u64>,
+    },
+    ReportUnsupported {
+        op: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,7 +165,10 @@ pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
     if bytes.len() as u64 > MAX_MSG_LEN as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("message too large: {} bytes (max {MAX_MSG_LEN})", bytes.len()),
+            format!(
+                "message too large: {} bytes (max {MAX_MSG_LEN})",
+                bytes.len()
+            ),
         ));
     }
     w.write_all(&(bytes.len() as u32).to_le_bytes())?;
@@ -181,13 +221,30 @@ mod tests {
         roundtrip_req(Request::ModuleList(Pid(1)));
         roundtrip_req(Request::ModuleByName(Pid(1), "ntdll.dll".into()));
         roundtrip_req(Request::ModuleExports(Pid(1), "kernel32.dll".into()));
-        roundtrip_req(Request::Read { pid: Pid(7), addr: 0x1400010000, len: 64 });
-        roundtrip_req(Request::Write { pid: Pid(7), addr: 0xdead, data: vec![1, 2, 3, 4] });
+        roundtrip_req(Request::Read {
+            pid: Pid(7),
+            addr: 0x1400010000,
+            len: 64,
+        });
+        roundtrip_req(Request::Write {
+            pid: Pid(7),
+            addr: 0xdead,
+            data: vec![1, 2, 3, 4],
+        });
         roundtrip_req(Request::MemoryMap(Pid(7)));
         roundtrip_req(Request::Diagnostics);
-        roundtrip_req(Request::Scan { pid: Pid(7), pattern: "DE CA ?? 00".into() });
-        roundtrip_req(Request::Resolve { pid: Pid(7), base: 0x1000, offsets: vec![0x10, 0x18] });
-        roundtrip_req(Request::ReportUnsupported { op: "VirtualAllocEx".into() });
+        roundtrip_req(Request::Scan {
+            pid: Pid(7),
+            pattern: "DE CA ?? 00".into(),
+        });
+        roundtrip_req(Request::Resolve {
+            pid: Pid(7),
+            base: 0x1000,
+            offsets: vec![0x10, 0x18],
+        });
+        roundtrip_req(Request::ReportUnsupported {
+            op: "VirtualAllocEx".into(),
+        });
     }
 
     #[test]
@@ -197,13 +254,20 @@ mod tests {
             pid: Pid(1234),
             name: "target.exe".into(),
         }]));
-        roundtrip_resp(Response::Process(ProcessInfo { pid: Pid(1), name: "a".into() }));
+        roundtrip_resp(Response::Process(ProcessInfo {
+            pid: Pid(1),
+            name: "a".into(),
+        }));
         roundtrip_resp(Response::Modules(vec![ModuleInfo {
             name: "m.dll".into(),
             base: 0x1400000000,
             size: 0x80000,
         }]));
-        roundtrip_resp(Response::Module(ModuleInfo { name: "m".into(), base: 0, size: 1 }));
+        roundtrip_resp(Response::Module(ModuleInfo {
+            name: "m".into(),
+            base: 0,
+            size: 1,
+        }));
         roundtrip_resp(Response::Exports(vec![("add".into(), 0x1000)]));
         roundtrip_resp(Response::Data(vec![0xde, 0xad, 0xbe, 0xef]));
         roundtrip_resp(Response::Written(64));
@@ -215,9 +279,14 @@ mod tests {
             executable: false,
         }]));
         roundtrip_resp(Response::Diagnostics(Diagnostics::default()));
-        roundtrip_resp(Response::Err(ProtoError::Unsupported { op: "VirtualAllocEx".into() }));
+        roundtrip_resp(Response::Err(ProtoError::Unsupported {
+            op: "VirtualAllocEx".into(),
+        }));
         roundtrip_resp(Response::ScanHits(vec![0x1400010100, 0x1400010200]));
-        roundtrip_resp(Response::Resolved { address: 0x1400010290, value: vec![0x39, 5, 0, 0] });
+        roundtrip_resp(Response::Resolved {
+            address: 0x1400010290,
+            value: vec![0x39, 5, 0, 0],
+        });
     }
 
     #[test]

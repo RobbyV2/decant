@@ -45,7 +45,10 @@ fn main() {
     println!("  sentinel    : 0x{SENTINEL:016X}  (value the host writes to prove a write landed)");
     println!();
     println!("  magic AOB   : {}", aob_string(&MAGIC));
-    println!("  find me with : decant-cli scan <PID> \"{}\"", aob_string(&MAGIC));
+    println!(
+        "  find me with : decant-cli scan <PID> \"{}\"",
+        aob_string(&MAGIC)
+    );
     println!();
     let _ = std::io::stdout().flush();
 

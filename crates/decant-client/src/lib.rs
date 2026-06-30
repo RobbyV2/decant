@@ -2,8 +2,8 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use decant_protocol::{
-    read_msg, write_msg, Diagnostics, MemRegion, ModuleInfo, Pid, ProcessInfo, ProtoError, Request,
-    Response,
+    Diagnostics, MemRegion, ModuleInfo, Pid, ProcessInfo, ProtoError, Request, Response, read_msg,
+    write_msg,
 };
 
 pub use decant_protocol as protocol;
@@ -30,7 +30,11 @@ pub struct Client {
 
 impl Client {
     pub fn new(endpoint: impl Into<String>) -> Self {
-        Client { endpoint: endpoint.into(), conn: None, timeout: Duration::from_secs(10) }
+        Client {
+            endpoint: endpoint.into(),
+            conn: None,
+            timeout: Duration::from_secs(10),
+        }
     }
 
     pub fn from_env() -> Self {
@@ -91,10 +95,13 @@ impl Client {
     }
 
     pub fn process_by_name(&mut self, name: &str) -> Result<ProcessInfo> {
-        expect(self.send(Request::ProcessByName(name.to_string()))?, |r| match r {
-            Response::Process(p) => Ok(p),
-            o => Err(o),
-        })
+        expect(
+            self.send(Request::ProcessByName(name.to_string()))?,
+            |r| match r {
+                Response::Process(p) => Ok(p),
+                o => Err(o),
+            },
+        )
     }
 
     pub fn modules(&mut self, pid: Pid) -> Result<Vec<ModuleInfo>> {
@@ -105,31 +112,51 @@ impl Client {
     }
 
     pub fn module_by_name(&mut self, pid: Pid, name: &str) -> Result<ModuleInfo> {
-        expect(self.send(Request::ModuleByName(pid, name.to_string()))?, |r| match r {
-            Response::Module(m) => Ok(m),
-            o => Err(o),
-        })
+        expect(
+            self.send(Request::ModuleByName(pid, name.to_string()))?,
+            |r| match r {
+                Response::Module(m) => Ok(m),
+                o => Err(o),
+            },
+        )
     }
 
     pub fn exports(&mut self, pid: Pid, module: &str) -> Result<Vec<(String, u64)>> {
-        expect(self.send(Request::ModuleExports(pid, module.to_string()))?, |r| match r {
-            Response::Exports(e) => Ok(e),
-            o => Err(o),
-        })
+        expect(
+            self.send(Request::ModuleExports(pid, module.to_string()))?,
+            |r| match r {
+                Response::Exports(e) => Ok(e),
+                o => Err(o),
+            },
+        )
     }
 
     pub fn read(&mut self, pid: Pid, addr: u64, len: usize) -> Result<Vec<u8>> {
-        expect(self.send(Request::Read { pid, addr, len: len as u64 })?, |r| match r {
-            Response::Data(d) => Ok(d),
-            o => Err(o),
-        })
+        expect(
+            self.send(Request::Read {
+                pid,
+                addr,
+                len: len as u64,
+            })?,
+            |r| match r {
+                Response::Data(d) => Ok(d),
+                o => Err(o),
+            },
+        )
     }
 
     pub fn write(&mut self, pid: Pid, addr: u64, data: &[u8]) -> Result<usize> {
-        expect(self.send(Request::Write { pid, addr, data: data.to_vec() })?, |r| match r {
-            Response::Written(n) => Ok(n as usize),
-            o => Err(o),
-        })
+        expect(
+            self.send(Request::Write {
+                pid,
+                addr,
+                data: data.to_vec(),
+            })?,
+            |r| match r {
+                Response::Written(n) => Ok(n as usize),
+                o => Err(o),
+            },
+        )
     }
 
     pub fn memory_map(&mut self, pid: Pid) -> Result<Vec<MemRegion>> {
@@ -140,17 +167,30 @@ impl Client {
     }
 
     pub fn scan(&mut self, pid: Pid, pattern: &str) -> Result<Vec<u64>> {
-        expect(self.send(Request::Scan { pid, pattern: pattern.to_string() })?, |r| match r {
-            Response::ScanHits(h) => Ok(h),
-            o => Err(o),
-        })
+        expect(
+            self.send(Request::Scan {
+                pid,
+                pattern: pattern.to_string(),
+            })?,
+            |r| match r {
+                Response::ScanHits(h) => Ok(h),
+                o => Err(o),
+            },
+        )
     }
 
     pub fn resolve(&mut self, pid: Pid, base: u64, offsets: &[u64]) -> Result<(u64, Vec<u8>)> {
-        expect(self.send(Request::Resolve { pid, base, offsets: offsets.to_vec() })?, |r| match r {
-            Response::Resolved { address, value } => Ok((address, value)),
-            o => Err(o),
-        })
+        expect(
+            self.send(Request::Resolve {
+                pid,
+                base,
+                offsets: offsets.to_vec(),
+            })?,
+            |r| match r {
+                Response::Resolved { address, value } => Ok((address, value)),
+                o => Err(o),
+            },
+        )
     }
 
     pub fn diagnostics(&mut self) -> Result<Diagnostics> {
@@ -161,7 +201,10 @@ impl Client {
     }
 }
 
-fn expect<T>(resp: Response, f: impl FnOnce(Response) -> std::result::Result<T, Response>) -> Result<T> {
+fn expect<T>(
+    resp: Response,
+    f: impl FnOnce(Response) -> std::result::Result<T, Response>,
+) -> Result<T> {
     match resp {
         Response::Err(e) => Err(ClientError::Protocol(e)),
         other => f(other).map_err(ClientError::Unexpected),

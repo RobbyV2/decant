@@ -23,12 +23,12 @@ pub type Result<T> = std::result::Result<T, CoreError>;
 
 pub(crate) fn read_u64(backend: &dyn MemoryBackend, pid: Pid, addr: u64) -> Result<u64> {
     let bytes = backend.read(pid, addr, 8)?;
-    let arr: [u8; 8] = bytes
-        .try_into()
-        .map_err(|_| CoreError::Backend(BackendError::ReadFailed {
+    let arr: [u8; 8] = bytes.try_into().map_err(|_| {
+        CoreError::Backend(BackendError::ReadFailed {
             addr,
             len: 8,
             reason: "short read resolving pointer".into(),
-        }))?;
+        })
+    })?;
     Ok(u64::from_le_bytes(arr))
 }

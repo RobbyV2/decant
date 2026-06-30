@@ -62,7 +62,7 @@ pub fn scan_str(backend: &dyn MemoryBackend, pid: Pid, pattern: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use decant_backend::fixtures::{demo_backend, DEMO_MAGIC, DEMO_MAGIC_ADDR, DEMO_TARGET_PID};
+    use decant_backend::fixtures::{DEMO_MAGIC, DEMO_MAGIC_ADDR, DEMO_TARGET_PID, demo_backend};
     use decant_backend::{MockBackend, MockGuest};
 
     #[test]
@@ -122,7 +122,11 @@ mod tests {
             .done()
             .build();
         let b = MockBackend::new(guest);
-        assert!(scan(&b, Pid(1), &Pattern::parse("AA BB").unwrap()).unwrap().is_empty());
+        assert!(
+            scan(&b, Pid(1), &Pattern::parse("AA BB").unwrap())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     use decant_backend::Pid;

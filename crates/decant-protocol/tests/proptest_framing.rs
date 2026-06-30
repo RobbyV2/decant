@@ -1,6 +1,6 @@
 use decant_protocol::{
-    read_msg, write_msg, Diagnostics, MemRegion, ModuleInfo, Pid, ProcessInfo, ProtoError, Request,
-    Response,
+    Diagnostics, MemRegion, ModuleInfo, Pid, ProcessInfo, ProtoError, Request, Response, read_msg,
+    write_msg,
 };
 use proptest::prelude::*;
 use std::io::Cursor;
@@ -14,20 +14,28 @@ fn arb_process_info() -> impl Strategy<Value = ProcessInfo> {
 }
 
 fn arb_module_info() -> impl Strategy<Value = ModuleInfo> {
-    (any::<String>(), any::<u64>(), any::<u64>())
-        .prop_map(|(name, base, size)| ModuleInfo { name, base, size })
+    (any::<String>(), any::<u64>(), any::<u64>()).prop_map(|(name, base, size)| ModuleInfo {
+        name,
+        base,
+        size,
+    })
 }
 
 fn arb_mem_region() -> impl Strategy<Value = MemRegion> {
-    (any::<u64>(), any::<u64>(), any::<bool>(), any::<bool>(), any::<bool>()).prop_map(
-        |(base, size, readable, writable, executable)| MemRegion {
+    (
+        any::<u64>(),
+        any::<u64>(),
+        any::<bool>(),
+        any::<bool>(),
+        any::<bool>(),
+    )
+        .prop_map(|(base, size, readable, writable, executable)| MemRegion {
             base,
             size,
             readable,
             writable,
             executable,
-        },
-    )
+        })
 }
 
 fn arb_diagnostics() -> impl Strategy<Value = Diagnostics> {
@@ -65,10 +73,16 @@ fn arb_request() -> impl Strategy<Value = Request> {
         arb_pid().prop_map(Request::ModuleList),
         (arb_pid(), any::<String>()).prop_map(|(p, s)| Request::ModuleByName(p, s)),
         (arb_pid(), any::<String>()).prop_map(|(p, s)| Request::ModuleExports(p, s)),
-        (arb_pid(), any::<u64>(), any::<u64>())
-            .prop_map(|(pid, addr, len)| Request::Read { pid, addr, len }),
-        (arb_pid(), any::<u64>(), any::<Vec<u8>>())
-            .prop_map(|(pid, addr, data)| Request::Write { pid, addr, data }),
+        (arb_pid(), any::<u64>(), any::<u64>()).prop_map(|(pid, addr, len)| Request::Read {
+            pid,
+            addr,
+            len
+        }),
+        (arb_pid(), any::<u64>(), any::<Vec<u8>>()).prop_map(|(pid, addr, data)| Request::Write {
+            pid,
+            addr,
+            data
+        }),
         arb_pid().prop_map(Request::MemoryMap),
         Just(Request::Diagnostics),
     ]

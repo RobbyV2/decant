@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::thread;
 
 use decant::prelude::*;
-use decant_daemon::{serve, Diag};
+use decant_daemon::{Diag, serve};
 
 fn demo_guest() -> MockGuest {
     MockGuest::builder()
@@ -38,10 +38,28 @@ fn client_against_in_process_daemon() {
     });
 
     let mut client = Client::new(format!("127.0.0.1:{port}"));
-    assert!(client.processes().unwrap().iter().any(|p| p.name == "target.exe"));
-    assert_eq!(client.read(Pid(1234), 0x150100, 4).unwrap(), b"\xDE\xCA\xFB\xAD");
+    assert!(
+        client
+            .processes()
+            .unwrap()
+            .iter()
+            .any(|p| p.name == "target.exe")
+    );
+    assert_eq!(
+        client.read(Pid(1234), 0x150100, 4).unwrap(),
+        b"\xDE\xCA\xFB\xAD"
+    );
     client.write(Pid(1234), 0x150300, &[1, 2, 3, 4]).unwrap();
-    assert_eq!(client.read(Pid(1234), 0x150300, 4).unwrap(), vec![1, 2, 3, 4]);
-    assert_eq!(client.scan(Pid(1234), "DE CA FB AD").unwrap(), vec![0x150100]);
-    assert_eq!(client.resolve(Pid(1234), 0x150200, &[0x8]).unwrap().0, 0x150248);
+    assert_eq!(
+        client.read(Pid(1234), 0x150300, 4).unwrap(),
+        vec![1, 2, 3, 4]
+    );
+    assert_eq!(
+        client.scan(Pid(1234), "DE CA FB AD").unwrap(),
+        vec![0x150100]
+    );
+    assert_eq!(
+        client.resolve(Pid(1234), 0x150200, &[0x8]).unwrap().0,
+        0x150248
+    );
 }

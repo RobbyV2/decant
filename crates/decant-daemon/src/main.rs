@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use decant_backend::MemoryBackend;
-use decant_daemon::{serve, Diag};
+use decant_daemon::{Diag, serve};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum BackendKind {
@@ -13,7 +13,10 @@ enum BackendKind {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "decant-daemon", about = "Decant daemon, serves guest memory over TCP")]
+#[command(
+    name = "decant-daemon",
+    about = "Decant daemon, serves guest memory over TCP"
+)]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:7878")]
     bind: String,
@@ -36,8 +39,8 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let (backend, connector) = build_backend(args.backend, &args.connector)?;
 
-    let listener = TcpListener::bind(&args.bind)
-        .with_context(|| format!("binding {}", args.bind))?;
+    let listener =
+        TcpListener::bind(&args.bind).with_context(|| format!("binding {}", args.bind))?;
     let local = listener.local_addr().context("resolving bound address")?;
 
     println!("decant-daemon listening on {local} (backend: {connector})");
@@ -50,9 +53,10 @@ fn main() -> Result<()> {
 
 fn build_backend(kind: BackendKind, connector: &str) -> Result<(Arc<dyn MemoryBackend>, String)> {
     match kind {
-        BackendKind::Mock => {
-            Ok((Arc::new(decant_backend::fixtures::demo_backend()), "mock".to_string()))
-        }
+        BackendKind::Mock => Ok((
+            Arc::new(decant_backend::fixtures::demo_backend()),
+            "mock".to_string(),
+        )),
         BackendKind::Memflow => build_memflow_backend(connector),
     }
 }
@@ -69,6 +73,6 @@ fn build_memflow_backend(_connector: &str) -> Result<(Arc<dyn MemoryBackend>, St
     anyhow::bail!(
         "this decant-daemon build has no memflow support. Rebuild on the VM host with:\n    \
          cargo build --release -p decant-daemon --features memflow\n\
-         (the memflow QEMU/KVM connector plugin must also be installed, see docs/DECISIONS.md ADR-0005)."
+         (the memflow qemu or kvm connector plugin must also be installed)."
     )
 }

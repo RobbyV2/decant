@@ -2,7 +2,7 @@ use core::ffi::c_void;
 use core::sync::atomic::Ordering;
 use std::sync::Mutex;
 
-use decant_protocol::{MemRegion, Pid, Request, Response};
+use decant_protocol::{MemRegion, ModuleInfo, Pid, Request, Response};
 
 use crate::handle_table;
 use crate::iat;
@@ -20,6 +20,11 @@ const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_FREE: u32 = 0x10000;
 const MEM_PRIVATE: u32 = 0x20000;
+const MEM_IMAGE: u32 = 0x1000000;
+const WAIT_TIMEOUT: u32 = 0x0000_0102;
+const STATUS_TIMEOUT: i32 = 0x0000_0102;
+const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
+const PROCESS_BASIC_INFORMATION: u32 = 0;
 const STATUS_SUCCESS: i32 = 0;
 const STATUS_UNSUCCESSFUL: i32 = 0xC000_0001u32 as i32;
 const STATUS_NOT_SUPPORTED: i32 = 0xC000_00BBu32 as i32;
@@ -77,6 +82,17 @@ macro_rules! interpose_exports {
             b"NtGetNextProcess" => nt_get_next_process,
             b"Toolhelp32ReadProcessMemory" => toolhelp32_read_process_memory,
             b"NtQueryInformationProcess" => nt_query_information_process,
+            b"DuplicateHandle" => duplicate_handle,
+            b"WaitForSingleObject" => wait_for_single_object,
+            b"WaitForSingleObjectEx" => wait_for_single_object_ex,
+            b"GetHandleInformation" => get_handle_information,
+            b"NtWaitForSingleObject" => nt_wait_for_single_object,
+            b"SetHandleInformation" => set_handle_information,
+            b"GetPriorityClass" => get_priority_class,
+            b"GetProcessTimes" => get_process_times,
+            b"TerminateProcess" => terminate_process,
+            b"NtSuspendProcess" => nt_suspend_process,
+            b"NtResumeProcess" => nt_resume_process,
         }
     };
 }
@@ -126,7 +142,9 @@ fn invalid_handle() -> *mut c_void {
 
 fn report_unsupported(op: &str) {
     let _ = rpc::request(Request::ReportUnsupported { op: op.to_string() });
-    eprintln!("decant: refused unsupported operation {op}; the guest cannot execute code through the handle model");
+    eprintln!(
+        "decant: refused unsupported operation {op}; the guest cannot execute code through the handle model"
+    );
 }
 
 fn protect_flags(readable: bool, writable: bool, executable: bool) -> u32 {
@@ -142,6 +160,7 @@ fn protect_flags(readable: bool, writable: bool, executable: bool) -> u32 {
 struct RegionCache {
     pid: Pid,
     regions: Vec<MemRegion>,
+    modules: Vec<ModuleInfo>,
 }
 
 static REGION_CACHE: Mutex<Option<RegionCache>> = Mutex::new(None);
@@ -162,12 +181,28 @@ pub(crate) fn region_for(pid: Pid, addr: u64) -> Option<MemoryBasicInformation> 
             _ => return None,
         };
         regions.sort_by_key(|r| r.base);
-        *guard = Some(RegionCache { pid, regions });
+        let modules = match rpc::request(Request::ModuleList(pid)) {
+            Some(Response::Modules(m)) => m,
+            _ => Vec::new(),
+        };
+        *guard = Some(RegionCache {
+            pid,
+            regions,
+            modules,
+        });
     }
-    let regions = &guard.as_ref()?.regions;
+    let cache = guard.as_ref()?;
+    let regions = &cache.regions;
+    let modules = &cache.modules;
 
-    if let Some(r) = regions.iter().find(|r| addr >= r.base && addr < r.base + r.size) {
+    if let Some(r) = regions
+        .iter()
+        .find(|r| addr >= r.base && addr < r.base + r.size)
+    {
         let p = protect_flags(r.readable, r.writable, r.executable);
+        let in_module = modules
+            .iter()
+            .any(|m| r.base >= m.base && r.base < m.base + m.size);
         return Some(MemoryBasicInformation {
             base_address: r.base as usize,
             allocation_base: r.base as usize,
@@ -176,12 +211,16 @@ pub(crate) fn region_for(pid: Pid, addr: u64) -> Option<MemoryBasicInformation> 
             region_size: r.size as usize,
             state: MEM_COMMIT,
             protect: p,
-            type_: MEM_PRIVATE,
+            type_: if in_module { MEM_IMAGE } else { MEM_PRIVATE },
             __align2: 0,
         });
     }
 
-    let next = regions.iter().filter(|r| r.base > addr).map(|r| r.base).min()?;
+    let next = regions
+        .iter()
+        .filter(|r| r.base > addr)
+        .map(|r| r.base)
+        .min()?;
     Some(MemoryBasicInformation {
         base_address: addr as usize,
         allocation_base: 0,
@@ -195,13 +234,35 @@ pub(crate) fn region_for(pid: Pid, addr: u64) -> Option<MemoryBasicInformation> 
     })
 }
 
-type RpmFn = unsafe extern "system" fn(*mut c_void, *const c_void, *mut c_void, usize, *mut usize) -> i32;
-type WpmFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize, *mut usize) -> i32;
-type NtRwFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, usize, *mut usize) -> i32;
+type RpmFn =
+    unsafe extern "system" fn(*mut c_void, *const c_void, *mut c_void, usize, *mut usize) -> i32;
+type WpmFn =
+    unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize, *mut usize) -> i32;
+type NtRwFn =
+    unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, usize, *mut usize) -> i32;
 type CloseFn = unsafe extern "system" fn(*mut c_void) -> i32;
 type EnumModsFn = unsafe extern "system" fn(*mut c_void, *mut *mut c_void, u32, *mut u32) -> i32;
 type GetNameAFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut u8, u32) -> u32;
 type GetNameWFn = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut u16, u32) -> u32;
+type DupHandleFn = unsafe extern "system" fn(
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut *mut c_void,
+    u32,
+    i32,
+    u32,
+) -> i32;
+type WaitFn = unsafe extern "system" fn(*mut c_void, u32) -> u32;
+type WaitExFn = unsafe extern "system" fn(*mut c_void, u32, i32) -> u32;
+type GetHandleInfoFn = unsafe extern "system" fn(*mut c_void, *mut u32) -> i32;
+type NtWaitFn = unsafe extern "system" fn(*mut c_void, u8, *mut c_void) -> i32;
+type SetHandleInfoFn = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
+type GetPriorityFn = unsafe extern "system" fn(*mut c_void) -> u32;
+type GetProcessTimesFn =
+    unsafe extern "system" fn(*mut c_void, *mut u64, *mut u64, *mut u64, *mut u64) -> i32;
+type TerminateProcessFn = unsafe extern "system" fn(*mut c_void, u32) -> i32;
+type NtProcessActionFn = unsafe extern "system" fn(*mut c_void) -> i32;
 
 #[repr(C)]
 pub struct ProcessEntry32 {
@@ -278,32 +339,36 @@ fn put_wide(buf: &mut [u16], s: &str) {
     buf[i] = 0;
 }
 
-pub(crate) unsafe fn put_ansi_counted(ptr: *mut u8, size: u32, s: &str) -> u32 { unsafe {
-    if ptr.is_null() || size == 0 {
-        return 0;
-    }
-    let bytes = s.as_bytes();
-    let n = bytes.len().min((size as usize) - 1);
-    core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, n);
-    *ptr.add(n) = 0;
-    n as u32
-}}
-
-pub(crate) unsafe fn put_wide_counted(ptr: *mut u16, size: u32, s: &str) -> u32 { unsafe {
-    if ptr.is_null() || size == 0 {
-        return 0;
-    }
-    let mut i = 0usize;
-    for u in s.encode_utf16() {
-        if i + 1 >= size as usize {
-            break;
+pub(crate) unsafe fn put_ansi_counted(ptr: *mut u8, size: u32, s: &str) -> u32 {
+    unsafe {
+        if ptr.is_null() || size == 0 {
+            return 0;
         }
-        *ptr.add(i) = u;
-        i += 1;
+        let bytes = s.as_bytes();
+        let n = bytes.len().min((size as usize) - 1);
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, n);
+        *ptr.add(n) = 0;
+        n as u32
     }
-    *ptr.add(i) = 0;
-    i as u32
-}}
+}
+
+pub(crate) unsafe fn put_wide_counted(ptr: *mut u16, size: u32, s: &str) -> u32 {
+    unsafe {
+        if ptr.is_null() || size == 0 {
+            return 0;
+        }
+        let mut i = 0usize;
+        for u in s.encode_utf16() {
+            if i + 1 >= size as usize {
+                break;
+            }
+            *ptr.add(i) = u;
+            i += 1;
+        }
+        *ptr.add(i) = 0;
+        i as u32
+    }
+}
 
 pub unsafe extern "system" fn open_process(_access: u32, _inherit: i32, pid: u32) -> *mut c_void {
     match rpc::request(Request::ProcessByPid(Pid(pid))) {
@@ -318,32 +383,38 @@ unsafe fn synth_read(
     buffer: *mut c_void,
     size: usize,
     bytes_read: *mut usize,
-) -> usize { unsafe {
-    if !bytes_read.is_null() {
-        *bytes_read = 0;
-    }
-    let pid = match handle_table::pid_for(handle) {
-        Some(p) => p,
-        None => return 0,
-    };
-    if buffer.is_null() || size == 0 {
-        return 0;
-    }
-    match rpc::request(Request::Read { pid, addr, len: size as u64 }) {
-        Some(Response::Data(data)) => {
-            let n = data.len().min(size);
-            if n == 0 {
-                return 0;
-            }
-            core::ptr::copy_nonoverlapping(data.as_ptr(), buffer as *mut u8, n);
-            if !bytes_read.is_null() {
-                *bytes_read = n;
-            }
-            n
+) -> usize {
+    unsafe {
+        if !bytes_read.is_null() {
+            *bytes_read = 0;
         }
-        _ => 0,
+        let pid = match handle_table::pid_for(handle) {
+            Some(p) => p,
+            None => return 0,
+        };
+        if buffer.is_null() || size == 0 {
+            return 0;
+        }
+        match rpc::request(Request::Read {
+            pid,
+            addr,
+            len: size as u64,
+        }) {
+            Some(Response::Data(data)) => {
+                let n = data.len().min(size);
+                if n == 0 {
+                    return 0;
+                }
+                core::ptr::copy_nonoverlapping(data.as_ptr(), buffer as *mut u8, n);
+                if !bytes_read.is_null() {
+                    *bytes_read = n;
+                }
+                n
+            }
+            _ => 0,
+        }
     }
-}}
+}
 
 unsafe fn synth_write(
     handle: usize,
@@ -351,29 +422,31 @@ unsafe fn synth_write(
     buffer: *const c_void,
     size: usize,
     bytes_written: *mut usize,
-) -> usize { unsafe {
-    if !bytes_written.is_null() {
-        *bytes_written = 0;
-    }
-    let pid = match handle_table::pid_for(handle) {
-        Some(p) => p,
-        None => return 0,
-    };
-    if buffer.is_null() || size == 0 {
-        return 0;
-    }
-    let data = core::slice::from_raw_parts(buffer as *const u8, size).to_vec();
-    match rpc::request(Request::Write { pid, addr, data }) {
-        Some(Response::Written(n)) => {
-            let n = (n as usize).min(size);
-            if !bytes_written.is_null() {
-                *bytes_written = n;
-            }
-            n
+) -> usize {
+    unsafe {
+        if !bytes_written.is_null() {
+            *bytes_written = 0;
         }
-        _ => 0,
+        let pid = match handle_table::pid_for(handle) {
+            Some(p) => p,
+            None => return 0,
+        };
+        if buffer.is_null() || size == 0 {
+            return 0;
+        }
+        let data = core::slice::from_raw_parts(buffer as *const u8, size).to_vec();
+        match rpc::request(Request::Write { pid, addr, data }) {
+            Some(Response::Written(n)) => {
+                let n = (n as usize).min(size);
+                if !bytes_written.is_null() {
+                    *bytes_written = n;
+                }
+                n
+            }
+            _ => 0,
+        }
     }
-}}
+}
 
 pub unsafe extern "system" fn read_process_memory(
     process: *mut c_void,
@@ -381,22 +454,24 @@ pub unsafe extern "system" fn read_process_memory(
     buffer: *mut c_void,
     size: usize,
     bytes_read: *mut usize,
-) -> i32 { unsafe {
-    let h = process as usize;
-    if handle_table::is_synthetic(h) {
-        let n = synth_read(h, base_address as u64, buffer, size, bytes_read);
-        return (n == size && size > 0) as i32;
+) -> i32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            let n = synth_read(h, base_address as u64, buffer, size, bytes_read);
+            return (n == size && size > 0) as i32;
+        }
+        let p = ORIGINALS.read_process_memory.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: RpmFn = core::mem::transmute(p);
+            return f(process, base_address, buffer, size, bytes_read);
+        }
+        if !bytes_read.is_null() {
+            *bytes_read = 0;
+        }
+        0
     }
-    let p = ORIGINALS.read_process_memory.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: RpmFn = core::mem::transmute(p);
-        return f(process, base_address, buffer, size, bytes_read);
-    }
-    if !bytes_read.is_null() {
-        *bytes_read = 0;
-    }
-    0
-}}
+}
 
 pub unsafe extern "system" fn write_process_memory(
     process: *mut c_void,
@@ -404,22 +479,24 @@ pub unsafe extern "system" fn write_process_memory(
     buffer: *const c_void,
     size: usize,
     bytes_written: *mut usize,
-) -> i32 { unsafe {
-    let h = process as usize;
-    if handle_table::is_synthetic(h) {
-        let n = synth_write(h, base_address as u64, buffer, size, bytes_written);
-        return (n == size && size > 0) as i32;
+) -> i32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            let n = synth_write(h, base_address as u64, buffer, size, bytes_written);
+            return (n == size && size > 0) as i32;
+        }
+        let p = ORIGINALS.write_process_memory.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: WpmFn = core::mem::transmute(p);
+            return f(process, base_address, buffer, size, bytes_written);
+        }
+        if !bytes_written.is_null() {
+            *bytes_written = 0;
+        }
+        0
     }
-    let p = ORIGINALS.write_process_memory.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: WpmFn = core::mem::transmute(p);
-        return f(process, base_address, buffer, size, bytes_written);
-    }
-    if !bytes_written.is_null() {
-        *bytes_written = 0;
-    }
-    0
-}}
+}
 
 pub unsafe extern "system" fn nt_read_virtual_memory(
     process: *mut c_void,
@@ -427,19 +504,25 @@ pub unsafe extern "system" fn nt_read_virtual_memory(
     buffer: *mut c_void,
     size: usize,
     bytes_read: *mut usize,
-) -> i32 { unsafe {
-    let h = process as usize;
-    if handle_table::is_synthetic(h) {
-        let n = synth_read(h, base_address as u64, buffer, size, bytes_read);
-        return if n == size && size > 0 { STATUS_SUCCESS } else { STATUS_UNSUCCESSFUL };
+) -> i32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            let n = synth_read(h, base_address as u64, buffer, size, bytes_read);
+            return if n == size && size > 0 {
+                STATUS_SUCCESS
+            } else {
+                STATUS_UNSUCCESSFUL
+            };
+        }
+        let p = ORIGINALS.nt_read_virtual_memory.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: NtRwFn = core::mem::transmute(p);
+            return f(process, base_address, buffer, size, bytes_read);
+        }
+        STATUS_UNSUCCESSFUL
     }
-    let p = ORIGINALS.nt_read_virtual_memory.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: NtRwFn = core::mem::transmute(p);
-        return f(process, base_address, buffer, size, bytes_read);
-    }
-    STATUS_UNSUCCESSFUL
-}}
+}
 
 pub unsafe extern "system" fn nt_write_virtual_memory(
     process: *mut c_void,
@@ -447,47 +530,57 @@ pub unsafe extern "system" fn nt_write_virtual_memory(
     buffer: *mut c_void,
     size: usize,
     bytes_written: *mut usize,
-) -> i32 { unsafe {
-    let h = process as usize;
-    if handle_table::is_synthetic(h) {
-        let n = synth_write(h, base_address as u64, buffer, size, bytes_written);
-        return if n == size && size > 0 { STATUS_SUCCESS } else { STATUS_UNSUCCESSFUL };
+) -> i32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            let n = synth_write(h, base_address as u64, buffer, size, bytes_written);
+            return if n == size && size > 0 {
+                STATUS_SUCCESS
+            } else {
+                STATUS_UNSUCCESSFUL
+            };
+        }
+        let p = ORIGINALS.nt_write_virtual_memory.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: NtRwFn = core::mem::transmute(p);
+            return f(process, base_address, buffer, size, bytes_written);
+        }
+        STATUS_UNSUCCESSFUL
     }
-    let p = ORIGINALS.nt_write_virtual_memory.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: NtRwFn = core::mem::transmute(p);
-        return f(process, base_address, buffer, size, bytes_written);
-    }
-    STATUS_UNSUCCESSFUL
-}}
+}
 
-pub unsafe extern "system" fn close_handle(handle: *mut c_void) -> i32 { unsafe {
-    let h = handle as usize;
-    if handle_table::is_synthetic(h) {
-        handle_table::free(h);
-        return 1;
+pub unsafe extern "system" fn close_handle(handle: *mut c_void) -> i32 {
+    unsafe {
+        let h = handle as usize;
+        if handle_table::is_synthetic(h) {
+            handle_table::free(h);
+            return 1;
+        }
+        let p = ORIGINALS.close_handle.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: CloseFn = core::mem::transmute(p);
+            return f(handle);
+        }
+        1
     }
-    let p = ORIGINALS.close_handle.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: CloseFn = core::mem::transmute(p);
-        return f(handle);
-    }
-    1
-}}
+}
 
-pub unsafe extern "system" fn nt_close(handle: *mut c_void) -> i32 { unsafe {
-    let h = handle as usize;
-    if handle_table::is_synthetic(h) {
-        handle_table::free(h);
-        return STATUS_SUCCESS;
+pub unsafe extern "system" fn nt_close(handle: *mut c_void) -> i32 {
+    unsafe {
+        let h = handle as usize;
+        if handle_table::is_synthetic(h) {
+            handle_table::free(h);
+            return STATUS_SUCCESS;
+        }
+        let p = ORIGINALS.nt_close.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: CloseFn = core::mem::transmute(p);
+            return f(handle);
+        }
+        STATUS_SUCCESS
     }
-    let p = ORIGINALS.nt_close.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: CloseFn = core::mem::transmute(p);
-        return f(handle);
-    }
-    STATUS_SUCCESS
-}}
+}
 
 pub unsafe extern "system" fn create_toolhelp32_snapshot(flags: u32, pid: u32) -> *mut c_void {
     if flags & TH32CS_SNAPPROCESS != 0 {
@@ -511,155 +604,191 @@ pub unsafe extern "system" fn create_toolhelp32_snapshot(flags: u32, pid: u32) -
     invalid_handle()
 }
 
-unsafe fn fill_process_ansi(handle: usize, entry: *mut ProcessEntry32, reset: bool) -> i32 { unsafe {
-    if entry.is_null() {
-        return 0;
-    }
-    match handle_table::snapshot_next_process(handle, reset) {
-        Some(pi) => {
-            let e = &mut *entry;
-            e.cnt_usage = 1;
-            e.th32_process_id = pi.pid.0;
-            e.cnt_threads = 1;
-            put_ansi(&mut e.sz_exe_file, &pi.name);
-            1
+unsafe fn fill_process_ansi(handle: usize, entry: *mut ProcessEntry32, reset: bool) -> i32 {
+    unsafe {
+        if entry.is_null() {
+            return 0;
         }
-        None => 0,
-    }
-}}
-
-unsafe fn fill_process_wide(handle: usize, entry: *mut ProcessEntry32W, reset: bool) -> i32 { unsafe {
-    if entry.is_null() {
-        return 0;
-    }
-    match handle_table::snapshot_next_process(handle, reset) {
-        Some(pi) => {
-            let e = &mut *entry;
-            e.cnt_usage = 1;
-            e.th32_process_id = pi.pid.0;
-            e.cnt_threads = 1;
-            put_wide(&mut e.sz_exe_file, &pi.name);
-            1
-        }
-        None => 0,
-    }
-}}
-
-pub unsafe extern "system" fn process32_first(snapshot: *mut c_void, entry: *mut ProcessEntry32) -> i32 { unsafe {
-    fill_process_ansi(snapshot as usize, entry, true)
-}}
-pub unsafe extern "system" fn process32_next(snapshot: *mut c_void, entry: *mut ProcessEntry32) -> i32 { unsafe {
-    fill_process_ansi(snapshot as usize, entry, false)
-}}
-pub unsafe extern "system" fn process32_first_w(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32 { unsafe {
-    fill_process_wide(snapshot as usize, entry, true)
-}}
-pub unsafe extern "system" fn process32_next_w(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32 { unsafe {
-    fill_process_wide(snapshot as usize, entry, false)
-}}
-
-unsafe fn fill_module_ansi(handle: usize, entry: *mut ModuleEntry32, reset: bool) -> i32 { unsafe {
-    if entry.is_null() {
-        return 0;
-    }
-    match handle_table::snapshot_next_module(handle, reset) {
-        Some(mi) => {
-            let e = &mut *entry;
-            e.th32_module_id = 1;
-            e.mod_base_addr = mi.base as usize;
-            e.mod_base_size = mi.size as u32;
-            e.h_module = mi.base as usize;
-            put_ansi(&mut e.sz_module, &mi.name);
-            put_ansi(&mut e.sz_exe_path, &mi.name);
-            1
-        }
-        None => 0,
-    }
-}}
-
-unsafe fn fill_module_wide(handle: usize, entry: *mut ModuleEntry32W, reset: bool) -> i32 { unsafe {
-    if entry.is_null() {
-        return 0;
-    }
-    match handle_table::snapshot_next_module(handle, reset) {
-        Some(mi) => {
-            let e = &mut *entry;
-            e.th32_module_id = 1;
-            e.mod_base_addr = mi.base as usize;
-            e.mod_base_size = mi.size as u32;
-            e.h_module = mi.base as usize;
-            put_wide(&mut e.sz_module, &mi.name);
-            put_wide(&mut e.sz_exe_path, &mi.name);
-            1
-        }
-        None => 0,
-    }
-}}
-
-pub unsafe extern "system" fn module32_first(snapshot: *mut c_void, entry: *mut ModuleEntry32) -> i32 { unsafe {
-    fill_module_ansi(snapshot as usize, entry, true)
-}}
-pub unsafe extern "system" fn module32_next(snapshot: *mut c_void, entry: *mut ModuleEntry32) -> i32 { unsafe {
-    fill_module_ansi(snapshot as usize, entry, false)
-}}
-pub unsafe extern "system" fn module32_first_w(snapshot: *mut c_void, entry: *mut ModuleEntry32W) -> i32 { unsafe {
-    fill_module_wide(snapshot as usize, entry, true)
-}}
-pub unsafe extern "system" fn module32_next_w(snapshot: *mut c_void, entry: *mut ModuleEntry32W) -> i32 { unsafe {
-    fill_module_wide(snapshot as usize, entry, false)
-}}
-
-pub unsafe extern "system" fn enum_processes(pids: *mut u32, cb: u32, needed: *mut u32) -> i32 { unsafe {
-    if let Some(Response::Processes(list)) = rpc::request(Request::ListProcesses) {
-        let cap = (cb as usize) / core::mem::size_of::<u32>();
-        let n = list.len().min(cap);
-        if !pids.is_null() {
-            for (i, p) in list.iter().take(n).enumerate() {
-                *pids.add(i) = p.pid.0;
+        match handle_table::snapshot_next_process(handle, reset) {
+            Some(pi) => {
+                let e = &mut *entry;
+                e.cnt_usage = 1;
+                e.th32_process_id = pi.pid.0;
+                e.cnt_threads = 1;
+                put_ansi(&mut e.sz_exe_file, &pi.name);
+                1
             }
+            None => 0,
         }
-        if !needed.is_null() {
-            *needed = (n * core::mem::size_of::<u32>()) as u32;
-        }
-        return 1;
     }
-    0
-}}
+}
+
+unsafe fn fill_process_wide(handle: usize, entry: *mut ProcessEntry32W, reset: bool) -> i32 {
+    unsafe {
+        if entry.is_null() {
+            return 0;
+        }
+        match handle_table::snapshot_next_process(handle, reset) {
+            Some(pi) => {
+                let e = &mut *entry;
+                e.cnt_usage = 1;
+                e.th32_process_id = pi.pid.0;
+                e.cnt_threads = 1;
+                put_wide(&mut e.sz_exe_file, &pi.name);
+                1
+            }
+            None => 0,
+        }
+    }
+}
+
+pub unsafe extern "system" fn process32_first(
+    snapshot: *mut c_void,
+    entry: *mut ProcessEntry32,
+) -> i32 {
+    unsafe { fill_process_ansi(snapshot as usize, entry, true) }
+}
+pub unsafe extern "system" fn process32_next(
+    snapshot: *mut c_void,
+    entry: *mut ProcessEntry32,
+) -> i32 {
+    unsafe { fill_process_ansi(snapshot as usize, entry, false) }
+}
+pub unsafe extern "system" fn process32_first_w(
+    snapshot: *mut c_void,
+    entry: *mut ProcessEntry32W,
+) -> i32 {
+    unsafe { fill_process_wide(snapshot as usize, entry, true) }
+}
+pub unsafe extern "system" fn process32_next_w(
+    snapshot: *mut c_void,
+    entry: *mut ProcessEntry32W,
+) -> i32 {
+    unsafe { fill_process_wide(snapshot as usize, entry, false) }
+}
+
+unsafe fn fill_module_ansi(handle: usize, entry: *mut ModuleEntry32, reset: bool) -> i32 {
+    unsafe {
+        if entry.is_null() {
+            return 0;
+        }
+        match handle_table::snapshot_next_module(handle, reset) {
+            Some(mi) => {
+                let e = &mut *entry;
+                e.th32_module_id = 1;
+                e.mod_base_addr = mi.base as usize;
+                e.mod_base_size = mi.size as u32;
+                e.h_module = mi.base as usize;
+                put_ansi(&mut e.sz_module, &mi.name);
+                put_ansi(&mut e.sz_exe_path, &mi.name);
+                1
+            }
+            None => 0,
+        }
+    }
+}
+
+unsafe fn fill_module_wide(handle: usize, entry: *mut ModuleEntry32W, reset: bool) -> i32 {
+    unsafe {
+        if entry.is_null() {
+            return 0;
+        }
+        match handle_table::snapshot_next_module(handle, reset) {
+            Some(mi) => {
+                let e = &mut *entry;
+                e.th32_module_id = 1;
+                e.mod_base_addr = mi.base as usize;
+                e.mod_base_size = mi.size as u32;
+                e.h_module = mi.base as usize;
+                put_wide(&mut e.sz_module, &mi.name);
+                put_wide(&mut e.sz_exe_path, &mi.name);
+                1
+            }
+            None => 0,
+        }
+    }
+}
+
+pub unsafe extern "system" fn module32_first(
+    snapshot: *mut c_void,
+    entry: *mut ModuleEntry32,
+) -> i32 {
+    unsafe { fill_module_ansi(snapshot as usize, entry, true) }
+}
+pub unsafe extern "system" fn module32_next(
+    snapshot: *mut c_void,
+    entry: *mut ModuleEntry32,
+) -> i32 {
+    unsafe { fill_module_ansi(snapshot as usize, entry, false) }
+}
+pub unsafe extern "system" fn module32_first_w(
+    snapshot: *mut c_void,
+    entry: *mut ModuleEntry32W,
+) -> i32 {
+    unsafe { fill_module_wide(snapshot as usize, entry, true) }
+}
+pub unsafe extern "system" fn module32_next_w(
+    snapshot: *mut c_void,
+    entry: *mut ModuleEntry32W,
+) -> i32 {
+    unsafe { fill_module_wide(snapshot as usize, entry, false) }
+}
+
+pub unsafe extern "system" fn enum_processes(pids: *mut u32, cb: u32, needed: *mut u32) -> i32 {
+    unsafe {
+        if let Some(Response::Processes(list)) = rpc::request(Request::ListProcesses) {
+            let cap = (cb as usize) / core::mem::size_of::<u32>();
+            let n = list.len().min(cap);
+            if !pids.is_null() {
+                for (i, p) in list.iter().take(n).enumerate() {
+                    *pids.add(i) = p.pid.0;
+                }
+            }
+            if !needed.is_null() {
+                *needed = (n * core::mem::size_of::<u32>()) as u32;
+            }
+            return 1;
+        }
+        0
+    }
+}
 
 pub unsafe extern "system" fn enum_process_modules(
     process: *mut c_void,
     modules: *mut *mut c_void,
     cb: u32,
     needed: *mut u32,
-) -> i32 { unsafe {
-    let h = process as usize;
-    if handle_table::is_synthetic(h) {
-        let pid = match handle_table::pid_for(h) {
-            Some(p) => p,
-            None => return 0,
-        };
-        if let Some(Response::Modules(list)) = rpc::request(Request::ModuleList(pid)) {
-            let cap = (cb as usize) / core::mem::size_of::<*mut c_void>();
-            let n = list.len().min(cap);
-            if !modules.is_null() {
-                for (i, m) in list.iter().take(n).enumerate() {
-                    *modules.add(i) = m.base as *mut c_void;
+) -> i32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            let pid = match handle_table::pid_for(h) {
+                Some(p) => p,
+                None => return 0,
+            };
+            if let Some(Response::Modules(list)) = rpc::request(Request::ModuleList(pid)) {
+                let cap = (cb as usize) / core::mem::size_of::<*mut c_void>();
+                let n = list.len().min(cap);
+                if !modules.is_null() {
+                    for (i, m) in list.iter().take(n).enumerate() {
+                        *modules.add(i) = m.base as *mut c_void;
+                    }
                 }
+                if !needed.is_null() {
+                    *needed = (list.len() * core::mem::size_of::<*mut c_void>()) as u32;
+                }
+                return 1;
             }
-            if !needed.is_null() {
-                *needed = (list.len() * core::mem::size_of::<*mut c_void>()) as u32;
-            }
-            return 1;
+            return 0;
         }
-        return 0;
+        let p = ORIGINALS.enum_process_modules.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: EnumModsFn = core::mem::transmute(p);
+            return f(process, modules, cb, needed);
+        }
+        0
     }
-    let p = ORIGINALS.enum_process_modules.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: EnumModsFn = core::mem::transmute(p);
-        return f(process, modules, cb, needed);
-    }
-    0
-}}
+}
 
 unsafe fn module_name_for(handle: usize, module: *mut c_void) -> Option<String> {
     let pid = handle_table::pid_for(handle)?;
@@ -680,84 +809,92 @@ pub unsafe extern "system" fn get_module_base_name_a(
     module: *mut c_void,
     base_name: *mut u8,
     size: u32,
-) -> u32 { unsafe {
-    let h = process as usize;
-    if handle_table::is_synthetic(h) {
-        return match module_name_for(h, module) {
-            Some(name) => put_ansi_counted(base_name, size, &name),
-            None => 0,
-        };
+) -> u32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            return match module_name_for(h, module) {
+                Some(name) => put_ansi_counted(base_name, size, &name),
+                None => 0,
+            };
+        }
+        let p = ORIGINALS.get_module_base_name_a.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: GetNameAFn = core::mem::transmute(p);
+            return f(process, module, base_name, size);
+        }
+        0
     }
-    let p = ORIGINALS.get_module_base_name_a.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: GetNameAFn = core::mem::transmute(p);
-        return f(process, module, base_name, size);
-    }
-    0
-}}
+}
 
 pub unsafe extern "system" fn get_module_base_name_w(
     process: *mut c_void,
     module: *mut c_void,
     base_name: *mut u16,
     size: u32,
-) -> u32 { unsafe {
-    let h = process as usize;
-    if handle_table::is_synthetic(h) {
-        return match module_name_for(h, module) {
-            Some(name) => put_wide_counted(base_name, size, &name),
-            None => 0,
-        };
+) -> u32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            return match module_name_for(h, module) {
+                Some(name) => put_wide_counted(base_name, size, &name),
+                None => 0,
+            };
+        }
+        let p = ORIGINALS.get_module_base_name_w.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: GetNameWFn = core::mem::transmute(p);
+            return f(process, module, base_name, size);
+        }
+        0
     }
-    let p = ORIGINALS.get_module_base_name_w.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: GetNameWFn = core::mem::transmute(p);
-        return f(process, module, base_name, size);
-    }
-    0
-}}
+}
 
 pub unsafe extern "system" fn get_module_file_name_ex_a(
     process: *mut c_void,
     module: *mut c_void,
     file_name: *mut u8,
     size: u32,
-) -> u32 { unsafe {
-    let h = process as usize;
-    if handle_table::is_synthetic(h) {
-        return match module_name_for(h, module) {
-            Some(name) => put_ansi_counted(file_name, size, &name),
-            None => 0,
-        };
+) -> u32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            return match module_name_for(h, module) {
+                Some(name) => put_ansi_counted(file_name, size, &name),
+                None => 0,
+            };
+        }
+        let p = ORIGINALS.get_module_file_name_ex_a.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: GetNameAFn = core::mem::transmute(p);
+            return f(process, module, file_name, size);
+        }
+        0
     }
-    let p = ORIGINALS.get_module_file_name_ex_a.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: GetNameAFn = core::mem::transmute(p);
-        return f(process, module, file_name, size);
-    }
-    0
-}}
+}
 
 pub unsafe extern "system" fn get_module_file_name_ex_w(
     process: *mut c_void,
     module: *mut c_void,
     file_name: *mut u16,
     size: u32,
-) -> u32 { unsafe {
-    let h = process as usize;
-    if handle_table::is_synthetic(h) {
-        return match module_name_for(h, module) {
-            Some(name) => put_wide_counted(file_name, size, &name),
-            None => 0,
-        };
+) -> u32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            return match module_name_for(h, module) {
+                Some(name) => put_wide_counted(file_name, size, &name),
+                None => 0,
+            };
+        }
+        let p = ORIGINALS.get_module_file_name_ex_w.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: GetNameWFn = core::mem::transmute(p);
+            return f(process, module, file_name, size);
+        }
+        0
     }
-    let p = ORIGINALS.get_module_file_name_ex_w.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: GetNameWFn = core::mem::transmute(p);
-        return f(process, module, file_name, size);
-    }
-    0
-}}
+}
 
 pub unsafe extern "system" fn virtual_protect_ex(
     _process: *mut c_void,
@@ -765,52 +902,92 @@ pub unsafe extern "system" fn virtual_protect_ex(
     _size: usize,
     _new_protect: u32,
     old_protect: *mut u32,
-) -> i32 { unsafe {
-    if !old_protect.is_null() {
-        *old_protect = PAGE_READWRITE;
+) -> i32 {
+    unsafe {
+        if !old_protect.is_null() {
+            *old_protect = PAGE_READWRITE;
+        }
+        1
     }
-    1
-}}
+}
 
-type VqExFn = unsafe extern "system" fn(*mut c_void, *const c_void, *mut MemoryBasicInformation, usize) -> usize;
-type VAllocExFn = unsafe extern "system" fn(*mut c_void, *mut c_void, usize, u32, u32) -> *mut c_void;
+type VqExFn = unsafe extern "system" fn(
+    *mut c_void,
+    *const c_void,
+    *mut MemoryBasicInformation,
+    usize,
+) -> usize;
+type VAllocExFn =
+    unsafe extern "system" fn(*mut c_void, *mut c_void, usize, u32, u32) -> *mut c_void;
 type VFreeExFn = unsafe extern "system" fn(*mut c_void, *mut c_void, usize, u32) -> i32;
-type NtAllocFn = unsafe extern "system" fn(*mut c_void, *mut *mut c_void, usize, *mut usize, u32, u32) -> i32;
+type NtAllocFn =
+    unsafe extern "system" fn(*mut c_void, *mut *mut c_void, usize, *mut usize, u32, u32) -> i32;
 type NtFreeFn = unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut usize, u32) -> i32;
-type CrtFn = unsafe extern "system" fn(*mut c_void, *mut c_void, usize, *mut c_void, *mut c_void, u32, *mut u32) -> *mut c_void;
-type CrtExFn = unsafe extern "system" fn(*mut c_void, *mut c_void, usize, *mut c_void, *mut c_void, u32, *mut u32, *mut c_void) -> *mut c_void;
-type NtCreateThreadExFn = unsafe extern "system" fn(*mut *mut c_void, u32, *mut c_void, *mut c_void, *mut c_void, *mut c_void, u32, usize, usize, usize, *mut c_void) -> i32;
+type CrtFn = unsafe extern "system" fn(
+    *mut c_void,
+    *mut c_void,
+    usize,
+    *mut c_void,
+    *mut c_void,
+    u32,
+    *mut u32,
+) -> *mut c_void;
+type CrtExFn = unsafe extern "system" fn(
+    *mut c_void,
+    *mut c_void,
+    usize,
+    *mut c_void,
+    *mut c_void,
+    u32,
+    *mut u32,
+    *mut c_void,
+) -> *mut c_void;
+type NtCreateThreadExFn = unsafe extern "system" fn(
+    *mut *mut c_void,
+    u32,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    u32,
+    usize,
+    usize,
+    usize,
+    *mut c_void,
+) -> i32;
 
 pub unsafe extern "system" fn virtual_query_ex(
     process: *mut c_void,
     address: *const c_void,
     mbi: *mut MemoryBasicInformation,
     length: usize,
-) -> usize { unsafe {
-    let h = process as usize;
-    if handle_table::is_synthetic(h) {
-        let pid = match handle_table::pid_for(h) {
-            Some(p) => p,
-            None => return 0,
-        };
-        if mbi.is_null() || length < core::mem::size_of::<MemoryBasicInformation>() {
-            return 0;
-        }
-        match region_for(pid, address as u64) {
-            Some(info) => {
-                *mbi = info;
-                return core::mem::size_of::<MemoryBasicInformation>();
+) -> usize {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            let pid = match handle_table::pid_for(h) {
+                Some(p) => p,
+                None => return 0,
+            };
+            if mbi.is_null() || length < core::mem::size_of::<MemoryBasicInformation>() {
+                return 0;
             }
-            None => return 0,
+            match region_for(pid, address as u64) {
+                Some(info) => {
+                    *mbi = info;
+                    return core::mem::size_of::<MemoryBasicInformation>();
+                }
+                None => return 0,
+            }
         }
+        let p = ORIGINALS.virtual_query_ex.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: VqExFn = core::mem::transmute(p);
+            return f(process, address, mbi, length);
+        }
+        0
     }
-    let p = ORIGINALS.virtual_query_ex.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: VqExFn = core::mem::transmute(p);
-        return f(process, address, mbi, length);
-    }
-    0
-}}
+}
 
 pub unsafe extern "system" fn virtual_alloc_ex(
     process: *mut c_void,
@@ -818,38 +995,42 @@ pub unsafe extern "system" fn virtual_alloc_ex(
     size: usize,
     alloc_type: u32,
     protect: u32,
-) -> *mut c_void { unsafe {
-    let h = process as usize;
-    if handle_table::is_synthetic(h) {
-        report_unsupported("VirtualAllocEx");
-        return core::ptr::null_mut();
+) -> *mut c_void {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            report_unsupported("VirtualAllocEx");
+            return core::ptr::null_mut();
+        }
+        let p = ORIGINALS.virtual_alloc_ex.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: VAllocExFn = core::mem::transmute(p);
+            return f(process, address, size, alloc_type, protect);
+        }
+        core::ptr::null_mut()
     }
-    let p = ORIGINALS.virtual_alloc_ex.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: VAllocExFn = core::mem::transmute(p);
-        return f(process, address, size, alloc_type, protect);
-    }
-    core::ptr::null_mut()
-}}
+}
 
 pub unsafe extern "system" fn virtual_free_ex(
     process: *mut c_void,
     address: *mut c_void,
     size: usize,
     free_type: u32,
-) -> i32 { unsafe {
-    let h = process as usize;
-    if handle_table::is_synthetic(h) {
-        report_unsupported("VirtualFreeEx");
-        return 0;
+) -> i32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            report_unsupported("VirtualFreeEx");
+            return 0;
+        }
+        let p = ORIGINALS.virtual_free_ex.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: VFreeExFn = core::mem::transmute(p);
+            return f(process, address, size, free_type);
+        }
+        0
     }
-    let p = ORIGINALS.virtual_free_ex.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: VFreeExFn = core::mem::transmute(p);
-        return f(process, address, size, free_type);
-    }
-    0
-}}
+}
 
 pub unsafe extern "system" fn nt_allocate_virtual_memory(
     process: *mut c_void,
@@ -858,38 +1039,42 @@ pub unsafe extern "system" fn nt_allocate_virtual_memory(
     size: *mut usize,
     alloc_type: u32,
     protect: u32,
-) -> i32 { unsafe {
-    let h = process as usize;
-    if handle_table::is_synthetic(h) {
-        report_unsupported("NtAllocateVirtualMemory");
-        return STATUS_NOT_SUPPORTED;
+) -> i32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            report_unsupported("NtAllocateVirtualMemory");
+            return STATUS_NOT_SUPPORTED;
+        }
+        let p = ORIGINALS.nt_allocate_virtual_memory.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: NtAllocFn = core::mem::transmute(p);
+            return f(process, base, zerobits, size, alloc_type, protect);
+        }
+        STATUS_NOT_SUPPORTED
     }
-    let p = ORIGINALS.nt_allocate_virtual_memory.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: NtAllocFn = core::mem::transmute(p);
-        return f(process, base, zerobits, size, alloc_type, protect);
-    }
-    STATUS_NOT_SUPPORTED
-}}
+}
 
 pub unsafe extern "system" fn nt_free_virtual_memory(
     process: *mut c_void,
     base: *mut *mut c_void,
     size: *mut usize,
     free_type: u32,
-) -> i32 { unsafe {
-    let h = process as usize;
-    if handle_table::is_synthetic(h) {
-        report_unsupported("NtFreeVirtualMemory");
-        return STATUS_NOT_SUPPORTED;
+) -> i32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            report_unsupported("NtFreeVirtualMemory");
+            return STATUS_NOT_SUPPORTED;
+        }
+        let p = ORIGINALS.nt_free_virtual_memory.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: NtFreeFn = core::mem::transmute(p);
+            return f(process, base, size, free_type);
+        }
+        STATUS_NOT_SUPPORTED
     }
-    let p = ORIGINALS.nt_free_virtual_memory.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: NtFreeFn = core::mem::transmute(p);
-        return f(process, base, size, free_type);
-    }
-    STATUS_NOT_SUPPORTED
-}}
+}
 
 pub unsafe extern "system" fn create_remote_thread(
     process: *mut c_void,
@@ -899,19 +1084,21 @@ pub unsafe extern "system" fn create_remote_thread(
     param: *mut c_void,
     flags: u32,
     tid: *mut u32,
-) -> *mut c_void { unsafe {
-    let h = process as usize;
-    if handle_table::is_synthetic(h) {
-        report_unsupported("CreateRemoteThread");
-        return core::ptr::null_mut();
+) -> *mut c_void {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            report_unsupported("CreateRemoteThread");
+            return core::ptr::null_mut();
+        }
+        let p = ORIGINALS.create_remote_thread.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: CrtFn = core::mem::transmute(p);
+            return f(process, attrs, stack, start, param, flags, tid);
+        }
+        core::ptr::null_mut()
     }
-    let p = ORIGINALS.create_remote_thread.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: CrtFn = core::mem::transmute(p);
-        return f(process, attrs, stack, start, param, flags, tid);
-    }
-    core::ptr::null_mut()
-}}
+}
 
 pub unsafe extern "system" fn create_remote_thread_ex(
     process: *mut c_void,
@@ -922,19 +1109,21 @@ pub unsafe extern "system" fn create_remote_thread_ex(
     flags: u32,
     tid: *mut u32,
     attr_list: *mut c_void,
-) -> *mut c_void { unsafe {
-    let h = process as usize;
-    if handle_table::is_synthetic(h) {
-        report_unsupported("CreateRemoteThreadEx");
-        return core::ptr::null_mut();
+) -> *mut c_void {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            report_unsupported("CreateRemoteThreadEx");
+            return core::ptr::null_mut();
+        }
+        let p = ORIGINALS.create_remote_thread_ex.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: CrtExFn = core::mem::transmute(p);
+            return f(process, attrs, stack, start, param, flags, tid, attr_list);
+        }
+        core::ptr::null_mut()
     }
-    let p = ORIGINALS.create_remote_thread_ex.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: CrtExFn = core::mem::transmute(p);
-        return f(process, attrs, stack, start, param, flags, tid, attr_list);
-    }
-    core::ptr::null_mut()
-}}
+}
 
 pub unsafe extern "system" fn nt_create_thread_ex(
     thread: *mut *mut c_void,
@@ -948,122 +1137,141 @@ pub unsafe extern "system" fn nt_create_thread_ex(
     stacksize: usize,
     maxstack: usize,
     attrlist: *mut c_void,
-) -> i32 { unsafe {
-    let h = process as usize;
-    if handle_table::is_synthetic(h) {
-        report_unsupported("NtCreateThreadEx");
-        return STATUS_NOT_SUPPORTED;
+) -> i32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            report_unsupported("NtCreateThreadEx");
+            return STATUS_NOT_SUPPORTED;
+        }
+        let p = ORIGINALS.nt_create_thread_ex.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: NtCreateThreadExFn = core::mem::transmute(p);
+            return f(
+                thread, access, objattrs, process, start, param, flags, zerobits, stacksize,
+                maxstack, attrlist,
+            );
+        }
+        STATUS_NOT_SUPPORTED
     }
-    let p = ORIGINALS.nt_create_thread_ex.load(Ordering::SeqCst);
-    if p != 0 {
-        let f: NtCreateThreadExFn = core::mem::transmute(p);
-        return f(
-            thread, access, objattrs, process, start, param, flags, zerobits, stacksize, maxstack,
-            attrlist,
-        );
-    }
-    STATUS_NOT_SUPPORTED
-}}
+}
 
-pub unsafe extern "system" fn get_proc_address(module: *mut c_void, name: *const u8) -> *mut c_void { unsafe {
-    if (name as usize) >> 16 != 0 {
-        let r = redirect(name);
-        if !r.is_null() {
-            return r;
+pub unsafe extern "system" fn get_proc_address(
+    module: *mut c_void,
+    name: *const u8,
+) -> *mut c_void {
+    unsafe {
+        if (name as usize) >> 16 != 0 {
+            let r = redirect(name);
+            if !r.is_null() {
+                return r;
+            }
+            let r = crate::process_hooks::redirect(name);
+            if !r.is_null() {
+                return r;
+            }
+            let r = crate::module_hooks::redirect(name);
+            if !r.is_null() {
+                return r;
+            }
         }
-        let r = crate::process_hooks::redirect(name);
-        if !r.is_null() {
-            return r;
+        let orig = ORIGINALS.get_proc_address.load(Ordering::SeqCst);
+        if orig == 0 {
+            return core::ptr::null_mut();
         }
-        let r = crate::module_hooks::redirect(name);
-        if !r.is_null() {
-            return r;
-        }
+        let f: unsafe extern "system" fn(*mut c_void, *const u8) -> *mut c_void =
+            core::mem::transmute(orig);
+        f(module, name)
     }
-    let orig = ORIGINALS.get_proc_address.load(Ordering::SeqCst);
-    if orig == 0 {
-        return core::ptr::null_mut();
-    }
-    let f: unsafe extern "system" fn(*mut c_void, *const u8) -> *mut c_void = core::mem::transmute(orig);
-    f(module, name)
-}}
+}
 
 pub unsafe extern "system" fn nt_query_system_information(
     class: u32,
     info: *mut c_void,
     len: u32,
     ret_len: *mut u32,
-) -> i32 { unsafe {
-    if class != SYSTEM_PROCESS_INFORMATION {
-        let orig = ORIGINALS.nt_query_system_information.load(Ordering::SeqCst);
-        if orig == 0 {
-            return STATUS_UNSUCCESSFUL;
+) -> i32 {
+    unsafe {
+        if class != SYSTEM_PROCESS_INFORMATION {
+            let orig = ORIGINALS.nt_query_system_information.load(Ordering::SeqCst);
+            if orig == 0 {
+                return STATUS_UNSUCCESSFUL;
+            }
+            let f: unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32 =
+                core::mem::transmute(orig);
+            return f(class, info, len, ret_len);
         }
-        let f: unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32 =
-            core::mem::transmute(orig);
-        return f(class, info, len, ret_len);
-    }
 
-    let list = match rpc::request(Request::ListProcesses) {
-        Some(Response::Processes(l)) => l,
-        _ => return STATUS_UNSUCCESSFUL,
-    };
+        let list = match rpc::request(Request::ListProcesses) {
+            Some(Response::Processes(l)) => l,
+            _ => return STATUS_UNSUCCESSFUL,
+        };
 
-    let entry_size = |nb: usize| SPI_STRIDE + ((nb + 7) & !7);
-    let required: usize = list.iter().map(|p| entry_size(p.name.encode_utf16().count() * 2)).sum();
+        let entry_size = |nb: usize| SPI_STRIDE + ((nb + 7) & !7);
+        let required: usize = list
+            .iter()
+            .map(|p| entry_size(p.name.encode_utf16().count() * 2))
+            .sum();
 
-    if !ret_len.is_null() {
-        *ret_len = required as u32;
-    }
-    if info.is_null() || (len as usize) < required {
-        return STATUS_INFO_LENGTH_MISMATCH;
-    }
-
-    let base = info as *mut u8;
-    core::ptr::write_bytes(base, 0, required);
-    let mut off = 0usize;
-    for (i, p) in list.iter().enumerate() {
-        let entry = base.add(off);
-        let nb = p.name.encode_utf16().count() * 2;
-        let stride = entry_size(nb);
-        let next = if i + 1 == list.len() { 0u32 } else { stride as u32 };
-
-        (entry as *mut u32).write_unaligned(next);
-        (entry.add(0x04) as *mut u32).write_unaligned(0);
-        (entry.add(0x38) as *mut u16).write_unaligned(nb as u16);
-        (entry.add(0x3A) as *mut u16).write_unaligned(nb as u16);
-        let name_ptr = entry.add(SPI_STRIDE);
-        (entry.add(0x40) as *mut u64).write_unaligned(name_ptr as u64);
-        (entry.add(0x50) as *mut u64).write_unaligned(p.pid.0 as u64);
-
-        let mut w = name_ptr as *mut u16;
-        for u in p.name.encode_utf16() {
-            w.write_unaligned(u);
-            w = w.add(1);
+        if !ret_len.is_null() {
+            *ret_len = required as u32;
         }
-        off += stride;
+        if info.is_null() || (len as usize) < required {
+            return STATUS_INFO_LENGTH_MISMATCH;
+        }
+
+        let base = info as *mut u8;
+        core::ptr::write_bytes(base, 0, required);
+        let mut off = 0usize;
+        for (i, p) in list.iter().enumerate() {
+            let entry = base.add(off);
+            let nb = p.name.encode_utf16().count() * 2;
+            let stride = entry_size(nb);
+            let next = if i + 1 == list.len() {
+                0u32
+            } else {
+                stride as u32
+            };
+
+            (entry as *mut u32).write_unaligned(next);
+            (entry.add(0x04) as *mut u32).write_unaligned(0);
+            (entry.add(0x38) as *mut u16).write_unaligned(nb as u16);
+            (entry.add(0x3A) as *mut u16).write_unaligned(nb as u16);
+            let name_ptr = entry.add(SPI_STRIDE);
+            (entry.add(0x40) as *mut u64).write_unaligned(name_ptr as u64);
+            (entry.add(0x50) as *mut u64).write_unaligned(p.pid.0 as u64);
+
+            let mut w = name_ptr as *mut u16;
+            for u in p.name.encode_utf16() {
+                w.write_unaligned(u);
+                w = w.add(1);
+            }
+            off += stride;
+        }
+        STATUS_SUCCESS
     }
-    STATUS_SUCCESS
-}}
+}
 
 pub unsafe extern "system" fn nt_open_process(
     handle: *mut *mut c_void,
     _access: u32,
     _obj_attr: *mut c_void,
     client_id: *const ClientId,
-) -> i32 { unsafe {
-    if handle.is_null() || client_id.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    let pid = (*client_id).unique_process as u32;
-    match rpc::request(Request::ProcessByPid(Pid(pid))) {
-        Some(Response::Process(_)) => {
-            *handle = handle_table::open_process(Pid(pid)) as *mut c_void;
-            STATUS_SUCCESS
+) -> i32 {
+    unsafe {
+        if handle.is_null() || client_id.is_null() {
+            return STATUS_INVALID_PARAMETER;
         }
-        _ => STATUS_INVALID_PARAMETER,
+        let pid = (*client_id).unique_process as u32;
+        match rpc::request(Request::ProcessByPid(Pid(pid))) {
+            Some(Response::Process(_)) => {
+                *handle = handle_table::open_process(Pid(pid)) as *mut c_void;
+                STATUS_SUCCESS
+            }
+            _ => STATUS_INVALID_PARAMETER,
+        }
     }
-}}
+}
 
 pub unsafe extern "system" fn nt_get_next_process(
     process: *mut c_void,
@@ -1071,26 +1279,28 @@ pub unsafe extern "system" fn nt_get_next_process(
     _attrs: u32,
     _flags: u32,
     new_process: *mut *mut c_void,
-) -> i32 { unsafe {
-    if new_process.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    let list = match rpc::request(Request::ListProcesses) {
-        Some(Response::Processes(l)) => l,
-        _ => return STATUS_UNSUCCESSFUL,
-    };
-    let start = match handle_table::pid_for(process as usize) {
-        Some(cur) => list.iter().position(|p| p.pid == cur).map_or(0, |i| i + 1),
-        None => 0,
-    };
-    match list.get(start) {
-        Some(p) => {
-            *new_process = handle_table::open_process(p.pid) as *mut c_void;
-            STATUS_SUCCESS
+) -> i32 {
+    unsafe {
+        if new_process.is_null() {
+            return STATUS_INVALID_PARAMETER;
         }
-        None => STATUS_NO_MORE_ENTRIES,
+        let list = match rpc::request(Request::ListProcesses) {
+            Some(Response::Processes(l)) => l,
+            _ => return STATUS_UNSUCCESSFUL,
+        };
+        let start = match handle_table::pid_for(process as usize) {
+            Some(cur) => list.iter().position(|p| p.pid == cur).map_or(0, |i| i + 1),
+            None => 0,
+        };
+        match list.get(start) {
+            Some(p) => {
+                *new_process = handle_table::open_process(p.pid) as *mut c_void;
+                STATUS_SUCCESS
+            }
+            None => STATUS_NO_MORE_ENTRIES,
+        }
     }
-}}
+}
 
 pub unsafe extern "system" fn toolhelp32_read_process_memory(
     pid: u32,
@@ -1098,28 +1308,34 @@ pub unsafe extern "system" fn toolhelp32_read_process_memory(
     buffer: *mut c_void,
     size: usize,
     bytes_read: *mut usize,
-) -> i32 { unsafe {
-    if !bytes_read.is_null() {
-        *bytes_read = 0;
-    }
-    if buffer.is_null() || size == 0 {
-        return 0;
-    }
-    match rpc::request(Request::Read { pid: Pid(pid), addr: base as u64, len: size as u64 }) {
-        Some(Response::Data(data)) => {
-            let n = data.len().min(size);
-            if n == 0 {
-                return 0;
-            }
-            core::ptr::copy_nonoverlapping(data.as_ptr(), buffer as *mut u8, n);
-            if !bytes_read.is_null() {
-                *bytes_read = n;
-            }
-            1
+) -> i32 {
+    unsafe {
+        if !bytes_read.is_null() {
+            *bytes_read = 0;
         }
-        _ => 0,
+        if buffer.is_null() || size == 0 {
+            return 0;
+        }
+        match rpc::request(Request::Read {
+            pid: Pid(pid),
+            addr: base as u64,
+            len: size as u64,
+        }) {
+            Some(Response::Data(data)) => {
+                let n = data.len().min(size);
+                if n == 0 {
+                    return 0;
+                }
+                core::ptr::copy_nonoverlapping(data.as_ptr(), buffer as *mut u8, n);
+                if !bytes_read.is_null() {
+                    *bytes_read = n;
+                }
+                1
+            }
+            _ => 0,
+        }
     }
-}}
+}
 
 pub unsafe extern "system" fn nt_query_information_process(
     process: *mut c_void,
@@ -1127,70 +1343,321 @@ pub unsafe extern "system" fn nt_query_information_process(
     info: *mut c_void,
     len: u32,
     ret_len: *mut u32,
-) -> i32 { unsafe {
-    if !handle_table::is_synthetic(process as usize) {
-        let orig = ORIGINALS.nt_query_information_process.load(Ordering::SeqCst);
-        if orig == 0 {
-            return STATUS_UNSUCCESSFUL;
+) -> i32 {
+    unsafe {
+        if !handle_table::is_synthetic(process as usize) {
+            let orig = ORIGINALS
+                .nt_query_information_process
+                .load(Ordering::SeqCst);
+            if orig == 0 {
+                return STATUS_UNSUCCESSFUL;
+            }
+            let f: unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut u32) -> i32 =
+                core::mem::transmute(orig);
+            return f(process, class, info, len, ret_len);
         }
-        let f: unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut u32) -> i32 =
-            core::mem::transmute(orig);
-        return f(process, class, info, len, ret_len);
-    }
-    let pid = match handle_table::pid_for(process as usize) {
-        Some(p) => p,
-        None => return STATUS_INVALID_PARAMETER,
-    };
-    match class {
-        PROCESS_WOW64_INFORMATION => {
-            if info.is_null() || (len as usize) < 8 {
-                if !ret_len.is_null() {
-                    *ret_len = 8;
+        let pid = match handle_table::pid_for(process as usize) {
+            Some(p) => p,
+            None => return STATUS_INVALID_PARAMETER,
+        };
+        match class {
+            PROCESS_BASIC_INFORMATION => {
+                let total = 0x30;
+                if info.is_null() || (len as usize) < total {
+                    if !ret_len.is_null() {
+                        *ret_len = total as u32;
+                    }
+                    return STATUS_INFO_LENGTH_MISMATCH;
                 }
-                return STATUS_INFO_LENGTH_MISMATCH;
-            }
-            (info as *mut u64).write_unaligned(0);
-            if !ret_len.is_null() {
-                *ret_len = 8;
-            }
-            STATUS_SUCCESS
-        }
-        PROCESS_IMAGE_FILE_NAME => {
-            let name = match rpc::request(Request::ProcessByPid(pid)) {
-                Some(Response::Process(p)) => p.name,
-                _ => return STATUS_INVALID_PARAMETER,
-            };
-            let nb = name.encode_utf16().count() * 2;
-            let total = 0x10 + nb;
-            if info.is_null() || (len as usize) < total {
+                let base = info as *mut u8;
+                (base as *mut i32).write_unaligned(0);
+                (base.add(0x08) as *mut usize).write_unaligned(0);
+                (base.add(0x10) as *mut usize).write_unaligned(0);
+                (base.add(0x18) as *mut i32).write_unaligned(0);
+                (base.add(0x20) as *mut usize).write_unaligned(pid.0 as usize);
+                (base.add(0x28) as *mut usize).write_unaligned(0);
                 if !ret_len.is_null() {
                     *ret_len = total as u32;
                 }
-                return STATUS_INFO_LENGTH_MISMATCH;
+                STATUS_SUCCESS
             }
-            let base = info as *mut u8;
-            let buf = base.add(0x10);
-            (base as *mut u16).write_unaligned(nb as u16);
-            (base.add(0x02) as *mut u16).write_unaligned(nb as u16);
-            (base.add(0x08) as *mut u64).write_unaligned(buf as u64);
-            let mut w = buf as *mut u16;
-            for u in name.encode_utf16() {
-                w.write_unaligned(u);
-                w = w.add(1);
+            PROCESS_WOW64_INFORMATION => {
+                if info.is_null() || (len as usize) < 8 {
+                    if !ret_len.is_null() {
+                        *ret_len = 8;
+                    }
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                (info as *mut u64).write_unaligned(0);
+                if !ret_len.is_null() {
+                    *ret_len = 8;
+                }
+                STATUS_SUCCESS
             }
-            if !ret_len.is_null() {
-                *ret_len = total as u32;
+            PROCESS_IMAGE_FILE_NAME => {
+                let name = match rpc::request(Request::ProcessByPid(pid)) {
+                    Some(Response::Process(p)) => p.name,
+                    _ => return STATUS_INVALID_PARAMETER,
+                };
+                let nb = name.encode_utf16().count() * 2;
+                let total = 0x10 + nb;
+                if info.is_null() || (len as usize) < total {
+                    if !ret_len.is_null() {
+                        *ret_len = total as u32;
+                    }
+                    return STATUS_INFO_LENGTH_MISMATCH;
+                }
+                let base = info as *mut u8;
+                let buf = base.add(0x10);
+                (base as *mut u16).write_unaligned(nb as u16);
+                (base.add(0x02) as *mut u16).write_unaligned(nb as u16);
+                (base.add(0x08) as *mut u64).write_unaligned(buf as u64);
+                let mut w = buf as *mut u16;
+                for u in name.encode_utf16() {
+                    w.write_unaligned(u);
+                    w = w.add(1);
+                }
+                if !ret_len.is_null() {
+                    *ret_len = total as u32;
+                }
+                STATUS_SUCCESS
             }
-            STATUS_SUCCESS
+            _ => STATUS_INVALID_PARAMETER,
         }
-        _ => STATUS_INVALID_PARAMETER,
     }
-}}
+}
 
-pub unsafe fn install_all() -> u32 { unsafe {
-    originals::capture();
-    let mut total = interpose_exports!(do_install);
-    total += crate::process_hooks::install();
-    total += crate::module_hooks::install();
-    total
-}}
+pub unsafe extern "system" fn duplicate_handle(
+    source_process: *mut c_void,
+    source_handle: *mut c_void,
+    target_process: *mut c_void,
+    target_handle: *mut *mut c_void,
+    desired_access: u32,
+    inherit: i32,
+    options: u32,
+) -> i32 {
+    unsafe {
+        let h = source_handle as usize;
+        if handle_table::is_synthetic(h) {
+            let pid = match handle_table::pid_for(h) {
+                Some(p) => p,
+                None => return 0,
+            };
+            if target_handle.is_null() {
+                return 0;
+            }
+            let dup = handle_table::open_process(pid);
+            if dup == 0 {
+                return 0;
+            }
+            *target_handle = dup as *mut c_void;
+            return 1;
+        }
+        let p = ORIGINALS.duplicate_handle.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: DupHandleFn = core::mem::transmute(p);
+            return f(
+                source_process,
+                source_handle,
+                target_process,
+                target_handle,
+                desired_access,
+                inherit,
+                options,
+            );
+        }
+        0
+    }
+}
+
+pub unsafe extern "system" fn wait_for_single_object(
+    handle: *mut c_void,
+    milliseconds: u32,
+) -> u32 {
+    unsafe {
+        let h = handle as usize;
+        if handle_table::is_synthetic(h) {
+            return WAIT_TIMEOUT;
+        }
+        let p = ORIGINALS.wait_for_single_object.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: WaitFn = core::mem::transmute(p);
+            return f(handle, milliseconds);
+        }
+        WAIT_TIMEOUT
+    }
+}
+
+pub unsafe extern "system" fn wait_for_single_object_ex(
+    handle: *mut c_void,
+    milliseconds: u32,
+    alertable: i32,
+) -> u32 {
+    unsafe {
+        let h = handle as usize;
+        if handle_table::is_synthetic(h) {
+            return WAIT_TIMEOUT;
+        }
+        let p = ORIGINALS.wait_for_single_object_ex.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: WaitExFn = core::mem::transmute(p);
+            return f(handle, milliseconds, alertable);
+        }
+        WAIT_TIMEOUT
+    }
+}
+
+pub unsafe extern "system" fn get_handle_information(object: *mut c_void, flags: *mut u32) -> i32 {
+    unsafe {
+        let h = object as usize;
+        if handle_table::is_synthetic(h) {
+            if !flags.is_null() {
+                *flags = 0;
+            }
+            return 1;
+        }
+        let p = ORIGINALS.get_handle_information.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: GetHandleInfoFn = core::mem::transmute(p);
+            return f(object, flags);
+        }
+        0
+    }
+}
+
+pub unsafe extern "system" fn nt_wait_for_single_object(
+    handle: *mut c_void,
+    alertable: u8,
+    timeout: *mut c_void,
+) -> i32 {
+    unsafe {
+        let h = handle as usize;
+        if handle_table::is_synthetic(h) {
+            return STATUS_TIMEOUT;
+        }
+        let p = ORIGINALS.nt_wait_for_single_object.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: NtWaitFn = core::mem::transmute(p);
+            return f(handle, alertable, timeout);
+        }
+        STATUS_TIMEOUT
+    }
+}
+
+pub unsafe extern "system" fn set_handle_information(
+    object: *mut c_void,
+    mask: u32,
+    flags: u32,
+) -> i32 {
+    unsafe {
+        let h = object as usize;
+        if handle_table::is_synthetic(h) {
+            return 1;
+        }
+        let p = ORIGINALS.set_handle_information.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: SetHandleInfoFn = core::mem::transmute(p);
+            return f(object, mask, flags);
+        }
+        0
+    }
+}
+
+pub unsafe extern "system" fn get_priority_class(process: *mut c_void) -> u32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            return NORMAL_PRIORITY_CLASS;
+        }
+        let p = ORIGINALS.get_priority_class.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: GetPriorityFn = core::mem::transmute(p);
+            return f(process);
+        }
+        0
+    }
+}
+
+pub unsafe extern "system" fn get_process_times(
+    process: *mut c_void,
+    creation: *mut u64,
+    exit: *mut u64,
+    kernel: *mut u64,
+    user: *mut u64,
+) -> i32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            for out in [creation, exit, kernel, user] {
+                if !out.is_null() {
+                    out.write_unaligned(0);
+                }
+            }
+            return 1;
+        }
+        let p = ORIGINALS.get_process_times.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: GetProcessTimesFn = core::mem::transmute(p);
+            return f(process, creation, exit, kernel, user);
+        }
+        0
+    }
+}
+
+pub unsafe extern "system" fn terminate_process(process: *mut c_void, exit_code: u32) -> i32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            report_unsupported("TerminateProcess");
+            return 0;
+        }
+        let p = ORIGINALS.terminate_process.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: TerminateProcessFn = core::mem::transmute(p);
+            return f(process, exit_code);
+        }
+        0
+    }
+}
+
+pub unsafe extern "system" fn nt_suspend_process(process: *mut c_void) -> i32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            report_unsupported("NtSuspendProcess");
+            return STATUS_NOT_SUPPORTED;
+        }
+        let p = ORIGINALS.nt_suspend_process.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: NtProcessActionFn = core::mem::transmute(p);
+            return f(process);
+        }
+        STATUS_NOT_SUPPORTED
+    }
+}
+
+pub unsafe extern "system" fn nt_resume_process(process: *mut c_void) -> i32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            report_unsupported("NtResumeProcess");
+            return STATUS_NOT_SUPPORTED;
+        }
+        let p = ORIGINALS.nt_resume_process.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: NtProcessActionFn = core::mem::transmute(p);
+            return f(process);
+        }
+        STATUS_NOT_SUPPORTED
+    }
+}
+
+pub unsafe fn install_all() -> u32 {
+    unsafe {
+        originals::capture();
+        let mut total = interpose_exports!(do_install);
+        total += crate::process_hooks::install();
+        total += crate::module_hooks::install();
+        total
+    }
+}

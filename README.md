@@ -150,25 +150,35 @@ Mock backend (no VM, default; develop the whole stack against a mock guest):
 decant-daemon --backend mock --bind 127.0.0.1:7878
 ```
 
-VM backend (memflow over QEMU/KVM, runs as root; see the memflow backend section of [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
+VM backend (memflow; see the memflow backend section of [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)). Build it once:
 
 ```bash
 cargo build -p decant-daemon --features memflow
-
-QPID=$(pgrep -f 'guest=<vm-name>')          # the qemu-system process for your VM
-sudo env \
-  MEMFLOW_PLUGIN_PATH=/path/to/plugins \
-  DECANT_CONNECTOR_ARGS="$QPID" \
-  ./target/debug/decant-daemon --backend memflow --connector kvm --bind 127.0.0.1:7878
-# decant-daemon listening on 127.0.0.1:7878 (backend: memflow:kvm)
 ```
 
-Usage notes (memflow over QEMU/KVM):
+The **QEMU connector** (default) reads the qemu process directly: no kernel module, and no root once the binary has ptrace capability. Its arg is the VM name from `qemu -name guest=<name>`; leave it empty to auto-detect a single VM.
 
-- The qemu PID is memflow's bare default arg. A `pid=` named arg fails with `Error(Connector, ArgValidation)`.
-- The plugin ABI is the integer `MEMFLOW_PLUGIN_VERSION`, not the crate version; a 0.2.4 core loads 0.2.1 plugins.
-- KVM needs root (`/dev/memflow` is `root:root`). The backend connects before binding the socket, so a failure exits with a message instead of leaving a partial server.
-- Write to stable memory (zero padding), not active heap. Actively-used slots get reclaimed during a test.
+```bash
+sudo setcap 'CAP_SYS_PTRACE=ep' target/debug/decant-daemon       # one-time, instead of sudo
+MEMFLOW_PLUGIN_PATH=/path/to/plugins DECANT_CONNECTOR_ARGS=<vm-name> \
+  ./target/debug/decant-daemon --backend memflow --connector qemu --bind 127.0.0.1:7878
+# decant-daemon listening on 127.0.0.1:7878 (backend: memflow:qemu)
+```
+
+The **KVM connector** reads through the `memflow.ko` kernel module: lower overhead, needs root and the qemu PID as its arg.
+
+```bash
+sudo env MEMFLOW_PLUGIN_PATH=/path/to/plugins \
+  DECANT_CONNECTOR_ARGS=$(pgrep -f 'guest=<vm-name>') \
+  ./target/debug/decant-daemon --backend memflow --connector kvm --bind 127.0.0.1:7878
+```
+
+Usage notes:
+
+- Connector arg: the qemu connector takes the VM name (or empty to auto-detect); the kvm connector takes the qemu PID. Both are memflow's bare default arg; a `pid=` named arg fails with `Error(Connector, ArgValidation)`.
+- `MEMFLOW_PLUGIN_PATH` points at the directory with `libmemflow_{qemu,kvm,win32}.so`. The plugin ABI is the integer `MEMFLOW_PLUGIN_VERSION`, not the crate version; a 0.2.4 core loads 0.2.1 plugins.
+- The backend connects before binding the socket, so a failure exits with a message instead of leaving a partial server.
+- Write to stable memory (zero padding), not active heap; a hot slot can be reclaimed by the guest between operations.
 
 ## Running a tool under the interposer
 
@@ -203,13 +213,16 @@ it cannot perform, and never returns a false success.
 | Module and export resolution | `SetWindowsHookEx` |
 | In-place byte patching | Calling a guest function |
 | `VirtualProtectEx` (no-op success) | |
-| `VirtualQueryEx` (best-effort) | |
+| `VirtualQueryEx`/`NtQueryVirtualMemory` (State/Type/Protect) | |
 
 Notes:
 
 - Hooks are event-driven; Decant polls. It cannot deliver a `SetWindowsHookEx`-style callback.
-- There is no atomic read-modify-write across the VM boundary, and a paged-out guest page reads as not-present (a `ReadFailed`, not truncated bytes).
-- Cheat Engine and other tools that resolve the memory APIs at runtime are supported. Such a tool does not import `ReadProcessMemory`; it looks the address up with `GetProcAddress` at runtime, and it lists processes through `NtQuerySystemInformation` rather than toolhelp. Patching the import table alone would see neither. The carafe also hooks `GetProcAddress` (returning its own functions for the names it interposes) and synthesizes `NtQuerySystemInformation`, along with `NtOpenProcess`, `NtGetNextProcess`, `Toolhelp32ReadProcessMemory`, and the `NtQueryInformationProcess` image classes, so a runtime-resolving tool's process list, scans, and edits all route to the guest. A tool that imports the APIs directly (the bundled `sample-tool`) routes through the import-table patch instead. Either way the binding stays on public Win32/NT exports. `cargo xtask dynamic` exercises the runtime-resolution path with a tool that resolves every memory API only through `GetProcAddress` and enumerates only through `NtQuerySystemInformation`. What stays unsupported is guest code execution (see the table above).
+- A paged-out guest page reads as not-present (a `ReadFailed`, not truncated bytes).
+- Freezing a fast-changing or per-frame value is racy by construction. Decant reads and writes guest memory out of band; it cannot install a hook in the guest or perform an atomic read-modify-write across the boundary, so a freeze loop can lose races against the game's own writes. Slow-changing values freeze reliably.
+- Cheat Engine and any other tool that resolves the memory APIs at runtime route the same as one that imports them. Such a tool does not import `ReadProcessMemory`; it looks the address up with `GetProcAddress` at runtime, and it lists processes through `NtQuerySystemInformation` rather than toolhelp. The carafe patches `GetProcAddress`'s own import slot, so every runtime lookup of an interposed memory API returns the carafe's hook, and it synthesizes `NtQuerySystemInformation` for the process list, along with `NtOpenProcess`, `NtGetNextProcess`, `Toolhelp32ReadProcessMemory`, and the `NtQueryInformationProcess` image classes. A tool that imports the APIs directly (the bundled `sample-tool`) routes through the import-table patch instead. This is general, not a Cheat-Engine special case; either way the binding stays on public Win32/NT exports. `cargo xtask dynamic` exercises the runtime-resolution path with a tool that resolves every memory API only through `GetProcAddress` and enumerates only through `NtQuerySystemInformation`. What stays unsupported is guest code execution (see the table above).
+- The synthetic process handle services the full handle tail: `OpenProcess`, `ReadProcessMemory`, `WriteProcessMemory`, `CloseHandle` and `NtClose`, `DuplicateHandle`, `WaitForSingleObject`/`WaitForSingleObjectEx`/`NtWaitForSingleObject`, `GetHandleInformation`/`SetHandleInformation`, `GetProcessId`, `GetExitCodeProcess`, `GetPriorityClass`, `GetProcessTimes`, `IsWow64Process`, `QueryFullProcessImageName`, `GetProcessImageFileName`, the `NtQueryInformationProcess` basic, wow64, and image classes, and `VirtualQueryEx` and `NtQueryVirtualMemory`. `NtQueryInformationProcess(ProcessBasicInformation)` returns the pid with a PEB base of 0, since memflow's generic ABI does not expose it, so guest PEB-walking features are unavailable. The execution and process-control exports (memory allocation, remote threads, `TerminateProcess`, `NtSuspendProcess`/`NtResumeProcess`) refuse.
+- `VirtualQueryEx` and `NtQueryVirtualMemory` report `State`, `Type`, and `Protect` derived from the guest page tables and module list: a region overlapping a loaded module reports `MEM_IMAGE`, others `MEM_PRIVATE`. `MEM_MAPPED` is not distinguished, reserved uncommitted memory is not enumerated, and copy-on-write and guard sub-flags are not reported. Default scans over all types are unaffected; a `Type`-filtered or `Protect`-filtered scan may differ from native.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) section 3.
 
