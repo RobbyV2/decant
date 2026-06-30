@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use decant_wine_harness::run_under_wine;
 
 const WIN_TARGET: &str = "x86_64-pc-windows-gnu";
@@ -114,7 +114,15 @@ fn wine_smoke() -> Result<()> {
     let root = repo_root();
 
     let mut build = cargo();
-    build.args(["build", "--target", WIN_TARGET, "-p", "hello-dll", "-p", "dll-smoke"]);
+    build.args([
+        "build",
+        "--target",
+        WIN_TARGET,
+        "-p",
+        "hello-dll",
+        "-p",
+        "dll-smoke",
+    ]);
     run("cargo build hello-dll + dll-smoke", &mut build)?;
 
     setup()?;
@@ -141,7 +149,10 @@ fn wine_smoke() -> Result<()> {
         .context("running dll-smoke.exe under Wine")?;
 
     let stdout = out.stdout.trim();
-    println!("wine-smoke: dll-smoke.exe stdout={stdout:?} exit={}", out.status);
+    println!(
+        "wine-smoke: dll-smoke.exe stdout={stdout:?} exit={}",
+        out.status
+    );
 
     if out.ok_with("5") {
         println!("wine-smoke: PASS");
@@ -159,8 +170,15 @@ fn inject_test() -> Result<()> {
 
     let mut build = cargo();
     build.args([
-        "build", "--target", WIN_TARGET, "-p", "decant-interpose", "-p", "sample-tool",
-        "-p", "decant-launcher",
+        "build",
+        "--target",
+        WIN_TARGET,
+        "-p",
+        "decant-interpose",
+        "-p",
+        "sample-tool",
+        "-p",
+        "decant-launcher",
     ]);
     run("cargo build carafe + sample-tool + launcher", &mut build)?;
 
@@ -170,7 +188,11 @@ fn inject_test() -> Result<()> {
     let stage = root.join("target").join("inject-test-stage");
     std::fs::create_dir_all(&stage)
         .with_context(|| format!("creating staging dir {}", stage.display()))?;
-    for name in ["decant_interpose.dll", "sample-tool.exe", "decant-launcher.exe"] {
+    for name in [
+        "decant_interpose.dll",
+        "sample-tool.exe",
+        "decant-launcher.exe",
+    ] {
         let src = out_dir.join(name);
         if !src.exists() {
             bail!("expected build artifact missing: {}", src.display());
@@ -185,27 +207,44 @@ fn inject_test() -> Result<()> {
 
     let r1 = run_under_wine(&mock, &["--cooperative", "--inject-test"], &prefix, &[])
         .context("running cooperative bootstrap")?;
-    println!("inject-test cooperative bootstrap: stdout={:?}", r1.stdout.trim());
+    println!(
+        "inject-test cooperative bootstrap: stdout={:?}",
+        r1.stdout.trim()
+    );
     if !r1.ok_with("INTERCEPTED") {
         eprintln!("stderr:\n{}", r1.stderr);
         bail!("cooperative bootstrap FAIL: expected INTERCEPTED");
     }
 
-    let base = run_under_wine(&mock, &["--inject-test"], &prefix, &[]).context("running baseline")?;
-    println!("inject-test baseline (no inject): stdout={:?}", base.stdout.trim());
+    let base =
+        run_under_wine(&mock, &["--inject-test"], &prefix, &[]).context("running baseline")?;
+    println!(
+        "inject-test baseline (no inject): stdout={:?}",
+        base.stdout.trim()
+    );
     if !base.ok_with("passthrough") {
         bail!("baseline FAIL: expected passthrough (the test cannot discriminate!)");
     }
 
-    let r2 = run_under_wine(&launcher, &["sample-tool.exe", "--inject-test"], &prefix, &autohook)
-        .context("running launcher injection")?;
-    println!("inject-test launcher injection: stdout={:?}", r2.stdout.trim());
+    let r2 = run_under_wine(
+        &launcher,
+        &["sample-tool.exe", "--inject-test"],
+        &prefix,
+        &autohook,
+    )
+    .context("running launcher injection")?;
+    println!(
+        "inject-test launcher injection: stdout={:?}",
+        r2.stdout.trim()
+    );
     if !r2.ok_with("INTERCEPTED") {
         eprintln!("stderr:\n{}", r2.stderr);
         bail!("launcher injection FAIL: expected INTERCEPTED on the unmodified tool");
     }
 
-    println!("inject-test: PASS (cooperative bootstrap + launcher injection both INTERCEPTED; baseline passthrough)");
+    println!(
+        "inject-test: PASS (cooperative bootstrap + launcher injection both INTERCEPTED; baseline passthrough)"
+    );
     Ok(())
 }
 
@@ -214,7 +253,11 @@ fn build_and_stage(root: &Path, stage_name: &str) -> Result<PathBuf> {
     let stage = root.join("target").join(stage_name);
     std::fs::create_dir_all(&stage)
         .with_context(|| format!("creating staging dir {}", stage.display()))?;
-    for name in ["decant_interpose.dll", "sample-tool.exe", "decant-launcher.exe"] {
+    for name in [
+        "decant_interpose.dll",
+        "sample-tool.exe",
+        "decant-launcher.exe",
+    ] {
         let src = out_dir.join(name);
         if !src.exists() {
             bail!("expected build artifact missing: {}", src.display());
@@ -242,7 +285,9 @@ fn spawn_mock_daemon(root: &Path) -> Result<(std::process::Child, String)> {
         .ok_or_else(|| anyhow!("daemon stdout not captured"))?;
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
-    reader.read_line(&mut line).context("reading daemon listening line")?;
+    reader
+        .read_line(&mut line)
+        .context("reading daemon listening line")?;
     let endpoint = line
         .split("listening on ")
         .nth(1)
@@ -257,7 +302,14 @@ fn e2e() -> Result<()> {
 
     let mut wbuild = cargo();
     wbuild.args([
-        "build", "--target", WIN_TARGET, "-p", "decant-interpose", "-p", "sample-tool", "-p",
+        "build",
+        "--target",
+        WIN_TARGET,
+        "-p",
+        "decant-interpose",
+        "-p",
+        "sample-tool",
+        "-p",
         "decant-launcher",
     ]);
     run("cargo build carafe + sample-tool + launcher", &mut wbuild)?;
@@ -307,7 +359,10 @@ fn e2e() -> Result<()> {
     }
 
     let diag = diag?;
-    println!("e2e: daemon reports unsupported_ops={}", diag.unsupported_ops);
+    println!(
+        "e2e: daemon reports unsupported_ops={}",
+        diag.unsupported_ops
+    );
     if diag.unsupported_ops < 1 {
         bail!("e2e: FAIL (expected unsupported_ops >= 1 after the refused VirtualAllocEx)");
     }
@@ -321,11 +376,21 @@ fn dynamic() -> Result<()> {
 
     let mut wbuild = cargo();
     wbuild.args([
-        "build", "--target", WIN_TARGET, "-p", "decant-interpose", "-p", "sample-tool", "-p",
+        "build",
+        "--target",
+        WIN_TARGET,
+        "-p",
+        "decant-interpose",
+        "-p",
+        "sample-tool",
+        "-p",
         "decant-launcher",
     ]);
     run("cargo build carafe + sample-tool + launcher", &mut wbuild)?;
-    run("cargo build daemon", cargo().args(["build", "-p", "decant-daemon"]))?;
+    run(
+        "cargo build daemon",
+        cargo().args(["build", "-p", "decant-daemon"]),
+    )?;
 
     setup()?;
 
@@ -354,7 +419,10 @@ fn dynamic() -> Result<()> {
         eprintln!("sample-tool stderr\n{}", out.stderr.trim());
     }
     if out.status != 0 || !out.stdout.contains("sample-tool dynamic: ALL PASS") {
-        bail!("dynamic: FAIL (exit={}, missing 'sample-tool dynamic: ALL PASS')", out.status);
+        bail!(
+            "dynamic: FAIL (exit={}, missing 'sample-tool dynamic: ALL PASS')",
+            out.status
+        );
     }
     println!("dynamic: PASS");
     Ok(())

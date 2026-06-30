@@ -34,13 +34,10 @@ impl Pattern {
     }
 
     fn matches_at_start(&self, hay: &[u8]) -> bool {
-        self.bytes
-            .iter()
-            .zip(hay)
-            .all(|(p, &h)| match p {
-                Some(b) => *b == h,
-                None => true,
-            })
+        self.bytes.iter().zip(hay).all(|(p, &h)| match p {
+            Some(b) => *b == h,
+            None => true,
+        })
     }
 
     pub fn find_all(&self, hay: &[u8]) -> Vec<usize> {
@@ -54,7 +51,9 @@ impl Pattern {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Pattern {
-        Pattern { bytes: bytes.iter().map(|b| Some(*b)).collect() }
+        Pattern {
+            bytes: bytes.iter().map(|b| Some(*b)).collect(),
+        }
     }
 }
 
@@ -66,7 +65,10 @@ mod tests {
     fn parses_hex_and_wildcards() {
         let p = Pattern::parse("DE CA ?? 00 4d").unwrap();
         assert_eq!(p.len(), 5);
-        assert_eq!(p.bytes, vec![Some(0xDE), Some(0xCA), None, Some(0x00), Some(0x4D)]);
+        assert_eq!(
+            p.bytes,
+            vec![Some(0xDE), Some(0xCA), None, Some(0x00), Some(0x4D)]
+        );
     }
 
     #[test]
@@ -89,12 +91,25 @@ mod tests {
         assert_eq!(Pattern::parse("AA BB").unwrap().find_all(&hay), vec![0, 2]);
         assert_eq!(Pattern::parse("AA ??").unwrap().find_all(&hay), vec![0, 2]);
         let hh = [0x5A, 0x5A, 0x5A, 0x5A];
-        assert_eq!(Pattern::parse("5A 5A").unwrap().find_all(&hh), vec![0, 1, 2]);
+        assert_eq!(
+            Pattern::parse("5A 5A").unwrap().find_all(&hh),
+            vec![0, 1, 2]
+        );
     }
 
     #[test]
     fn no_match_and_too_short() {
-        assert!(Pattern::parse("AA BB").unwrap().find_all(&[0xAA]).is_empty());
-        assert!(Pattern::parse("FF").unwrap().find_all(&[0x00, 0x01]).is_empty());
+        assert!(
+            Pattern::parse("AA BB")
+                .unwrap()
+                .find_all(&[0xAA])
+                .is_empty()
+        );
+        assert!(
+            Pattern::parse("FF")
+                .unwrap()
+                .find_all(&[0x00, 0x01])
+                .is_empty()
+        );
     }
 }

@@ -1,12 +1,7 @@
-use crate::{read_u64, Result};
+use crate::{Result, read_u64};
 use decant_backend::{MemoryBackend, Pid};
 
-pub fn resolve(
-    backend: &dyn MemoryBackend,
-    pid: Pid,
-    base: u64,
-    offsets: &[u64],
-) -> Result<u64> {
+pub fn resolve(backend: &dyn MemoryBackend, pid: Pid, base: u64, offsets: &[u64]) -> Result<u64> {
     let mut address = base;
     for &off in offsets {
         // wrapping_add so a garbage pointer + offset cannot panic on overflow
@@ -19,8 +14,8 @@ pub fn resolve(
 mod tests {
     use super::*;
     use decant_backend::fixtures::{
-        demo_backend, DEMO_CHAIN_HEAD, DEMO_CHAIN_NODE, DEMO_CHAIN_OFFSET, DEMO_CHAIN_VALUE,
-        DEMO_TARGET_PID,
+        DEMO_CHAIN_HEAD, DEMO_CHAIN_NODE, DEMO_CHAIN_OFFSET, DEMO_CHAIN_VALUE, DEMO_TARGET_PID,
+        demo_backend,
     };
     use decant_backend::{MockBackend, MockGuest, Pid};
 
@@ -30,7 +25,10 @@ mod tests {
         let addr = resolve(&b, DEMO_TARGET_PID, DEMO_CHAIN_HEAD, &[DEMO_CHAIN_OFFSET]).unwrap();
         assert_eq!(addr, DEMO_CHAIN_NODE + DEMO_CHAIN_OFFSET);
         let value = b.read(DEMO_TARGET_PID, addr, 4).unwrap();
-        assert_eq!(u32::from_le_bytes(value.try_into().unwrap()), DEMO_CHAIN_VALUE);
+        assert_eq!(
+            u32::from_le_bytes(value.try_into().unwrap()),
+            DEMO_CHAIN_VALUE
+        );
     }
 
     #[test]

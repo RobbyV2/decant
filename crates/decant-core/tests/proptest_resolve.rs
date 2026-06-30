@@ -1,5 +1,5 @@
-use decant_core::resolve;
 use decant_backend::{MockBackend, MockGuest, Pid};
+use decant_core::resolve;
 use proptest::prelude::*;
 
 fn arb_chain() -> impl Strategy<Value = (usize, Vec<u64>)> {

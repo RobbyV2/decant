@@ -141,9 +141,18 @@ fn module_lookup_is_case_insensitive() {
         .build();
     let b = MockBackend::new(g);
 
-    assert_eq!(b.module_by_name(Pid(2), "ntdll.dll").unwrap().base, 0x1400000000);
-    assert_eq!(b.module_by_name(Pid(2), "NTDLL.DLL").unwrap().base, 0x1400000000);
-    assert_eq!(b.module_by_name(Pid(2), "nTdLl.DlL").unwrap().base, 0x1400000000);
+    assert_eq!(
+        b.module_by_name(Pid(2), "ntdll.dll").unwrap().base,
+        0x1400000000
+    );
+    assert_eq!(
+        b.module_by_name(Pid(2), "NTDLL.DLL").unwrap().base,
+        0x1400000000
+    );
+    assert_eq!(
+        b.module_by_name(Pid(2), "nTdLl.DlL").unwrap().base,
+        0x1400000000
+    );
 }
 
 #[test]

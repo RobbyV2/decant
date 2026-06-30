@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use decant_client::Client;
 use decant_protocol::{Pid, Request, Response};
@@ -21,14 +21,36 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Cmd {
     Processes,
-    Modules { pid: u32 },
-    Exports { pid: u32, module: String },
-    Read { pid: u32, addr: String, len: String },
-    Write { pid: u32, addr: String, hexbytes: String },
-    MemoryMap { pid: u32 },
+    Modules {
+        pid: u32,
+    },
+    Exports {
+        pid: u32,
+        module: String,
+    },
+    Read {
+        pid: u32,
+        addr: String,
+        len: String,
+    },
+    Write {
+        pid: u32,
+        addr: String,
+        hexbytes: String,
+    },
+    MemoryMap {
+        pid: u32,
+    },
     Diagnostics,
-    Scan { pid: u32, pattern: String },
-    Resolve { pid: u32, base: String, offsets: Vec<String> },
+    Scan {
+        pid: u32,
+        pattern: String,
+    },
+    Resolve {
+        pid: u32,
+        base: String,
+        offsets: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -52,16 +74,40 @@ fn run() -> Result<()> {
         Cmd::Read { pid, addr, len } => {
             let addr = parse_u64(&addr).context("parsing ADDR")?;
             let len = parse_u64(&len).context("parsing LEN")?;
-            (Request::Read { pid: Pid(pid), addr, len }, Some(addr))
+            (
+                Request::Read {
+                    pid: Pid(pid),
+                    addr,
+                    len,
+                },
+                Some(addr),
+            )
         }
-        Cmd::Write { pid, addr, hexbytes } => {
+        Cmd::Write {
+            pid,
+            addr,
+            hexbytes,
+        } => {
             let addr = parse_u64(&addr).context("parsing ADDR")?;
             let data = parse_hex(&hexbytes).context("parsing hex bytes")?;
-            (Request::Write { pid: Pid(pid), addr, data }, None)
+            (
+                Request::Write {
+                    pid: Pid(pid),
+                    addr,
+                    data,
+                },
+                None,
+            )
         }
         Cmd::MemoryMap { pid } => (Request::MemoryMap(Pid(pid)), None),
         Cmd::Diagnostics => (Request::Diagnostics, None),
-        Cmd::Scan { pid, pattern } => (Request::Scan { pid: Pid(pid), pattern }, None),
+        Cmd::Scan { pid, pattern } => (
+            Request::Scan {
+                pid: Pid(pid),
+                pattern,
+            },
+            None,
+        ),
         Cmd::Resolve { pid, base, offsets } => {
             let base = parse_u64(&base).context("parsing BASE")?;
             let offsets = offsets
@@ -69,7 +115,14 @@ fn run() -> Result<()> {
                 .map(|o| parse_u64(o))
                 .collect::<Result<Vec<_>>>()
                 .context("parsing offsets")?;
-            (Request::Resolve { pid: Pid(pid), base, offsets }, None)
+            (
+                Request::Resolve {
+                    pid: Pid(pid),
+                    base,
+                    offsets,
+                },
+                None,
+            )
         }
     };
 
@@ -109,7 +162,12 @@ fn emit(resp: Response, json: bool, read_base: Option<u64>) -> Result<()> {
                 ]
                 .iter()
                 .collect();
-                println!("{:#018x}-{:#018x}  {perms}  ({} bytes)", r.base, r.base + r.size, r.size);
+                println!(
+                    "{:#018x}-{:#018x}  {perms}  ({} bytes)",
+                    r.base,
+                    r.base + r.size,
+                    r.size
+                );
             }
         }
         Response::Diagnostics(d) => {
@@ -180,7 +238,13 @@ fn hexdump(base: u64, bytes: &[u8]) {
         }
         let ascii: String = chunk
             .iter()
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         println!("{off:#018x}  {hex:<49} |{ascii}|");
     }
@@ -199,7 +263,10 @@ mod tests {
     #[test]
     fn parse_hex_variants() {
         assert_eq!(parse_hex("deadbeef").unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
-        assert_eq!(parse_hex("de ad be ef").unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            parse_hex("de ad be ef").unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
         assert_eq!(parse_hex("0xDEAD").unwrap(), vec![0xde, 0xad]);
         assert!(parse_hex("abc").is_err());
     }

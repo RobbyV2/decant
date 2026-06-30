@@ -42,17 +42,29 @@ mod tests {
     fn demo_guest_is_internally_consistent() {
         let b = demo_backend();
         assert_eq!(b.list_processes().unwrap().len(), 2);
-        assert_eq!(b.process_by_name("decant-target.exe").unwrap().pid, DEMO_TARGET_PID);
+        assert_eq!(
+            b.process_by_name("decant-target.exe").unwrap().pid,
+            DEMO_TARGET_PID
+        );
 
-        assert_eq!(b.read(DEMO_TARGET_PID, DEMO_MAGIC_ADDR, 16).unwrap(), DEMO_MAGIC);
+        assert_eq!(
+            b.read(DEMO_TARGET_PID, DEMO_MAGIC_ADDR, 16).unwrap(),
+            DEMO_MAGIC
+        );
 
         let head = b.read(DEMO_TARGET_PID, DEMO_CHAIN_HEAD, 8).unwrap();
         let node = u64::from_le_bytes(head.try_into().unwrap());
         assert_eq!(node, DEMO_CHAIN_NODE);
-        let term = b.read(DEMO_TARGET_PID, node + DEMO_CHAIN_OFFSET, 4).unwrap();
-        assert_eq!(u32::from_le_bytes(term.try_into().unwrap()), DEMO_CHAIN_VALUE);
+        let term = b
+            .read(DEMO_TARGET_PID, node + DEMO_CHAIN_OFFSET, 4)
+            .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(term.try_into().unwrap()),
+            DEMO_CHAIN_VALUE
+        );
 
-        b.write(DEMO_TARGET_PID, DEMO_SLOT_ADDR, &[9, 8, 7, 6, 5, 4, 3, 2]).unwrap();
+        b.write(DEMO_TARGET_PID, DEMO_SLOT_ADDR, &[9, 8, 7, 6, 5, 4, 3, 2])
+            .unwrap();
         assert_eq!(
             b.read(DEMO_TARGET_PID, DEMO_SLOT_ADDR, 8).unwrap(),
             vec![9, 8, 7, 6, 5, 4, 3, 2]

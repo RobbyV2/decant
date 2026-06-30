@@ -51,7 +51,9 @@ pub struct MockGuest {
 
 impl MockGuest {
     pub fn builder() -> GuestBuilder {
-        GuestBuilder { processes: Vec::new() }
+        GuestBuilder {
+            processes: Vec::new(),
+        }
     }
 }
 
@@ -64,7 +66,10 @@ impl GuestBuilder {
         ProcessBuilder {
             parent: self,
             proc: Process {
-                info: ProcessInfo { pid, name: name.to_string() },
+                info: ProcessInfo {
+                    pid,
+                    name: name.to_string(),
+                },
                 modules: Vec::new(),
                 exports: BTreeMap::new(),
                 regions: Vec::new(),
@@ -75,7 +80,9 @@ impl GuestBuilder {
     }
 
     pub fn build(self) -> MockGuest {
-        MockGuest { inner: Arc::new(RwLock::new(self.processes)) }
+        MockGuest {
+            inner: Arc::new(RwLock::new(self.processes)),
+        }
     }
 }
 
@@ -95,7 +102,11 @@ pub struct ProcessBuilder {
 
 impl ProcessBuilder {
     pub fn module(mut self, name: &str, base: u64, size: u64) -> Self {
-        self.proc.modules.push(ModuleInfo { name: name.to_string(), base, size });
+        self.proc.modules.push(ModuleInfo {
+            name: name.to_string(),
+            base,
+            size,
+        });
         self
     }
 
@@ -196,7 +207,10 @@ fn idx_by_pid(procs: &[Process], pid: Pid) -> Result<usize> {
     procs
         .iter()
         .position(|p| p.info.pid == pid)
-        .ok_or(BackendError::NoSuchProcess { pid: Some(pid.0), name: None })
+        .ok_or(BackendError::NoSuchProcess {
+            pid: Some(pid.0),
+            name: None,
+        })
 }
 
 impl MemoryBackend for MockBackend {
@@ -215,7 +229,10 @@ impl MemoryBackend for MockBackend {
         g.iter()
             .find(|p| p.info.name.eq_ignore_ascii_case(name))
             .map(|p| p.info.clone())
-            .ok_or_else(|| BackendError::NoSuchProcess { pid: None, name: Some(name.to_string()) })
+            .ok_or_else(|| BackendError::NoSuchProcess {
+                pid: None,
+                name: Some(name.to_string()),
+            })
     }
 
     fn module_list(&self, pid: Pid) -> Result<Vec<ModuleInfo>> {
@@ -230,16 +247,29 @@ impl MemoryBackend for MockBackend {
             .iter()
             .find(|m| m.name.eq_ignore_ascii_case(name))
             .cloned()
-            .ok_or_else(|| BackendError::NoSuchModule { pid: pid.0, module: name.to_string() })
+            .ok_or_else(|| BackendError::NoSuchModule {
+                pid: pid.0,
+                module: name.to_string(),
+            })
     }
 
     fn module_exports(&self, pid: Pid, module: &str) -> Result<Vec<(String, u64)>> {
         let g = self.guest.inner.read().unwrap();
         let p = &g[idx_by_pid(&g, pid)?];
-        if !p.modules.iter().any(|m| m.name.eq_ignore_ascii_case(module)) {
-            return Err(BackendError::NoSuchModule { pid: pid.0, module: module.to_string() });
+        if !p
+            .modules
+            .iter()
+            .any(|m| m.name.eq_ignore_ascii_case(module))
+        {
+            return Err(BackendError::NoSuchModule {
+                pid: pid.0,
+                module: module.to_string(),
+            });
         }
-        Ok(p.exports.get(&module.to_ascii_lowercase()).cloned().unwrap_or_default())
+        Ok(p.exports
+            .get(&module.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn read(&self, pid: Pid, addr: u64, len: usize) -> Result<Vec<u8>> {
@@ -255,7 +285,7 @@ impl MemoryBackend for MockBackend {
                         addr,
                         len: len as u64,
                         reason: format!("address {a:#x} is not in a readable region"),
-                    })
+                    });
                 }
             }
         }
@@ -273,7 +303,7 @@ impl MemoryBackend for MockBackend {
                     return Err(BackendError::WriteFailed {
                         addr,
                         reason: format!("address {a:#x} is not in a writable region"),
-                    })
+                    });
                 }
             }
         }
@@ -285,7 +315,11 @@ impl MemoryBackend for MockBackend {
 
     fn memory_map(&self, pid: Pid) -> Result<Vec<MemRegion>> {
         let g = self.guest.inner.read().unwrap();
-        Ok(g[idx_by_pid(&g, pid)?].regions.iter().map(Region::to_mem_region).collect())
+        Ok(g[idx_by_pid(&g, pid)?]
+            .regions
+            .iter()
+            .map(Region::to_mem_region)
+            .collect())
     }
 }
 
@@ -335,7 +369,9 @@ mod tests {
     #[test]
     fn writes_round_trip() {
         let b = MockBackend::new(guest());
-        let n = b.write(Pid(1234), 0x1400010400, &[0xAA, 0xBB, 0xCC, 0xDD]).unwrap();
+        let n = b
+            .write(Pid(1234), 0x1400010400, &[0xAA, 0xBB, 0xCC, 0xDD])
+            .unwrap();
         assert_eq!(n, 4);
         let got = b.read(Pid(1234), 0x1400010400, 4).unwrap();
         assert_eq!(got, vec![0xAA, 0xBB, 0xCC, 0xDD]);

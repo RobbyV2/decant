@@ -18,8 +18,14 @@ const fn make_handle(index: usize) -> usize {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
     Process(Pid),
-    ProcessSnapshot { items: Vec<ProcessInfo>, cursor: usize },
-    ModuleSnapshot { items: Vec<ModuleInfo>, cursor: usize },
+    ProcessSnapshot {
+        items: Vec<ProcessInfo>,
+        cursor: usize,
+    },
+    ModuleSnapshot {
+        items: Vec<ModuleInfo>,
+        cursor: usize,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -30,7 +36,10 @@ pub struct HandleTable {
 
 impl HandleTable {
     pub fn new() -> Self {
-        HandleTable { next_index: 1, map: HashMap::new() }
+        HandleTable {
+            next_index: 1,
+            map: HashMap::new(),
+        }
     }
 
     fn alloc(&mut self, entry: Entry) -> usize {
@@ -115,15 +124,24 @@ fn table() -> &'static Mutex<HandleTable> {
 }
 
 pub fn open_process(pid: Pid) -> usize {
-    table().lock().map(|mut t| t.alloc_process(pid)).unwrap_or(0)
+    table()
+        .lock()
+        .map(|mut t| t.alloc_process(pid))
+        .unwrap_or(0)
 }
 
 pub fn new_process_snapshot(items: Vec<ProcessInfo>) -> usize {
-    table().lock().map(|mut t| t.alloc_process_snapshot(items)).unwrap_or(0)
+    table()
+        .lock()
+        .map(|mut t| t.alloc_process_snapshot(items))
+        .unwrap_or(0)
 }
 
 pub fn new_module_snapshot(items: Vec<ModuleInfo>) -> usize {
-    table().lock().map(|mut t| t.alloc_module_snapshot(items)).unwrap_or(0)
+    table()
+        .lock()
+        .map(|mut t| t.alloc_module_snapshot(items))
+        .unwrap_or(0)
 }
 
 pub fn pid_for(h: usize) -> Option<Pid> {
@@ -135,11 +153,17 @@ pub fn free(h: usize) -> bool {
 }
 
 pub fn snapshot_next_process(h: usize, reset: bool) -> Option<ProcessInfo> {
-    table().lock().ok().and_then(|mut t| t.snapshot_next_process(h, reset))
+    table()
+        .lock()
+        .ok()
+        .and_then(|mut t| t.snapshot_next_process(h, reset))
 }
 
 pub fn snapshot_next_module(h: usize, reset: bool) -> Option<ModuleInfo> {
-    table().lock().ok().and_then(|mut t| t.snapshot_next_module(h, reset))
+    table()
+        .lock()
+        .ok()
+        .and_then(|mut t| t.snapshot_next_module(h, reset))
 }
 
 #[cfg(test)]
@@ -161,7 +185,10 @@ mod tests {
     #[test]
     fn synthetic_handles_never_collide_with_real_ones() {
         for &real in PLAUSIBLE_REAL {
-            assert!(!is_synthetic(real), "real handle {real:#x} misclassified as synthetic");
+            assert!(
+                !is_synthetic(real),
+                "real handle {real:#x} misclassified as synthetic"
+            );
         }
         let mut t = HandleTable::new();
         let mut minted = Vec::new();
@@ -171,7 +198,10 @@ mod tests {
         minted.push(t.alloc_process_snapshot(vec![]));
         minted.push(t.alloc_module_snapshot(vec![]));
         for &h in &minted {
-            assert!(is_synthetic(h), "minted handle {h:#x} not recognized as synthetic");
+            assert!(
+                is_synthetic(h),
+                "minted handle {h:#x} not recognized as synthetic"
+            );
             assert!(!PLAUSIBLE_REAL.contains(&h));
         }
     }
@@ -193,7 +223,11 @@ mod tests {
         let p = t.alloc_process(Pid(1234));
         let snap = t.alloc_process_snapshot(vec![]);
         assert_eq!(t.pid_for(p), Some(Pid(1234)));
-        assert_eq!(t.pid_for(snap), None, "a snapshot handle is not a process handle");
+        assert_eq!(
+            t.pid_for(snap),
+            None,
+            "a snapshot handle is not a process handle"
+        );
         assert_eq!(t.pid_for(0x4), None, "a real handle has no pid");
     }
 
@@ -209,7 +243,10 @@ mod tests {
     #[test]
     fn free_of_unknown_handle_is_false() {
         let mut t = HandleTable::new();
-        assert!(!t.free(make_handle(999)), "freeing a never-issued synthetic handle is false");
+        assert!(
+            !t.free(make_handle(999)),
+            "freeing a never-issued synthetic handle is false"
+        );
         assert!(!t.free(0x4), "freeing a real handle via the table is false");
     }
 
@@ -226,8 +263,14 @@ mod tests {
     fn process_snapshot_iterates_with_first_then_next() {
         let mut t = HandleTable::new();
         let items = vec![
-            ProcessInfo { pid: Pid(1234), name: "decant-target.exe".into() },
-            ProcessInfo { pid: Pid(4), name: "explorer.exe".into() },
+            ProcessInfo {
+                pid: Pid(1234),
+                name: "decant-target.exe".into(),
+            },
+            ProcessInfo {
+                pid: Pid(4),
+                name: "explorer.exe".into(),
+            },
         ];
         let h = t.alloc_process_snapshot(items);
         let first = t.snapshot_next_process(h, true).unwrap();
@@ -235,15 +278,25 @@ mod tests {
         let second = t.snapshot_next_process(h, false).unwrap();
         assert_eq!(second.name, "explorer.exe");
         assert!(t.snapshot_next_process(h, false).is_none());
-        assert_eq!(t.snapshot_next_process(h, true).unwrap().name, "decant-target.exe");
+        assert_eq!(
+            t.snapshot_next_process(h, true).unwrap().name,
+            "decant-target.exe"
+        );
     }
 
     #[test]
     fn module_snapshot_iterates_and_rejects_wrong_kind() {
         let mut t = HandleTable::new();
-        let modules = vec![ModuleInfo { name: "decant-target.exe".into(), base: 0x1_4000_0000, size: 0x40000 }];
+        let modules = vec![ModuleInfo {
+            name: "decant-target.exe".into(),
+            base: 0x1_4000_0000,
+            size: 0x40000,
+        }];
         let h = t.alloc_module_snapshot(modules);
-        assert_eq!(t.snapshot_next_module(h, true).unwrap().name, "decant-target.exe");
+        assert_eq!(
+            t.snapshot_next_module(h, true).unwrap().name,
+            "decant-target.exe"
+        );
         assert!(t.snapshot_next_module(h, false).is_none());
         assert!(t.snapshot_next_process(h, true).is_none());
     }

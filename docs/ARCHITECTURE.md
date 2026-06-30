@@ -98,11 +98,22 @@ exposes it. Two consequences:
    `Diagnostics::unsupported_ops`, never a false success. Read, write, scan, and
    pointer-resolve are supported.
 
-On a synthetic handle, the execution exports
+The synthetic process handle services the full handle tail. `OpenProcess` mints it; then
+`ReadProcessMemory`/`WriteProcessMemory`, `CloseHandle`/`NtClose`, `DuplicateHandle`,
+`WaitForSingleObject`/`WaitForSingleObjectEx`/`NtWaitForSingleObject`,
+`GetHandleInformation`/`SetHandleInformation`, `GetProcessId`, `GetExitCodeProcess`,
+`GetPriorityClass`, `GetProcessTimes`, `IsWow64Process`, `QueryFullProcessImageName`,
+`GetProcessImageFileName`, the `NtQueryInformationProcess` basic/wow64/image classes, and
+`VirtualQueryEx`/`NtQueryVirtualMemory` all resolve against it.
+`NtQueryInformationProcess(ProcessBasicInformation)` returns the pid with a PEB base of 0:
+memflow's generic plugin ABI does not expose the PEB, so guest PEB-walking features are
+unavailable.
+
+On a synthetic handle, the execution and process-control exports
 (`VirtualAllocEx`/`VirtualFreeEx`, `NtAllocateVirtualMemory`/`NtFreeVirtualMemory`,
-`CreateRemoteThread`/`CreateRemoteThreadEx`, `NtCreateThreadEx`) return their documented
-failure sentinel (null or `STATUS_NOT_SUPPORTED`), report the refusal to the daemon, and
-write to the tool's stderr.
+`CreateRemoteThread`/`CreateRemoteThreadEx`, `NtCreateThreadEx`, `TerminateProcess`,
+`NtSuspendProcess`, `NtResumeProcess`) return their documented failure sentinel (null or
+`STATUS_NOT_SUPPORTED`), report the refusal to the daemon, and write to the tool's stderr.
 
 `SetWindowsHookEx` and `QueueUserAPC` are forwarded, not intercepted: neither carries a
 guest process handle (an event hook targets the local Wine session, an APC a thread
@@ -244,15 +255,18 @@ the host where the plugins are installed.
 
 Operational facts for running against a guest:
 
-- The connector takes the target as memflow's **default (unnamed) arg**: the QEMU process
-  PID passed *bare* (`DECANT_CONNECTOR_ARGS="<pid>"`). A `pid=` *named* arg fails
-  `Error(Connector, ArgValidation)` because `pid` is not a declared named arg.
+- Two connectors read the same guest. The `qemu` connector (default) reads the qemu
+  process directly through ptrace; it needs `CAP_SYS_PTRACE` on the daemon (or root), no
+  kernel module, and takes the VM name as its arg (`DECANT_CONNECTOR_ARGS=<name>`, or empty
+  to auto-detect a single VM). The `kvm` connector reads through the `memflow.ko` kernel
+  module for lower overhead; it needs root and takes the qemu process PID as its arg. Both
+  pass the arg as memflow's **default (unnamed) arg**; a `pid=` *named* arg fails
+  `Error(Connector, ArgValidation)`.
 - The plugin ABI is the integer `MEMFLOW_PLUGIN_VERSION` (`=1`), not the crate version, so
   a `memflow` 0.2.4 core loads 0.2.1 plugins.
 - `MEMFLOW_PLUGIN_PATH` must point at the directory holding the
-  `libmemflow_{kvm,qemu,win32}.so` plugins. KVM needs root (`/dev/memflow` is `root:root`);
-  the daemon resolves the backend before binding the socket, so a connector failure exits
-  with a message instead of a partial server.
+  `libmemflow_{qemu,kvm,win32}.so` plugins. The daemon resolves the backend before binding
+  the socket, so a connector failure exits with a message instead of a partial server.
 - Writes should target stable memory (zero padding); a hot heap slot can be reclaimed or
   rewritten by the guest between operations.
 
@@ -316,16 +330,22 @@ patched slots. The carafe widens the surface, still binding only to public expor
 - **Alternate paths.** `NtOpenProcess`, `NtGetNextProcess`, `Toolhelp32ReadProcessMemory`,
   and the `NtQueryInformationProcess` image classes are served the same way.
 
-`NtQueryInformationProcess(ProcessBasicInformation)` (the PEB) is excluded: its PEB base
-is not exposed through memflow's generic plugin ABI, and the module discovery a PEB walk
-would do is already served by the module hooks.
+`NtQueryInformationProcess(ProcessBasicInformation)` returns the requested
+`PROCESS_BASIC_INFORMATION` with the pid filled in and a PEB base of 0: memflow's generic
+plugin ABI does not expose the PEB, so a guest PEB walk is unavailable, and the module
+discovery it would do is already served by the module hooks.
 
 **Region walk.** A scanner queries `VirtualQueryEx`/`NtQueryVirtualMemory` upward from a
 low address. The hooks return committed regions from the daemon's memory map and span the
-gaps as `MEM_FREE`, so the walk advances past holes instead of stalling at address 0. The
-map is cached per pid for the walk to avoid a round trip per query. A scan then reads each
-region through the marshaled `ReadProcessMemory` in one request per caller read, passing
-the requested size through rather than paging slot by slot.
+gaps as `MEM_FREE`, so the walk advances past them instead of stalling at address 0. Each
+region reports `State`, `Type`, and `Protect` derived from the guest page tables and
+module list: a region overlapping a loaded module reports `MEM_IMAGE`, others
+`MEM_PRIVATE`. `MEM_MAPPED` is not distinguished, reserved uncommitted memory is not
+enumerated, and copy-on-write and guard sub-flags are not reported, so a default scan over
+all types is unaffected while a `Type`- or `Protect`-filtered scan may differ from native.
+The map is cached per pid for the walk to avoid a round trip per query. A scan then reads
+each region through the marshaled `ReadProcessMemory` in one request per caller read,
+passing the requested size through rather than paging slot by slot.
 
 **Alternatives that do not apply on Wine.** `AppInit_DLLs` does not load the DLL:
 `kernelbase!LoadAppInitDlls` is a no-op stub on Wine (its body is `test [dbg_flag],8` /

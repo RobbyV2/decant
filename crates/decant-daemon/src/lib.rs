@@ -1,10 +1,10 @@
 use std::io;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use decant_backend::MemoryBackend;
-use decant_protocol::{read_msg, write_msg, Diagnostics, ProtoError, Request, Response};
+use decant_protocol::{Diagnostics, ProtoError, Request, Response, read_msg, write_msg};
 
 #[derive(Debug)]
 pub struct Diag {
@@ -55,12 +55,8 @@ pub fn dispatch(req: Request, backend: &dyn MemoryBackend, diag: &Diag) -> Respo
     match req {
         Request::Ping => Response::Pong,
         Request::Diagnostics => Response::Diagnostics(diag.snapshot()),
-        Request::ListProcesses => {
-            finish(backend.list_processes(), Response::Processes, diag)
-        }
-        Request::ProcessByPid(pid) => {
-            finish(backend.process_by_pid(pid), Response::Process, diag)
-        }
+        Request::ListProcesses => finish(backend.list_processes(), Response::Processes, diag),
+        Request::ProcessByPid(pid) => finish(backend.process_by_pid(pid), Response::Process, diag),
         Request::ProcessByName(name) => {
             finish(backend.process_by_name(&name), Response::Process, diag)
         }
@@ -68,23 +64,30 @@ pub fn dispatch(req: Request, backend: &dyn MemoryBackend, diag: &Diag) -> Respo
         Request::ModuleByName(pid, name) => {
             finish(backend.module_by_name(pid, &name), Response::Module, diag)
         }
-        Request::ModuleExports(pid, module) => {
-            finish(backend.module_exports(pid, &module), Response::Exports, diag)
-        }
+        Request::ModuleExports(pid, module) => finish(
+            backend.module_exports(pid, &module),
+            Response::Exports,
+            diag,
+        ),
         Request::Read { pid, addr, len } => {
             diag.reads.fetch_add(1, Ordering::Relaxed);
             finish(backend.read(pid, addr, len as usize), Response::Data, diag)
         }
         Request::Write { pid, addr, data } => {
             diag.writes.fetch_add(1, Ordering::Relaxed);
-            finish(backend.write(pid, addr, &data), |n| Response::Written(n as u64), diag)
+            finish(
+                backend.write(pid, addr, &data),
+                |n| Response::Written(n as u64),
+                diag,
+            )
         }
         Request::MemoryMap(pid) => finish(backend.memory_map(pid), Response::MemoryMap, diag),
-        Request::Scan { pid, pattern } => match decant_core::scanner::scan_str(backend, pid, &pattern)
-        {
-            Ok(hits) => Response::ScanHits(hits),
-            Err(e) => Response::Err(core_err_to_proto(e)),
-        },
+        Request::Scan { pid, pattern } => {
+            match decant_core::scanner::scan_str(backend, pid, &pattern) {
+                Ok(hits) => Response::ScanHits(hits),
+                Err(e) => Response::Err(core_err_to_proto(e)),
+            }
+        }
         Request::Resolve { pid, base, offsets } => {
             match decant_core::resolve(backend, pid, base, &offsets) {
                 Ok(address) => {
@@ -152,7 +155,7 @@ pub fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use decant_backend::fixtures::{demo_backend, DEMO_MAGIC, DEMO_MAGIC_ADDR, DEMO_TARGET_PID};
+    use decant_backend::fixtures::{DEMO_MAGIC, DEMO_MAGIC_ADDR, DEMO_TARGET_PID, demo_backend};
     use decant_protocol::Pid;
 
     fn diag() -> Diag {
@@ -164,7 +167,11 @@ mod tests {
         let b = demo_backend();
         let d = diag();
         let resp = dispatch(
-            Request::Read { pid: DEMO_TARGET_PID, addr: DEMO_MAGIC_ADDR, len: 16 },
+            Request::Read {
+                pid: DEMO_TARGET_PID,
+                addr: DEMO_MAGIC_ADDR,
+                len: 16,
+            },
             &b,
             &d,
         );
@@ -180,13 +187,21 @@ mod tests {
         let b = demo_backend();
         let d = diag();
         let w = dispatch(
-            Request::Write { pid: DEMO_TARGET_PID, addr: 0x0001_4001_0400, data: vec![1, 2, 3, 4] },
+            Request::Write {
+                pid: DEMO_TARGET_PID,
+                addr: 0x0001_4001_0400,
+                data: vec![1, 2, 3, 4],
+            },
             &b,
             &d,
         );
         assert!(matches!(w, Response::Written(4)));
         let r = dispatch(
-            Request::Read { pid: DEMO_TARGET_PID, addr: 0x0001_4001_0400, len: 4 },
+            Request::Read {
+                pid: DEMO_TARGET_PID,
+                addr: 0x0001_4001_0400,
+                len: 4,
+            },
             &b,
             &d,
         );
@@ -199,6 +214,9 @@ mod tests {
         let b = demo_backend();
         let d = diag();
         let resp = dispatch(Request::ProcessByPid(Pid(9999)), &b, &d);
-        assert!(matches!(resp, Response::Err(ProtoError::NoSuchProcess { .. })));
+        assert!(matches!(
+            resp,
+            Response::Err(ProtoError::NoSuchProcess { .. })
+        ));
     }
 }

@@ -10,7 +10,10 @@ pub type Result<T> = std::result::Result<T, BackendError>;
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
     #[error("no such process (pid={pid:?}, name={name:?})")]
-    NoSuchProcess { pid: Option<u32>, name: Option<String> },
+    NoSuchProcess {
+        pid: Option<u32>,
+        name: Option<String>,
+    },
 
     #[error("no such module {module:?} in pid {pid}")]
     NoSuchModule { pid: u32, module: String },

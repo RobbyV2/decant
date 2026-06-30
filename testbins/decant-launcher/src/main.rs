@@ -107,9 +107,10 @@ fn main() -> ExitCode {
 
     let dll_path = std::env::var("DECANT_DLL").unwrap_or_else(|_| {
         match std::path::Path::new(&target).parent() {
-            Some(dir) if !dir.as_os_str().is_empty() => {
-                dir.join("decant_interpose.dll").to_string_lossy().into_owned()
-            }
+            Some(dir) if !dir.as_os_str().is_empty() => dir
+                .join("decant_interpose.dll")
+                .to_string_lossy()
+                .into_owned(),
             _ => "decant_interpose.dll".to_string(),
         }
     });
@@ -173,7 +174,10 @@ fn main() -> ExitCode {
             &mut written,
         ) == 0
         {
-            eprintln!("launcher: WriteProcessMemory failed (err={})", GetLastError());
+            eprintln!(
+                "launcher: WriteProcessMemory failed (err={})",
+                GetLastError()
+            );
             return ExitCode::from(4);
         }
 
@@ -194,7 +198,10 @@ fn main() -> ExitCode {
             std::ptr::null_mut(),
         );
         if thread.is_null() {
-            eprintln!("launcher: CreateRemoteThread failed (err={})", GetLastError());
+            eprintln!(
+                "launcher: CreateRemoteThread failed (err={})",
+                GetLastError()
+            );
             return ExitCode::from(6);
         }
         WaitForSingleObject(thread, INFINITE);

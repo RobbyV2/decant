@@ -25,9 +25,9 @@ mod platform {
         fn GetEnvironmentVariableA(name: *const u8, buf: *mut u8, size: u32) -> u32;
     }
 
-    pub unsafe fn install_hooks() -> u32 { unsafe {
-        crate::hooks::install_all()
-    }}
+    pub unsafe fn install_hooks() -> u32 {
+        unsafe { crate::hooks::install_all() }
+    }
 
     #[unsafe(no_mangle)]
     pub extern "system" fn decant_install_hooks() -> i32 {
@@ -35,7 +35,11 @@ mod platform {
     }
 
     #[unsafe(no_mangle)]
-    pub extern "system" fn DllMain(_hinst: *mut c_void, reason: u32, _reserved: *mut c_void) -> i32 {
+    pub extern "system" fn DllMain(
+        _hinst: *mut c_void,
+        reason: u32,
+        _reserved: *mut c_void,
+    ) -> i32 {
         if reason == DLL_PROCESS_ATTACH && autohook_enabled() {
             unsafe {
                 let _ = install_hooks();
@@ -47,7 +51,11 @@ mod platform {
     fn autohook_enabled() -> bool {
         let mut buf = [0u8; 8];
         let n = unsafe {
-            GetEnvironmentVariableA(b"DECANT_AUTOHOOK\0".as_ptr(), buf.as_mut_ptr(), buf.len() as u32)
+            GetEnvironmentVariableA(
+                b"DECANT_AUTOHOOK\0".as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+            )
         };
         n >= 1 && buf[0] == b'1'
     }

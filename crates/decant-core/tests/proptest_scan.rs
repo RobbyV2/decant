@@ -1,6 +1,6 @@
-use decant_core::scanner::{scan, scan_with_chunk};
-use decant_core::Pattern;
 use decant_backend::{MockBackend, MockGuest, Pid};
+use decant_core::Pattern;
+use decant_core::scanner::{scan, scan_with_chunk};
 use proptest::prelude::*;
 
 const PAGE: usize = 0x1000;
@@ -19,12 +19,10 @@ fn naive_find(hay: &[u8], pat: &[Option<u8>]) -> Vec<usize> {
     }
     (0..=hay.len() - plen)
         .filter(|&i| {
-            pat.iter()
-                .zip(&hay[i..i + plen])
-                .all(|(p, &h)| match p {
-                    Some(b) => *b == h,
-                    None => true,
-                })
+            pat.iter().zip(&hay[i..i + plen]).all(|(p, &h)| match p {
+                Some(b) => *b == h,
+                None => true,
+            })
         })
         .collect()
 }
@@ -56,7 +54,13 @@ fn arb_data_and_pattern() -> impl Strategy<Value = (Vec<u8>, Vec<Option<u8>>)> {
         })
         .prop_map(|(data, plen, start, wildcard)| {
             let pat = (0..plen)
-                .map(|i| if wildcard[i] { None } else { Some(data[start + i]) })
+                .map(|i| {
+                    if wildcard[i] {
+                        None
+                    } else {
+                        Some(data[start + i])
+                    }
+                })
                 .collect();
             (data, pat)
         })

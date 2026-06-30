@@ -151,7 +151,10 @@ fn run_target(pid_s: &str) -> ExitCode {
         Some(v) => v as u32,
         None => return ExitCode::from(20),
     };
-    let base = match std::env::var("DECANT_TARGET_BASE").ok().and_then(|s| parse_u64(&s)) {
+    let base = match std::env::var("DECANT_TARGET_BASE")
+        .ok()
+        .and_then(|s| parse_u64(&s))
+    {
         Some(v) => v,
         None => {
             eprintln!("set DECANT_TARGET_BASE to guest-target's struct base");
@@ -170,7 +173,11 @@ fn run_target(pid_s: &str) -> ExitCode {
 
     let mut magic = [0u8; 16];
     let magic_ok = rpm(proc, base, &mut magic) && magic == TARGET_MAGIC;
-    println!("read_magic: {} got={:02X?}", if magic_ok { "MATCH" } else { "mismatch" }, &magic);
+    println!(
+        "read_magic: {} got={:02X?}",
+        if magic_ok { "MATCH" } else { "mismatch" },
+        &magic
+    );
 
     let mut c1b = [0u8; 8];
     rpm(proc, counter_addr, &mut c1b);
@@ -178,7 +185,10 @@ fn run_target(pid_s: &str) -> ExitCode {
     let mut c2b = [0u8; 8];
     rpm(proc, counter_addr, &mut c2b);
     let (c1, c2) = (u64::from_le_bytes(c1b), u64::from_le_bytes(c2b));
-    println!("counter: {c1} -> {c2} (incrementing: {})", if c2 > c1 { "yes" } else { "no" });
+    println!(
+        "counter: {c1} -> {c2} (incrementing: {})",
+        if c2 > c1 { "yes" } else { "no" }
+    );
 
     let wrote = wpm(proc, slot_addr, &TARGET_SENTINEL.to_le_bytes());
     let mut sb = [0u8; 8];
@@ -206,7 +216,12 @@ fn run_checks() -> ExitCode {
 
     let proc = unsafe { OpenProcess(PROCESS_ALL_ACCESS, 0, DEMO_TARGET_PID) };
     let open_ok = !proc.is_null();
-    check(&mut all_pass, "open_process", open_ok, &format!("handle={proc:?}"));
+    check(
+        &mut all_pass,
+        "open_process",
+        open_ok,
+        &format!("handle={proc:?}"),
+    );
     if !open_ok {
         println!("sample-tool: ABORT (OpenProcess failed; is the daemon reachable?)");
         return ExitCode::from(10);
@@ -214,14 +229,24 @@ fn run_checks() -> ExitCode {
 
     let mut magic = [0u8; 16];
     let magic_ok = rpm(proc, DEMO_MAGIC_ADDR, &mut magic) && magic == DEMO_MAGIC;
-    check(&mut all_pass, "read_magic", magic_ok, &format!("got={:02X?}", &magic));
+    check(
+        &mut all_pass,
+        "read_magic",
+        magic_ok,
+        &format!("got={:02X?}", &magic),
+    );
 
     let payload: [u8; 8] = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
     let wrote = wpm(proc, DEMO_SLOT_ADDR, &payload);
     let mut readback = [0u8; 8];
     let read_back_ok = rpm(proc, DEMO_SLOT_ADDR, &mut readback);
     let write_ok = wrote && read_back_ok && readback == payload && readback != [0u8; 8];
-    check(&mut all_pass, "write_then_read", write_ok, &format!("readback={:02X?}", &readback));
+    check(
+        &mut all_pass,
+        "write_then_read",
+        write_ok,
+        &format!("readback={:02X?}", &readback),
+    );
 
     let mut head_bytes = [0u8; 8];
     let node = if rpm(proc, DEMO_CHAIN_HEAD, &mut head_bytes) {
@@ -249,7 +274,12 @@ fn run_checks() -> ExitCode {
     );
 
     let found_mod = enum_modules_find_target(proc);
-    check(&mut all_pass, "enum_modules", found_mod, &format!("looking for {DEMO_MODULE_NAME}"));
+    check(
+        &mut all_pass,
+        "enum_modules",
+        found_mod,
+        &format!("looking for {DEMO_MODULE_NAME}"),
+    );
 
     let sentinel: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
     let mut probe = [0u8; 8];
@@ -264,13 +294,29 @@ fn run_checks() -> ExitCode {
         )
     } != 0
         && probe == sentinel;
-    check(&mut all_pass, "real_handle_forward", real_ok, &format!("own-memory readback={:02X?}", &probe));
+    check(
+        &mut all_pass,
+        "real_handle_forward",
+        real_ok,
+        &format!("own-memory readback={:02X?}", &probe),
+    );
 
     let alloc = unsafe {
-        VirtualAllocEx(proc, std::ptr::null_mut(), 0x1000, MEM_COMMIT_RESERVE, PAGE_EXECUTE_READWRITE)
+        VirtualAllocEx(
+            proc,
+            std::ptr::null_mut(),
+            0x1000,
+            MEM_COMMIT_RESERVE,
+            PAGE_EXECUTE_READWRITE,
+        )
     };
     let alloc_refused = alloc.is_null();
-    check(&mut all_pass, "alloc_ex_refused", alloc_refused, &format!("VirtualAllocEx={alloc:?}"));
+    check(
+        &mut all_pass,
+        "alloc_ex_refused",
+        alloc_refused,
+        &format!("VirtualAllocEx={alloc:?}"),
+    );
 
     let mut mbi: MemoryBasicInformation = unsafe { std::mem::zeroed() };
     let n = unsafe {
@@ -281,11 +327,22 @@ fn run_checks() -> ExitCode {
             std::mem::size_of::<MemoryBasicInformation>(),
         )
     };
-    let query_ok = n == std::mem::size_of::<MemoryBasicInformation>() && mbi.protect != PAGE_NOACCESS;
-    check(&mut all_pass, "query_ex_region", query_ok, &format!("ret={n} protect={:#x}", mbi.protect));
+    let query_ok =
+        n == std::mem::size_of::<MemoryBasicInformation>() && mbi.protect != PAGE_NOACCESS;
+    check(
+        &mut all_pass,
+        "query_ex_region",
+        query_ok,
+        &format!("ret={n} protect={:#x}", mbi.protect),
+    );
 
     let close_ok = unsafe { CloseHandle(proc) } != 0;
-    check(&mut all_pass, "close_synthetic", close_ok, "CloseHandle(synthetic)==TRUE");
+    check(
+        &mut all_pass,
+        "close_synthetic",
+        close_ok,
+        "CloseHandle(synthetic)==TRUE",
+    );
 
     if all_pass {
         println!("sample-tool: ALL PASS");
@@ -380,8 +437,10 @@ fn run_interception_selftest() -> ExitCode {
 
 type NtQSI = unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32;
 type OpenProcFn = unsafe extern "system" fn(u32, i32, u32) -> Handle;
-type RpmFn = unsafe extern "system" fn(Handle, *const c_void, *mut c_void, usize, *mut usize) -> i32;
-type WpmFn = unsafe extern "system" fn(Handle, *mut c_void, *const c_void, usize, *mut usize) -> i32;
+type RpmFn =
+    unsafe extern "system" fn(Handle, *const c_void, *mut c_void, usize, *mut usize) -> i32;
+type WpmFn =
+    unsafe extern "system" fn(Handle, *mut c_void, *const c_void, usize, *mut usize) -> i32;
 
 const SYSTEM_PROCESS_INFORMATION: u32 = 5;
 
@@ -403,7 +462,12 @@ fn find_dynamic_pid() -> Option<u32> {
         }
         let nt_qsi: NtQSI = std::mem::transmute(p);
         let mut need: u32 = 0;
-        nt_qsi(SYSTEM_PROCESS_INFORMATION, std::ptr::null_mut(), 0, &mut need);
+        nt_qsi(
+            SYSTEM_PROCESS_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut need,
+        );
         if need == 0 {
             return None;
         }
@@ -444,7 +508,12 @@ fn run_dynamic() -> ExitCode {
 
     let pid = find_dynamic_pid();
     let enum_ok = pid == Some(DEMO_TARGET_PID);
-    check(&mut all_pass, "dynamic_enumerate", enum_ok, &format!("found pid {pid:?}"));
+    check(
+        &mut all_pass,
+        "dynamic_enumerate",
+        enum_ok,
+        &format!("found pid {pid:?}"),
+    );
     let pid = match pid {
         Some(p) => p,
         None => {
@@ -459,7 +528,12 @@ fn run_dynamic() -> ExitCode {
         let wpm: WpmFn = std::mem::transmute(resolve(b"kernel32.dll\0", b"WriteProcessMemory\0"));
 
         let proc = open(PROCESS_ALL_ACCESS, 0, pid);
-        check(&mut all_pass, "dynamic_open", !proc.is_null(), &format!("handle={proc:?}"));
+        check(
+            &mut all_pass,
+            "dynamic_open",
+            !proc.is_null(),
+            &format!("handle={proc:?}"),
+        );
 
         let mut magic = [0u8; 16];
         let mut n: usize = 0;
@@ -471,7 +545,12 @@ fn run_dynamic() -> ExitCode {
             &mut n,
         ) != 0
             && magic == DEMO_MAGIC;
-        check(&mut all_pass, "dynamic_read_magic", read_ok, &format!("got={:02X?}", &magic));
+        check(
+            &mut all_pass,
+            "dynamic_read_magic",
+            read_ok,
+            &format!("got={:02X?}", &magic),
+        );
 
         let payload: [u8; 8] = [0xAA, 0xBB, 0xCC, 0xDD, 0x01, 0x02, 0x03, 0x04];
         let mut nb: usize = 0;
@@ -491,7 +570,12 @@ fn run_dynamic() -> ExitCode {
             &mut n,
         ) != 0;
         let write_ok = wrote && read_back && back == payload;
-        check(&mut all_pass, "dynamic_write", write_ok, &format!("readback={:02X?}", &back));
+        check(
+            &mut all_pass,
+            "dynamic_write",
+            write_ok,
+            &format!("readback={:02X?}", &back),
+        );
 
         CloseHandle(proc);
     }

@@ -12,8 +12,13 @@ build:
 test:
     cargo test
 
+# format every crate, host and windows-target
 fmt:
     cargo fmt --all
+
+# verify formatting without writing (CI uses this)
+fmt-check:
+    cargo fmt --all --check
 
 clippy:
     cargo clippy --all-targets
