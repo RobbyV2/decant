@@ -88,6 +88,13 @@ unsafe extern "system" {
         mbi: *mut MemoryBasicInformation,
         length: usize,
     ) -> usize;
+    fn VirtualProtectEx(
+        process: Handle,
+        address: *mut c_void,
+        size: usize,
+        new_protect: u32,
+        old_protect: *mut u32,
+    ) -> i32;
 }
 
 #[link(name = "psapi")]
@@ -334,6 +341,41 @@ fn run_checks() -> ExitCode {
         "query_ex_region",
         query_ok,
         &format!("ret={n} protect={:#x}", mbi.protect),
+    );
+
+    let mut old_protect: u32 = 0;
+    let prot_ret = unsafe {
+        VirtualProtectEx(
+            proc,
+            DEMO_SLOT_ADDR as *mut c_void,
+            8,
+            PAGE_EXECUTE_READWRITE,
+            &mut old_protect,
+        )
+    };
+    let ce_payload: [u8; 8] = [0x5A, 0x5A, 0x5A, 0x5A, 0x10, 0x20, 0x30, 0x40];
+    let ce_wrote = wpm(proc, DEMO_SLOT_ADDR, &ce_payload);
+    if prot_ret != 0 {
+        let mut restored: u32 = 0;
+        unsafe {
+            VirtualProtectEx(
+                proc,
+                DEMO_SLOT_ADDR as *mut c_void,
+                8,
+                old_protect,
+                &mut restored,
+            )
+        };
+    }
+    let mut ce_back = [0u8; 8];
+    let ce_read = rpm(proc, DEMO_SLOT_ADDR, &mut ce_back);
+    let protect_ok =
+        prot_ret != 0 && old_protect != 0 && ce_wrote && ce_read && ce_back == ce_payload;
+    check(
+        &mut all_pass,
+        "protect_ex_write",
+        protect_ok,
+        &format!("old={old_protect:#x} readback={:02X?}", &ce_back),
     );
 
     let close_ok = unsafe { CloseHandle(proc) } != 0;
