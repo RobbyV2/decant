@@ -68,9 +68,9 @@ impl Client {
                 }
             }
         }
-        Err(ClientError::Io(last.unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "request failed")
-        })))
+        Err(ClientError::Io(
+            last.unwrap_or_else(|| std::io::Error::other("request failed")),
+        ))
     }
 
     pub fn ping(&mut self) -> Result<()> {
