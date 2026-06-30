@@ -347,6 +347,16 @@ The map is cached per pid for the walk to avoid a round trip per query. A scan t
 each region through the marshaled `ReadProcessMemory` in one request per caller read,
 passing the requested size through rather than paging slot by slot.
 
+**Protection changes.** A tool that edits a page it sees as read-only typically calls
+`VirtualProtectEx` (or `NtProtectVirtualMemory`) to grant write access, writes, then
+restores the prior protection. The carafe services both for a synthetic handle: it returns
+success and reports the page's current protection from the region map as the prior value,
+without changing anything. No change is needed because the write is marshaled to the daemon
+and applied by memflow to guest physical memory, which translates the address through the
+page tables and writes the underlying physical page directly; the guest's virtual page
+protection does not gate it. So a write to a read-only page lands whether or not the
+protection call succeeds. For a real handle both forward to the original export.
+
 **Alternatives that do not apply on Wine.** `AppInit_DLLs` does not load the DLL:
 `kernelbase!LoadAppInitDlls` is a no-op stub on Wine (its body is `test [dbg_flag],8` /
 `ret`), and nothing invokes it during process init. A `WINEDLLOVERRIDES` proxy must

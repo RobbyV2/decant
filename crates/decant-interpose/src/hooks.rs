@@ -69,6 +69,7 @@ macro_rules! interpose_exports {
             b"GetModuleFileNameExW" => get_module_file_name_ex_w,
             b"K32GetModuleFileNameExW" => get_module_file_name_ex_w,
             b"VirtualProtectEx" => virtual_protect_ex,
+            b"NtProtectVirtualMemory" => nt_protect_virtual_memory,
             b"VirtualQueryEx" => virtual_query_ex,
             b"VirtualAllocEx" => virtual_alloc_ex,
             b"VirtualFreeEx" => virtual_free_ex,
@@ -232,6 +233,11 @@ pub(crate) fn region_for(pid: Pid, addr: u64) -> Option<MemoryBasicInformation> 
         type_: 0,
         __align2: 0,
     })
+}
+
+fn synth_protect(handle: usize, addr: u64) -> Option<u32> {
+    let pid = handle_table::pid_for(handle)?;
+    region_for(pid, addr).map(|info| info.protect)
 }
 
 type RpmFn =
@@ -896,18 +902,57 @@ pub unsafe extern "system" fn get_module_file_name_ex_w(
     }
 }
 
+type VProtectExFn =
+    unsafe extern "system" fn(*mut c_void, *mut c_void, usize, u32, *mut u32) -> i32;
+type NtProtectFn =
+    unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut usize, u32, *mut u32) -> i32;
+
 pub unsafe extern "system" fn virtual_protect_ex(
-    _process: *mut c_void,
-    _address: *mut c_void,
-    _size: usize,
-    _new_protect: u32,
+    process: *mut c_void,
+    address: *mut c_void,
+    size: usize,
+    new_protect: u32,
     old_protect: *mut u32,
 ) -> i32 {
     unsafe {
-        if !old_protect.is_null() {
-            *old_protect = PAGE_READWRITE;
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            if !old_protect.is_null() {
+                *old_protect = synth_protect(h, address as u64).unwrap_or(PAGE_READWRITE);
+            }
+            return 1;
         }
-        1
+        let p = ORIGINALS.virtual_protect_ex.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: VProtectExFn = core::mem::transmute(p);
+            return f(process, address, size, new_protect, old_protect);
+        }
+        0
+    }
+}
+
+pub unsafe extern "system" fn nt_protect_virtual_memory(
+    process: *mut c_void,
+    base: *mut *mut c_void,
+    size: *mut usize,
+    new_protect: u32,
+    old_protect: *mut u32,
+) -> i32 {
+    unsafe {
+        let h = process as usize;
+        if handle_table::is_synthetic(h) {
+            let addr = if base.is_null() { 0 } else { *base as u64 };
+            if !old_protect.is_null() {
+                *old_protect = synth_protect(h, addr).unwrap_or(PAGE_READWRITE);
+            }
+            return STATUS_SUCCESS;
+        }
+        let p = ORIGINALS.nt_protect_virtual_memory.load(Ordering::SeqCst);
+        if p != 0 {
+            let f: NtProtectFn = core::mem::transmute(p);
+            return f(process, base, size, new_protect, old_protect);
+        }
+        STATUS_UNSUCCESSFUL
     }
 }
 

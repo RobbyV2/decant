@@ -20,6 +20,8 @@ pub struct Originals {
     pub get_module_base_name_w: AtomicUsize,
     pub get_module_file_name_ex_a: AtomicUsize,
     pub get_module_file_name_ex_w: AtomicUsize,
+    pub virtual_protect_ex: AtomicUsize,
+    pub nt_protect_virtual_memory: AtomicUsize,
     pub virtual_query_ex: AtomicUsize,
     pub virtual_alloc_ex: AtomicUsize,
     pub virtual_free_ex: AtomicUsize,
@@ -58,6 +60,8 @@ impl Originals {
             get_module_base_name_w: AtomicUsize::new(0),
             get_module_file_name_ex_a: AtomicUsize::new(0),
             get_module_file_name_ex_w: AtomicUsize::new(0),
+            virtual_protect_ex: AtomicUsize::new(0),
+            nt_protect_virtual_memory: AtomicUsize::new(0),
             virtual_query_ex: AtomicUsize::new(0),
             virtual_alloc_ex: AtomicUsize::new(0),
             virtual_free_ex: AtomicUsize::new(0),
@@ -177,6 +181,14 @@ pub unsafe fn capture() {
         };
         store(&ORIGINALS.get_module_file_name_ex_w, gmfn_w);
 
+        store(
+            &ORIGINALS.virtual_protect_ex,
+            resolve(&k32, b"VirtualProtectEx\0"),
+        );
+        store(
+            &ORIGINALS.nt_protect_virtual_memory,
+            resolve(&ntdll, b"NtProtectVirtualMemory\0"),
+        );
         store(
             &ORIGINALS.virtual_query_ex,
             resolve(&k32, b"VirtualQueryEx\0"),
