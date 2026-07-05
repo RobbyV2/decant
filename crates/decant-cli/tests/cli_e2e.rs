@@ -1,11 +1,12 @@
 use std::net::TcpListener;
-use std::process::{Command, Output};
+use std::process::{self, Command, Output};
 use std::sync::Arc;
+use std::{env, fs};
 
 use decant_backend::MemoryBackend;
 use decant_backend::fixtures::{
     DEMO_CHAIN_HEAD, DEMO_CHAIN_NODE, DEMO_CHAIN_OFFSET, DEMO_MAGIC, DEMO_MAGIC_ADDR,
-    DEMO_SLOT_ADDR, demo_backend,
+    DEMO_SLOT_ADDR, DEMO_TARGET_PID, demo_backend,
 };
 use decant_daemon::{Diag, serve};
 
@@ -117,4 +118,36 @@ fn unknown_pid_is_a_clean_error_not_a_crash() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("daemon error"), "stderr: {err}");
+}
+
+#[test]
+fn guest_inject_reaches_capability_check() {
+    let port = start_server();
+    let root = env::temp_dir().join(format!("decant_guest_inject_{}_{}", process::id(), port));
+    fs::create_dir_all(&root).unwrap();
+    let payload = root.join("payload.dll");
+    let config = root.join("guest.toml");
+    fs::write(&payload, b"MZ").unwrap();
+    fs::write(
+        &config,
+        format!(
+            "[injection]\ndomain = \"guest\"\nmethod = \"manual-map\"\n\
+             [guest]\npid = {}\npayload_path = \"{}\"\n",
+            DEMO_TARGET_PID.0,
+            payload.display()
+        ),
+    )
+    .unwrap();
+
+    let out = cli(port, &["guest-inject", config.to_str().unwrap()]);
+    let _ = fs::remove_dir_all(&root);
+    assert!(!out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("target:"), "stdout: {stdout}");
+    assert!(stdout.contains("unsupported:"), "stdout: {stdout}");
+    assert!(
+        stderr.contains("guest manual-map requires backend operations"),
+        "stderr: {stderr}"
+    );
 }

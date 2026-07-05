@@ -4,6 +4,8 @@ use std::ffi::c_void;
 use std::fmt;
 use std::path::Path;
 
+pub mod guest;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Portability {
     PublicExportsOnly,
@@ -189,6 +191,26 @@ pub enum Method {
     External,
 }
 
+impl Method {
+    pub fn label(self) -> &'static str {
+        match self {
+            Method::Standard => "standard",
+            Method::ManualMap => "manual-map",
+            Method::ThreadHijack => "thread-hijack",
+            Method::Plugin => "plugin",
+            Method::External => "external",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InjectionDomain {
+    #[default]
+    Tool,
+    Guest,
+}
+
 fn default_timeout_ms() -> u32 {
     5000
 }
@@ -196,6 +218,8 @@ fn default_timeout_ms() -> u32 {
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InjectionConfig {
+    #[serde(default)]
+    pub domain: InjectionDomain,
     #[serde(default)]
     pub method: Method,
     #[serde(default = "default_timeout_ms")]
@@ -209,6 +233,7 @@ pub struct InjectionConfig {
 impl Default for InjectionConfig {
     fn default() -> Self {
         Self {
+            domain: InjectionDomain::Tool,
             method: Method::Standard,
             timeout_ms: default_timeout_ms(),
             plugin_path: None,
@@ -217,26 +242,36 @@ impl Default for InjectionConfig {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct ConfigFile {
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct DecantConfig {
     #[serde(default)]
-    injection: InjectionConfig,
+    pub injection: InjectionConfig,
+    #[serde(default)]
+    pub guest: guest::GuestInjectionConfig,
 }
 
-impl InjectionConfig {
+impl DecantConfig {
     pub fn from_toml_str(s: &str) -> Result<Self, InjectError> {
-        toml::from_str::<ConfigFile>(s)
-            .map(|c| c.injection)
-            .map_err(|e| InjectError::Config(e.message().to_string()))
+        toml::from_str::<DecantConfig>(s).map_err(|e| InjectError::Config(e.message().to_string()))
     }
 
-    // Absent file resolves to defaults; a present but malformed file is an error.
     pub fn load(path: &Path) -> Result<Self, InjectError> {
         match std::fs::read_to_string(path) {
             Ok(s) => Self::from_toml_str(&s),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(InjectError::Config(e.to_string())),
         }
+    }
+}
+
+impl InjectionConfig {
+    pub fn from_toml_str(s: &str) -> Result<Self, InjectError> {
+        DecantConfig::from_toml_str(s).map(|c| c.injection)
+    }
+
+    // Absent file resolves to defaults; a present but malformed file is an error.
+    pub fn load(path: &Path) -> Result<Self, InjectError> {
+        DecantConfig::load(path).map(|c| c.injection)
     }
 }
 
@@ -507,6 +542,7 @@ mod tests {
     #[test]
     fn empty_config_is_standard_defaults() {
         let c = InjectionConfig::from_toml_str("").unwrap();
+        assert_eq!(c.domain, InjectionDomain::Tool);
         assert_eq!(c.method, Method::Standard);
         assert_eq!(c.timeout_ms, 5000);
         assert!(c.plugin_path.is_none());
@@ -515,9 +551,10 @@ mod tests {
     #[test]
     fn injection_table_parses() {
         let c = InjectionConfig::from_toml_str(
-            "[injection]\nmethod = \"manual-map\"\ntimeout_ms = 250\n",
+            "[injection]\ndomain = \"guest\"\nmethod = \"manual-map\"\ntimeout_ms = 250\n",
         )
         .unwrap();
+        assert_eq!(c.domain, InjectionDomain::Guest);
         assert_eq!(c.method, Method::ManualMap);
         assert_eq!(c.timeout_ms, 250);
     }
@@ -560,5 +597,18 @@ mod tests {
         assert_eq!(got.carafe_path, "c:/decant_interpose.dll");
         assert_eq!(got.carafe_image, image);
         assert_eq!(got.ready_token, "decant_ready_7");
+    }
+
+    #[test]
+    fn decant_config_parses_guest_table() {
+        let c = DecantConfig::from_toml_str(
+            "[injection]\ndomain = \"guest\"\nmethod = \"manual-map\"\n\
+             [guest]\nprocess = \"notepad.exe\"\npayload_path = \"payload.dll\"\n",
+        )
+        .unwrap();
+        let plan = guest::GuestInjectionPlan::from_config(&c).unwrap();
+        assert_eq!(plan.method, Method::ManualMap);
+        assert_eq!(plan.target.name.as_deref(), Some("notepad.exe"));
+        assert_eq!(plan.payload_path, std::path::PathBuf::from("payload.dll"));
     }
 }

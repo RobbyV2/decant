@@ -1,8 +1,11 @@
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use decant_client::Client;
+use decant_inject::DecantConfig;
+use decant_inject::guest::{GuestCapabilities, GuestInjectionPlan};
 use decant_protocol::{Pid, Request, Response};
 
 #[derive(Debug, Parser)]
@@ -50,6 +53,9 @@ enum Cmd {
         pid: u32,
         base: String,
         offsets: Vec<String>,
+    },
+    GuestInject {
+        config: PathBuf,
     },
 }
 
@@ -124,10 +130,88 @@ fn run() -> Result<()> {
                 None,
             )
         }
+        Cmd::GuestInject { config } => return guest_inject(&mut client, cli.json, &config),
     };
 
     let resp = client.send(req).context("daemon request")?;
     emit(resp, cli.json, read_base)
+}
+
+fn guest_inject(client: &mut Client, json: bool, config_path: &Path) -> Result<()> {
+    let config = DecantConfig::load(config_path)
+        .map_err(|e| anyhow!("{e}"))
+        .with_context(|| format!("loading {}", config_path.display()))?;
+    let plan = GuestInjectionPlan::from_config(&config).map_err(|e| anyhow!("{e}"))?;
+    let image = std::fs::read(&plan.payload_path)
+        .with_context(|| format!("reading {}", plan.payload_path.display()))?;
+    let process = match (&plan.target.pid, &plan.target.name) {
+        (Some(pid), _) => client.send(Request::ProcessByPid(Pid(*pid))),
+        (None, Some(name)) => client.send(Request::ProcessByName(name.clone())),
+        (None, None) => bail!("guest target is unset"),
+    }
+    .context("resolving guest target")?;
+    let process = match process {
+        Response::Process(p) => p,
+        Response::Err(e) => bail!("daemon error: {e}"),
+        other => bail!("unexpected response: {other:?}"),
+    };
+    let modules = match client
+        .send(Request::ModuleList(process.pid))
+        .context("listing guest modules")?
+    {
+        Response::Modules(modules) => modules.len(),
+        Response::Err(e) => bail!("daemon error: {e}"),
+        other => bail!("unexpected response: {other:?}"),
+    };
+    let regions = match client
+        .send(Request::MemoryMap(process.pid))
+        .context("reading guest memory map")?
+    {
+        Response::MemoryMap(regions) => regions.len(),
+        Response::Err(e) => bail!("daemon error: {e}"),
+        other => bail!("unexpected response: {other:?}"),
+    };
+    let missing = GuestCapabilities::memflow_passive().missing_manual_map();
+    let op = format!("guest {} injection", plan.method.label());
+    match json {
+        true => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "target": { "pid": process.pid.0, "name": process.name },
+                    "payload_path": plan.payload_path,
+                    "payload_bytes": image.len(),
+                    "method": plan.method.label(),
+                    "allocation": plan.allocation.label(),
+                    "execution": plan.execution.method.label(),
+                    "verification": plan.verification.method.label(),
+                    "module_count": modules,
+                    "memory_region_count": regions,
+                    "unsupported": missing,
+                })
+            );
+        }
+        false => {
+            println!("target:          {} {}", process.pid, process.name);
+            println!(
+                "payload:         {} ({} bytes)",
+                plan.payload_path.display(),
+                image.len()
+            );
+            println!("method:          {}", plan.method.label());
+            println!("allocation:      {}", plan.allocation.label());
+            println!("execution:       {}", plan.execution.method.label());
+            println!("verification:    {}", plan.verification.method.label());
+            println!("modules:         {modules}");
+            println!("memory regions:  {regions}");
+            println!("unsupported:     {}", missing.join(", "));
+        }
+    }
+    let _ = client.send(Request::ReportUnsupported { op });
+    bail!(
+        "guest manual-map requires backend operations not exposed by the current daemon: {}",
+        missing.join(", ")
+    )
 }
 
 fn emit(resp: Response, json: bool, read_base: Option<u64>) -> Result<()> {

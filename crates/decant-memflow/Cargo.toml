@@ -15,6 +15,7 @@ memflow = ["dep:memflow"]
 [dependencies]
 decant-protocol = { path = "../decant-protocol" }
 decant-backend = { path = "../decant-backend" }
+decant-inject = { path = "../decant-inject" }
 anyhow.workspace = true
 
 # memflow core with the `plugins` feature (the runtime Inventory). The win32 OS

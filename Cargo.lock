@@ -447,6 +447,7 @@ dependencies = [
  "decant-backend",
  "decant-client",
  "decant-daemon",
+ "decant-inject",
  "decant-protocol",
  "serde_json",
 ]
@@ -519,6 +520,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "decant-backend",
+ "decant-inject",
  "decant-protocol",
  "memflow",
 ]

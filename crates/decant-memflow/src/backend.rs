@@ -1,6 +1,10 @@
 use std::sync::Mutex;
 
 use decant_backend::{BackendError, MemoryBackend, Result};
+use decant_inject::guest::{
+    GuestCapabilities, GuestInjectError, GuestMemoryBackend, GuestMemoryRegion, GuestModuleInfo,
+    GuestProcessInfo,
+};
 use decant_protocol::{MemRegion, ModuleInfo, Pid, ProcessInfo};
 
 use memflow::prelude::v1::*;
@@ -13,6 +17,10 @@ pub struct MemflowBackend {
 
 fn other<E: std::fmt::Debug>(e: E) -> BackendError {
     BackendError::Other(format!("memflow: {e:?}"))
+}
+
+fn guest_other<E: std::fmt::Display>(e: E) -> GuestInjectError {
+    GuestInjectError::Backend(e.to_string())
 }
 
 impl MemflowBackend {
@@ -165,10 +173,10 @@ impl MemoryBackend for MemflowBackend {
                 module: module.to_string(),
             })?;
         let exports = proc.module_export_list(&m).map_err(other)?;
-        let base = m.base.to_umem() as u64;
+        let base = m.base.to_umem();
         Ok(exports
             .into_iter()
-            .map(|e| (e.name.to_string(), base + e.offset as u64))
+            .map(|e| (e.name.to_string(), base + e.offset))
             .collect())
     }
 
@@ -207,8 +215,8 @@ impl MemoryBackend for MemflowBackend {
             .into_iter()
             .map(
                 |CTup3(addr, size, page_type): CTup3<Address, umem, PageType>| MemRegion {
-                    base: addr.to_umem() as u64,
-                    size: size as u64,
+                    base: addr.to_umem(),
+                    size,
                     readable: true,
                     writable: page_type.contains(PageType::WRITEABLE),
                     executable: !page_type.contains(PageType::NOEXEC),
@@ -218,11 +226,89 @@ impl MemoryBackend for MemflowBackend {
     }
 }
 
+impl GuestMemoryBackend for MemflowBackend {
+    fn capabilities(&self) -> GuestCapabilities {
+        GuestCapabilities::memflow_passive()
+    }
+
+    fn list_processes(&self) -> std::result::Result<Vec<GuestProcessInfo>, GuestInjectError> {
+        <Self as MemoryBackend>::list_processes(self)
+            .map(|processes| {
+                processes
+                    .into_iter()
+                    .map(|p| GuestProcessInfo {
+                        pid: p.pid.0,
+                        name: p.name,
+                    })
+                    .collect()
+            })
+            .map_err(guest_other)
+    }
+
+    fn module_list(&self, pid: u32) -> std::result::Result<Vec<GuestModuleInfo>, GuestInjectError> {
+        <Self as MemoryBackend>::module_list(self, Pid(pid))
+            .map(|modules| {
+                modules
+                    .into_iter()
+                    .map(|m| GuestModuleInfo {
+                        name: m.name,
+                        base: m.base,
+                        size: m.size,
+                    })
+                    .collect()
+            })
+            .map_err(guest_other)
+    }
+
+    fn module_exports(
+        &self,
+        pid: u32,
+        module: &str,
+    ) -> std::result::Result<Vec<(String, u64)>, GuestInjectError> {
+        <Self as MemoryBackend>::module_exports(self, Pid(pid), module).map_err(guest_other)
+    }
+
+    fn memory_map(
+        &self,
+        pid: u32,
+    ) -> std::result::Result<Vec<GuestMemoryRegion>, GuestInjectError> {
+        <Self as MemoryBackend>::memory_map(self, Pid(pid))
+            .map(|regions| {
+                regions
+                    .into_iter()
+                    .map(|r| GuestMemoryRegion {
+                        base: r.base,
+                        size: r.size,
+                        readable: r.readable,
+                        writable: r.writable,
+                        executable: r.executable,
+                    })
+                    .collect()
+            })
+            .map_err(guest_other)
+    }
+
+    fn read(
+        &self,
+        pid: u32,
+        addr: u64,
+        len: usize,
+    ) -> std::result::Result<Vec<u8>, GuestInjectError> {
+        <Self as MemoryBackend>::read(self, Pid(pid), addr, len).map_err(guest_other)
+    }
+
+    fn write(&self, pid: u32, addr: u64, data: &[u8]) -> std::result::Result<(), GuestInjectError> {
+        <Self as MemoryBackend>::write(self, Pid(pid), addr, data)
+            .map(|_| ())
+            .map_err(guest_other)
+    }
+}
+
 fn module_to_info(m: ModuleInfo_) -> ModuleInfo {
     ModuleInfo {
         name: m.name.to_string(),
-        base: m.base.to_umem() as u64,
-        size: m.size as u64,
+        base: m.base.to_umem(),
+        size: m.size,
     }
 }
 
