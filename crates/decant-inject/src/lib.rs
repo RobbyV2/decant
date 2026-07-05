@@ -193,6 +193,7 @@ mod win32 {
         ) -> *mut c_void;
         pub fn GetModuleHandleA(module_name: *const u8) -> *mut c_void;
         pub fn GetProcAddress(module: *mut c_void, proc_name: *const u8) -> *mut c_void;
+        pub fn LoadLibraryA(file_name: *const u8) -> *mut c_void;
         pub fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
         pub fn CloseHandle(object: *mut c_void) -> i32;
         pub fn GetLastError() -> u32;
@@ -280,6 +281,114 @@ impl Injector for StandardInjector {
     }
 }
 
+// Versioned C ABI for bring-your-own injectors. A plugin cdylib exports
+// `decant_inject_abi() -> u32` returning this constant and
+// `decant_inject(*mut DecantInjectRequest) -> i32` (0 = success). Bumped on any
+// layout change to DecantInjectRequest.
+pub const DECANT_INJECT_ABI: u32 = 1;
+
+#[repr(C)]
+pub struct DecantInjectRequest {
+    pub abi_version: u32,
+    pub target_process: *mut c_void,
+    pub main_thread: *mut c_void,
+    pub carafe_path: *const u16,
+    pub carafe_image: *const u8,
+    pub carafe_image_len: usize,
+    pub ready_token_name: *const u16,
+    pub out_remote_base: u64,
+}
+
+#[cfg(windows)]
+fn wide_z(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+// Loads a user cdylib against DECANT_INJECT_ABI and delegates the load to it.
+// A plugin runs PE-side in the same Wine prefix, so it shares the handle
+// namespace with the harness. The harness still owns the ready-token wait.
+#[cfg(windows)]
+pub struct PluginInjector {
+    pub path: std::path::PathBuf,
+}
+
+#[cfg(windows)]
+impl Injector for PluginInjector {
+    fn name(&self) -> &str {
+        "plugin"
+    }
+
+    fn portability(&self) -> Portability {
+        Portability::LoaderInternals
+    }
+
+    fn inject(&self, req: &InjectionRequest) -> Result<LoadInfo, InjectError> {
+        use win32::*;
+
+        type AbiFn = unsafe extern "system" fn() -> u32;
+        type InjectFn = unsafe extern "system" fn(*mut DecantInjectRequest) -> i32;
+
+        let mut lib_path = self.path.to_string_lossy().into_owned().into_bytes();
+        lib_path.push(0);
+
+        let path_w = wide_z(&req.carafe_path.to_string_lossy());
+        let token_w = wide_z(&req.ready.name);
+
+        unsafe {
+            let lib = LoadLibraryA(lib_path.as_ptr());
+            if lib.is_null() {
+                return Err(InjectError::Plugin(format!(
+                    "loading plugin {} failed (err={}); a plugin must be a PE cdylib in this Wine prefix",
+                    self.path.display(),
+                    GetLastError()
+                )));
+            }
+
+            let abi_sym = GetProcAddress(lib, b"decant_inject_abi\0".as_ptr());
+            if abi_sym.is_null() {
+                return Err(InjectError::Plugin(
+                    "plugin missing export 'decant_inject_abi'".into(),
+                ));
+            }
+            let abi = std::mem::transmute::<*mut c_void, AbiFn>(abi_sym)();
+            if abi != DECANT_INJECT_ABI {
+                return Err(InjectError::Plugin(format!(
+                    "ABI mismatch: plugin reports {abi}, harness expects {DECANT_INJECT_ABI}"
+                )));
+            }
+
+            let inject_sym = GetProcAddress(lib, b"decant_inject\0".as_ptr());
+            if inject_sym.is_null() {
+                return Err(InjectError::Plugin(
+                    "plugin missing export 'decant_inject'".into(),
+                ));
+            }
+            let inject = std::mem::transmute::<*mut c_void, InjectFn>(inject_sym);
+
+            let mut c_req = DecantInjectRequest {
+                abi_version: DECANT_INJECT_ABI,
+                target_process: req.target.0,
+                main_thread: req.main_thread.0,
+                carafe_path: path_w.as_ptr(),
+                carafe_image: req.carafe_image.as_ptr(),
+                carafe_image_len: req.carafe_image.len(),
+                ready_token_name: token_w.as_ptr(),
+                out_remote_base: 0,
+            };
+            let rc = inject(&mut c_req);
+            if rc != 0 {
+                return Err(InjectError::Plugin(format!("plugin returned error {rc}")));
+            }
+
+            Ok(LoadInfo {
+                method: self.name().to_string(),
+                remote_base: (c_req.out_remote_base != 0).then_some(c_req.out_remote_base as usize),
+                notes: Vec::new(),
+            })
+        }
+    }
+}
+
 #[cfg(windows)]
 impl InjectionConfig {
     pub fn injector(&self) -> Result<Box<dyn Injector>, InjectError> {
@@ -287,7 +396,12 @@ impl InjectionConfig {
             Method::Standard => Ok(Box::new(StandardInjector)),
             Method::ManualMap => Err(InjectError::Unsupported("manual-map".into())),
             Method::ThreadHijack => Err(InjectError::Unsupported("thread-hijack".into())),
-            Method::Plugin => Err(InjectError::Unsupported("plugin".into())),
+            Method::Plugin => match &self.plugin_path {
+                Some(p) => Ok(Box::new(PluginInjector { path: p.clone() })),
+                None => Err(InjectError::Config(
+                    "method = \"plugin\" requires plugin_path".into(),
+                )),
+            },
             Method::External => Err(InjectError::Unsupported("external".into())),
         }
     }

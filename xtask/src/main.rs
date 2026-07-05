@@ -13,6 +13,7 @@ const WIN_CRATES: &[&str] = &[
     "guest-target",
     "sample-tool",
     "decant-launcher",
+    "decant-plugin-standard",
     "dll-smoke",
     "hello-dll",
 ];
@@ -179,8 +180,13 @@ fn inject_test() -> Result<()> {
         "sample-tool",
         "-p",
         "decant-launcher",
+        "-p",
+        "decant-plugin-standard",
     ]);
-    run("cargo build carafe + sample-tool + launcher", &mut build)?;
+    run(
+        "cargo build carafe + sample-tool + launcher + plugin",
+        &mut build,
+    )?;
 
     setup()?;
 
@@ -192,6 +198,7 @@ fn inject_test() -> Result<()> {
         "decant_interpose.dll",
         "sample-tool.exe",
         "decant-launcher.exe",
+        "decant_plugin_standard.dll",
     ] {
         let src = out_dir.join(name);
         if !src.exists() {
@@ -244,6 +251,56 @@ fn inject_test() -> Result<()> {
 
     std::fs::write(stage.join("fault.toml"), "[injection]\ntimeout_ms = 500\n")
         .context("writing fault config")?;
+    std::fs::write(
+        stage.join("plugin.toml"),
+        "[injection]\nmethod = \"plugin\"\nplugin_path = \"decant_plugin_standard.dll\"\n",
+    )
+    .context("writing plugin config")?;
+    let plugin_env = [("DECANT_AUTOHOOK", "1"), ("DECANT_CONFIG", "plugin.toml")];
+    let r_plugin = run_under_wine(
+        &launcher,
+        &["sample-tool.exe", "--inject-test"],
+        &prefix,
+        &plugin_env,
+    )
+    .context("running plugin injection")?;
+    println!(
+        "inject-test plugin injection: stdout={:?}",
+        r_plugin.stdout.trim()
+    );
+    if !r_plugin.ok_with("INTERCEPTED") {
+        eprintln!("stderr:\n{}", r_plugin.stderr);
+        bail!("plugin injection FAIL: expected INTERCEPTED via the cdylib plugin");
+    }
+
+    std::fs::write(
+        stage.join("plugin_bad.toml"),
+        "[injection]\nmethod = \"plugin\"\nplugin_path = \"decant_interpose.dll\"\n",
+    )
+    .context("writing bad-plugin config")?;
+    let bad_env = [
+        ("DECANT_AUTOHOOK", "1"),
+        ("DECANT_CONFIG", "plugin_bad.toml"),
+    ];
+    let r_bad = run_under_wine(
+        &launcher,
+        &["sample-tool.exe", "--inject-test"],
+        &prefix,
+        &bad_env,
+    )
+    .context("running plugin missing-export")?;
+    println!(
+        "inject-test plugin missing-export: status={} stderr={:?}",
+        r_bad.status,
+        r_bad.stderr.trim()
+    );
+    if r_bad.status != 10 || !r_bad.stderr.contains("missing export") {
+        bail!(
+            "plugin missing-export FAIL: expected exit 10 with a clear error, got exit {}",
+            r_bad.status
+        );
+    }
+
     let fault = [
         ("DECANT_AUTOHOOK", "1"),
         ("DECANT_FAULT", "nohooks"),
@@ -269,7 +326,7 @@ fn inject_test() -> Result<()> {
     }
 
     println!(
-        "inject-test: PASS (launcher injection INTERCEPTED via the ready signal; broken carafe times out; baseline passthrough)"
+        "inject-test: PASS (standard + plugin injection INTERCEPTED via the ready signal; broken carafe times out; baseline passthrough)"
     );
     Ok(())
 }

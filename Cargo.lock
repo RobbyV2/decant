@@ -517,6 +517,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "decant-plugin-standard"
+version = "0.1.0"
+dependencies = [
+ "decant-inject",
+]
+
+[[package]]
 name = "decant-protocol"
 version = "0.1.0"
 dependencies = [
