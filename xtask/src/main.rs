@@ -310,10 +310,7 @@ fn inject_test() -> Result<()> {
         "[injection]\nmethod = \"external\"\nexternal_command = [\"decant-external-standard.exe\"]\n",
     )
     .context("writing external config")?;
-    let external_env = [
-        ("DECANT_AUTOHOOK", "1"),
-        ("DECANT_CONFIG", "external.toml"),
-    ];
+    let external_env = [("DECANT_AUTOHOOK", "1"), ("DECANT_CONFIG", "external.toml")];
     let r_external = run_under_wine(
         &launcher,
         &["sample-tool.exe", "--inject-test"],

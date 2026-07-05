@@ -599,8 +599,14 @@ mod tests {
     fn external_protocol_round_trips() {
         let mut buf = Vec::new();
         let image = [0xDEu8, 0xAD, 0xBE, 0xEF];
-        external::write_request(&mut buf, 4321, "c:/decant_interpose.dll", &image, "decant_ready_7")
-            .unwrap();
+        external::write_request(
+            &mut buf,
+            4321,
+            "c:/decant_interpose.dll",
+            &image,
+            "decant_ready_7",
+        )
+        .unwrap();
         let got = external::read_request(&mut &buf[..]).unwrap();
         assert_eq!(got.pid, 4321);
         assert_eq!(got.carafe_path, "c:/decant_interpose.dll");
