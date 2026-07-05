@@ -1,0 +1,14 @@
+[package]
+name = "decant-inject"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "The injection contract: an Injector trait plus a method-agnostic load request, and the standard public-exports-only injector. Methods are selected by config or supplied as plugins."
+
+[lib]
+name = "decant_inject"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }

@@ -418,3 +418,49 @@ A call by name is covered whether resolved at load time (IAT patch) or at runtim
 cannot see it; catching it would need syscall-dispatch hooking, the Wine-internal
 territory above. Such a call still cannot escape the guest-execution limit (section 3);
 this is about interception visibility, not power over the guest.
+
+## 12. Pluggable injection and method-agnostic verification
+
+Section 9 fixes one delivery mechanism into the tool. Injection becomes a capability behind a
+single trait, so a user can pick a shipped method by config or supply their own against a
+stable boundary. The differentiator is the harness and its verification contract, not any one
+injector.
+
+An `Injector` performs only the load: `inject(&InjectionRequest) -> Result<LoadInfo,
+InjectError>`. The harness owns spawning the target suspended and resuming it; an injector
+never resumes. The request carries both a `carafe_path`, for loader-based methods that hand a
+path to `LoadLibrary`, and the raw `carafe_image` bytes, for manual-map methods that
+reimplement the loader, so one request type serves both method classes. Every method reports a
+`Portability` tier: `PublicExportsOnly` (the `standard` method, upholding the section 11
+guarantee), `LoaderInternals` (manual map), or `PrologueBytes` (thread hijack or inline). The
+tier is logged at startup, and any method below `PublicExportsOnly` prints a notice that the
+run opts out of the cross-version portability guarantee.
+
+Load is confirmed by the carafe signaling a named sync primitive, the `ReadyToken`, from
+`DllMain` after its hooks are installed, never by enumerating the target's module list. A
+manual-mapped image is deliberately absent from the loader module list, so external
+enumeration confirms `LoadLibrary` and silently fails for manual map. The harness creates the
+token before injection, passes its name in, waits with a timeout, and resumes the main thread
+only on success; timeout or signal failure kills the target and exits non-zero. This makes
+verification identical for `LoadLibrary`, manual map, thread hijack, or APC: if the carafe is
+alive and hooking, it reports. Waiting on the token stays in the harness, so a plugin cannot
+report "hooks installed" on its own.
+
+Pre-made injectors are selected by config: `[injection] method = "standard" | "manual-map" |
+"plugin" | "external"` with `timeout_ms`. Bring-your-own is a `PluginInjector` that loads a user cdylib
+exporting `decant_inject` against a versioned `#[repr(C)]` ABI (`DECANT_INJECT_ABI`); the host
+resolves the export, checks the ABI version, marshals the request, and maps the result back.
+The plugin returns once the carafe's `DllMain` is reached; the harness still owns the
+ready-token wait.
+
+Injection primitives act on a Windows process handle inside a wineserver prefix, so a
+bring-your-own injector cannot be an arbitrary Linux program; it must run PE-side, in the same
+prefix, to share the handle namespace. This stays agnostic in the way that matters: any
+toolchain targeting Windows, or any existing Windows injector, qualifies. `PluginInjector`
+error messages state this constraint directly.
+
+A fourth method, `external`, hands the target PID and the carafe path to a user-configured
+command and lets that command perform the load out of process. It runs PE-side in the same
+prefix for the handle-namespace reason above, reports `PrologueBytes` portability, and is
+verified by the same ready-token wait: the harness resumes only after the carafe signals,
+whatever the external command did.

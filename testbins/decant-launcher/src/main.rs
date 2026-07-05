@@ -1,5 +1,10 @@
 use std::ffi::c_void;
+use std::path::Path;
 use std::process::ExitCode;
+
+use decant_inject::{
+    InjectError, InjectionConfig, InjectionRequest, ProcessHandle, ReadyToken, ThreadHandle,
+};
 
 type Handle = *mut c_void;
 
@@ -48,31 +53,6 @@ unsafe extern "system" {
         startup_info: *const StartupInfoW,
         process_information: *mut ProcessInformation,
     ) -> i32;
-    fn VirtualAllocEx(
-        process: Handle,
-        address: *mut c_void,
-        size: usize,
-        allocation_type: u32,
-        protect: u32,
-    ) -> *mut c_void;
-    fn WriteProcessMemory(
-        process: Handle,
-        base_address: *mut c_void,
-        buffer: *const c_void,
-        size: usize,
-        written: *mut usize,
-    ) -> i32;
-    fn CreateRemoteThread(
-        process: Handle,
-        thread_attributes: *const c_void,
-        stack_size: usize,
-        start_address: *mut c_void,
-        parameter: *mut c_void,
-        creation_flags: u32,
-        thread_id: *mut u32,
-    ) -> Handle;
-    fn GetModuleHandleA(module_name: *const u8) -> Handle;
-    fn GetProcAddress(module: Handle, proc_name: *const u8) -> *mut c_void;
     fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
     fn ResumeThread(thread: Handle) -> u32;
     fn GetExitCodeProcess(process: Handle, exit_code: *mut u32) -> i32;
@@ -82,8 +62,6 @@ unsafe extern "system" {
 }
 
 const CREATE_SUSPENDED: u32 = 0x0000_0004;
-const MEM_COMMIT_RESERVE: u32 = 0x0000_1000 | 0x0000_2000;
-const PAGE_READWRITE: u32 = 0x04;
 const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
 const STD_INPUT: i32 = -10;
 const STD_OUTPUT: i32 = -11;
@@ -92,6 +70,19 @@ const INFINITE: u32 = 0xFFFF_FFFF;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn exit_code_for(e: &InjectError) -> u8 {
+    match e {
+        InjectError::RemoteAlloc(_) => 3,
+        InjectError::RemoteWrite(_) => 4,
+        InjectError::ResolveLoadLibrary => 5,
+        InjectError::RemoteThread(_) => 6,
+        InjectError::Timeout => 8,
+        InjectError::Unsupported(_) => 9,
+        InjectError::Plugin(_) => 10,
+        InjectError::Config(_) => 11,
+    }
 }
 
 fn main() -> ExitCode {
@@ -105,15 +96,14 @@ fn main() -> ExitCode {
     };
     let rest: Vec<String> = args.collect();
 
-    let dll_path = std::env::var("DECANT_DLL").unwrap_or_else(|_| {
-        match std::path::Path::new(&target).parent() {
+    let dll_path =
+        std::env::var("DECANT_DLL").unwrap_or_else(|_| match Path::new(&target).parent() {
             Some(dir) if !dir.as_os_str().is_empty() => dir
                 .join("decant_interpose.dll")
                 .to_string_lossy()
                 .into_owned(),
             _ => "decant_interpose.dll".to_string(),
-        }
-    });
+        });
 
     let mut cmd = format!("\"{target}\"");
     for a in &rest {
@@ -122,11 +112,36 @@ fn main() -> ExitCode {
     }
     let app_w = wide(&target);
     let mut cmd_w = wide(&cmd);
-    let dll_bytes = {
-        let mut b = dll_path.into_bytes();
-        b.push(0);
-        b
+
+    let cfg = match std::env::var("DECANT_CONFIG") {
+        Ok(p) => match InjectionConfig::load(Path::new(&p)) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("launcher: {e}");
+                return ExitCode::from(exit_code_for(&e));
+            }
+        },
+        Err(_) => InjectionConfig::default(),
     };
+    let injector = match cfg.injector() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("launcher: {e}");
+            return ExitCode::from(exit_code_for(&e));
+        }
+    };
+    eprintln!(
+        "launcher: injecting via method '{}' ({})",
+        injector.name(),
+        injector.portability().label()
+    );
+    if !injector.portability().upholds_export_guarantee() {
+        eprintln!(
+            "launcher: method '{}' binds below the public export ABI; the cross-version \
+             portability guarantee does not apply to this run",
+            injector.name()
+        );
+    }
 
     unsafe {
         let mut si: StartupInfoW = std::mem::zeroed();
@@ -154,58 +169,21 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
 
-        let remote = VirtualAllocEx(
-            pi.h_process,
-            std::ptr::null_mut(),
-            dll_bytes.len(),
-            MEM_COMMIT_RESERVE,
-            PAGE_READWRITE,
-        );
-        if remote.is_null() {
-            eprintln!("launcher: VirtualAllocEx failed (err={})", GetLastError());
-            return ExitCode::from(3);
-        }
-        let mut written = 0usize;
-        if WriteProcessMemory(
-            pi.h_process,
-            remote,
-            dll_bytes.as_ptr() as *const c_void,
-            dll_bytes.len(),
-            &mut written,
-        ) == 0
-        {
-            eprintln!(
-                "launcher: WriteProcessMemory failed (err={})",
-                GetLastError()
-            );
-            return ExitCode::from(4);
-        }
+        let req = InjectionRequest {
+            target: ProcessHandle(pi.h_process),
+            main_thread: ThreadHandle(pi.h_thread),
+            carafe_path: Path::new(&dll_path),
+            carafe_image: &[],
+            ready: ReadyToken::none(),
+        };
 
-        let kernel32 = GetModuleHandleA(b"kernel32.dll\0".as_ptr());
-        let load_library = GetProcAddress(kernel32, b"LoadLibraryA\0".as_ptr());
-        if load_library.is_null() {
-            eprintln!("launcher: GetProcAddress(LoadLibraryA) failed");
-            return ExitCode::from(5);
+        match injector.inject(&req) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("launcher: injection failed: {e}");
+                return ExitCode::from(exit_code_for(&e));
+            }
         }
-
-        let thread = CreateRemoteThread(
-            pi.h_process,
-            std::ptr::null(),
-            0,
-            load_library,
-            remote,
-            0,
-            std::ptr::null_mut(),
-        );
-        if thread.is_null() {
-            eprintln!(
-                "launcher: CreateRemoteThread failed (err={})",
-                GetLastError()
-            );
-            return ExitCode::from(6);
-        }
-        WaitForSingleObject(thread, INFINITE);
-        CloseHandle(thread);
 
         if ResumeThread(pi.h_thread) == u32::MAX {
             eprintln!("launcher: ResumeThread failed (err={})", GetLastError());

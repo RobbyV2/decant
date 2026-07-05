@@ -484,6 +484,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "decant-inject"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "decant-interpose"
 version = "0.1.0"
 dependencies = [
@@ -494,6 +502,9 @@ dependencies = [
 [[package]]
 name = "decant-launcher"
 version = "0.1.0"
+dependencies = [
+ "decant-inject",
+]
 
 [[package]]
 name = "decant-memflow"

@@ -8,3 +8,6 @@ description = "Launches a target exe SUSPENDED under Wine and injects the carafe
 [[bin]]
 name = "decant-launcher"
 path = "src/main.rs"
+
+[dependencies]
+decant-inject = { path = "../../crates/decant-inject" }
