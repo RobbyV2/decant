@@ -698,6 +698,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "guest-inject-fixture"
+version = "0.1.0"
+
+[[package]]
 name = "guest-target"
 version = "0.1.0"
 

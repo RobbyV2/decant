@@ -17,6 +17,7 @@ const WIN_CRATES: &[&str] = &[
     "decant-external-standard",
     "dll-smoke",
     "hello-dll",
+    "guest-inject-fixture",
 ];
 
 fn main() -> ExitCode {
@@ -28,10 +29,10 @@ fn main() -> ExitCode {
         "test" => test(),
         "test-live" => test_live(),
         "wine-smoke" => wine_smoke(),
+        "guest-inject-fixture" => guest_inject_fixture(),
         "inject-test" => inject_test(),
         "e2e" => e2e(),
         "dynamic" => dynamic(),
-        "demo" => demo(),
         other => {
             usage(other);
             return ExitCode::from(2);
@@ -53,7 +54,7 @@ fn usage(unknown: &str) {
     }
     eprintln!(
         "usage: cargo xtask \
-         <setup|build-native|build-dll|test|test-live|wine-smoke|inject-test|e2e|dynamic|demo>"
+         <setup|build-native|build-dll|test|test-live|wine-smoke|guest-inject-fixture|inject-test|e2e|dynamic>"
     );
 }
 
@@ -164,6 +165,65 @@ fn wine_smoke() -> Result<()> {
             eprintln!("wine-smoke: stderr:\n{}", out.stderr);
         }
         bail!("wine-smoke: FAIL (expected stdout to contain 5 and exit 0)");
+    }
+}
+
+fn guest_inject_fixture() -> Result<()> {
+    let root = repo_root();
+
+    let mut build = cargo();
+    build.args([
+        "build",
+        "--target",
+        WIN_TARGET,
+        "-p",
+        "guest-inject-fixture",
+    ]);
+    run("cargo build guest-inject-fixture", &mut build)?;
+
+    setup()?;
+
+    let out_dir = root.join("target").join(WIN_TARGET).join("debug");
+    let dll = out_dir.join("guest_inject_probe.dll");
+    let exe = out_dir.join("guest-inject-target.exe");
+    for artifact in [&dll, &exe] {
+        if !artifact.exists() {
+            bail!("expected build artifact missing: {}", artifact.display());
+        }
+    }
+
+    let stage = root.join("target").join("guest-inject-fixture");
+    std::fs::create_dir_all(&stage)
+        .with_context(|| format!("creating staging dir {}", stage.display()))?;
+    std::fs::copy(&dll, stage.join("guest_inject_probe.dll"))
+        .context("staging guest_inject_probe.dll")?;
+    std::fs::copy(&exe, stage.join("guest-inject-target.exe"))
+        .context("staging guest-inject-target.exe")?;
+
+    let prefix = root.join("wine-env").join("prefix");
+    let out = run_under_wine(
+        &stage.join("guest-inject-target.exe"),
+        &["--self-load", "guest_inject_probe.dll"],
+        &prefix,
+        &[],
+    )
+    .context("running guest-inject fixture under Wine")?;
+
+    println!(
+        "guest-inject-fixture: stdout={:?} exit={}",
+        out.stdout.trim(),
+        out.status
+    );
+    if out.ok_with("guest-inject-target: self-load PASS") {
+        println!("guest-inject-fixture: PASS");
+        println!("guest-inject-fixture: exe={}", exe.display());
+        println!("guest-inject-fixture: dll={}", dll.display());
+        Ok(())
+    } else {
+        if !out.stderr.trim().is_empty() {
+            eprintln!("guest-inject-fixture: stderr:\n{}", out.stderr);
+        }
+        bail!("guest-inject-fixture: FAIL");
     }
 }
 
@@ -612,18 +672,5 @@ fn dynamic() -> Result<()> {
         );
     }
     println!("dynamic: PASS");
-    Ok(())
-}
-
-fn demo() -> Result<()> {
-    let script = repo_root().join("scripts/demo.sh");
-    if script.exists() {
-        return run("scripts/demo.sh", Command::new("bash").arg(&script));
-    }
-    println!(
-        "demo: no scripts/demo.sh yet. The end-to-end demo (cheat tool under Wine \
-         editing a VM's memory through the daemon) is not wired up here; for \
-         now `cargo xtask wine-smoke` is the runnable proof."
-    );
     Ok(())
 }

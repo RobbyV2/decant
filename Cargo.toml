@@ -29,6 +29,7 @@ members = [
     "testbins/decant-external-standard",
     "testbins/dll-smoke",
     "testbins/hello-dll",
+    "testbins/guest-inject-fixture",
 ]
 # Host-only crates. `cargo build`/`cargo test` with no `-p`/`--target` touch only these.
 #

@@ -3,7 +3,7 @@ name = "xtask"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "Build/test orchestration: cargo xtask <setup|build-native|build-dll|test|test-live|wine-smoke|demo>."
+description = "Build/test orchestration: cargo xtask <setup|build-native|build-dll|test|test-live|wine-smoke|inject-test|e2e>."
 
 [dependencies]
 anyhow.workspace = true

@@ -39,10 +39,6 @@ e2e:
 inject-test:
     cargo run -p xtask -- inject-test
 
-# offline end-to-end demo
-demo:
-    bash scripts/demo.sh
-
 # the whole offline suite
 check: build test build-win wine-smoke inject-test e2e
 

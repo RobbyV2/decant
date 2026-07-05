@@ -103,7 +103,7 @@ cargo xtask wine-smoke
 # isolated repo-local WINEPREFIX, calls the exported `add`, prints 5
 ```
 
-`xtask` subcommands: `setup`, `build-native`, `build-dll`, `test`, `test-live`, `wine-smoke`, `inject-test`, `e2e`, `demo`.
+`xtask` subcommands: `setup`, `build-native`, `build-dll`, `test`, `test-live`, `wine-smoke`, `inject-test`, `e2e`.
 
 ## CLI
 
