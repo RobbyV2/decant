@@ -26,6 +26,7 @@ members = [
     "testbins/sample-tool",
     "testbins/decant-launcher",
     "testbins/decant-plugin-standard",
+    "testbins/decant-external-standard",
     "testbins/dll-smoke",
     "testbins/hello-dll",
 ]

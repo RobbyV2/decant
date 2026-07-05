@@ -459,8 +459,35 @@ prefix, to share the handle namespace. This stays agnostic in the way that matte
 toolchain targeting Windows, or any existing Windows injector, qualifies. `PluginInjector`
 error messages state this constraint directly.
 
-A fourth method, `external`, hands the target PID and the carafe path to a user-configured
-command and lets that command perform the load out of process. It runs PE-side in the same
-prefix for the handle-namespace reason above, reports `PrologueBytes` portability, and is
-verified by the same ready-token wait: the harness resumes only after the carafe signals,
-whatever the external command did.
+A fourth method, `external`, hands the load to a user-configured command that runs out of
+process. The harness spawns the command and writes one length-prefixed frame to its stdin:
+the target PID, the carafe path, the carafe image bytes, and the ready-token name. The command
+reopens the target itself with `OpenProcess(pid)` and performs the load, using the path for a
+loader-based load or the bytes for a manual map. A PID crosses the process boundary where a
+handle would not, since a handle is valid only inside the harness that created it. The command
+runs PE-side in the same prefix for the handle-namespace reason above, reports `PrologueBytes`
+portability because its mechanism is opaque to the harness, and is verified by the same
+ready-token wait: the harness resumes only after the carafe signals, whatever the command did.
+The shipped `decant-external-standard` reads this frame and delegates to the standard load.
+
+Configuration selects the method and carries the two boundaries' parameters. The launcher reads
+a TOML file named by `DECANT_CONFIG`; an absent file is the standard defaults, a malformed one
+is an error.
+
+```toml
+[injection]
+method = "standard"        # standard | manual-map | thread-hijack | plugin | external
+timeout_ms = 5000          # ready-token wait before the harness kills the target
+plugin_path = "my_injector.dll"          # required for method = "plugin"
+external_command = ["my_inject.exe", "--flag"]   # required for method = "external"
+```
+
+The cdylib boundary is a versioned C ABI. A plugin exports `decant_inject_abi() -> u32`
+returning `DECANT_INJECT_ABI` and `decant_inject(*mut DecantInjectRequest) -> i32` (0 on
+success); the host resolves both, rejects a version mismatch or a missing export with a clear
+error, marshals the request, and reads back `out_remote_base`. The ABI constant is bumped on any
+layout change to `DecantInjectRequest`. The external boundary is the stdin frame above, so a
+bring-your-own external command needs no linkage against Decant, only agreement on the frame.
+Both boundaries share the same PE-side constraint: an injector acts on a process handle inside a
+wineserver prefix, so it must run as a Windows image in that prefix, not as an arbitrary Linux
+program. Any toolchain targeting Windows qualifies.

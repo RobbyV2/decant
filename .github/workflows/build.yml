@@ -31,4 +31,4 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Cross-compile windows crates
-        run: cargo build --locked --target x86_64-pc-windows-gnu -p decant-interpose -p sample-tool -p decant-launcher -p guest-target -p dll-smoke -p hello-dll
+        run: cargo build --locked --target x86_64-pc-windows-gnu -p decant-interpose -p sample-tool -p decant-launcher -p decant-plugin-standard -p decant-external-standard -p guest-target -p dll-smoke -p hello-dll

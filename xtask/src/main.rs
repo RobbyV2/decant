@@ -14,6 +14,7 @@ const WIN_CRATES: &[&str] = &[
     "sample-tool",
     "decant-launcher",
     "decant-plugin-standard",
+    "decant-external-standard",
     "dll-smoke",
     "hello-dll",
 ];
@@ -182,9 +183,11 @@ fn inject_test() -> Result<()> {
         "decant-launcher",
         "-p",
         "decant-plugin-standard",
+        "-p",
+        "decant-external-standard",
     ]);
     run(
-        "cargo build carafe + sample-tool + launcher + plugin",
+        "cargo build carafe + sample-tool + launcher + plugin + external",
         &mut build,
     )?;
 
@@ -199,6 +202,7 @@ fn inject_test() -> Result<()> {
         "sample-tool.exe",
         "decant-launcher.exe",
         "decant_plugin_standard.dll",
+        "decant-external-standard.exe",
     ] {
         let src = out_dir.join(name);
         if !src.exists() {
@@ -301,6 +305,59 @@ fn inject_test() -> Result<()> {
         );
     }
 
+    std::fs::write(
+        stage.join("external.toml"),
+        "[injection]\nmethod = \"external\"\nexternal_command = [\"decant-external-standard.exe\"]\n",
+    )
+    .context("writing external config")?;
+    let external_env = [
+        ("DECANT_AUTOHOOK", "1"),
+        ("DECANT_CONFIG", "external.toml"),
+    ];
+    let r_external = run_under_wine(
+        &launcher,
+        &["sample-tool.exe", "--inject-test"],
+        &prefix,
+        &external_env,
+    )
+    .context("running external injection")?;
+    println!(
+        "inject-test external injection: stdout={:?}",
+        r_external.stdout.trim()
+    );
+    if !r_external.ok_with("INTERCEPTED") {
+        eprintln!("stderr:\n{}", r_external.stderr);
+        bail!("external injection FAIL: expected INTERCEPTED via the external command");
+    }
+
+    std::fs::write(
+        stage.join("external_bad.toml"),
+        "[injection]\nmethod = \"external\"\n",
+    )
+    .context("writing bad-external config")?;
+    let external_bad_env = [
+        ("DECANT_AUTOHOOK", "1"),
+        ("DECANT_CONFIG", "external_bad.toml"),
+    ];
+    let r_external_bad = run_under_wine(
+        &launcher,
+        &["sample-tool.exe", "--inject-test"],
+        &prefix,
+        &external_bad_env,
+    )
+    .context("running external missing-command")?;
+    println!(
+        "inject-test external missing-command: status={} stderr={:?}",
+        r_external_bad.status,
+        r_external_bad.stderr.trim()
+    );
+    if r_external_bad.status != 11 || !r_external_bad.stderr.contains("external_command") {
+        bail!(
+            "external missing-command FAIL: expected exit 11 with a clear error, got exit {}",
+            r_external_bad.status
+        );
+    }
+
     let fault = [
         ("DECANT_AUTOHOOK", "1"),
         ("DECANT_FAULT", "nohooks"),
@@ -326,7 +383,7 @@ fn inject_test() -> Result<()> {
     }
 
     println!(
-        "inject-test: PASS (standard + plugin injection INTERCEPTED via the ready signal; broken carafe times out; baseline passthrough)"
+        "inject-test: PASS (standard + plugin + external injection INTERCEPTED via the ready signal; broken carafe times out; baseline passthrough)"
     );
     Ok(())
 }

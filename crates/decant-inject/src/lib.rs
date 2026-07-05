@@ -51,9 +51,12 @@ impl ReadyToken {
 
 // Carries enough for both method classes: loader-based methods read carafe_path,
 // manual-map methods read carafe_image. A method uses whichever it needs.
+// target_pid lets out-of-process methods reopen the target by identifier rather
+// than by a handle that is only valid inside the harness.
 pub struct InjectionRequest<'a> {
     pub target: ProcessHandle,
     pub main_thread: ThreadHandle,
+    pub target_pid: u32,
     pub carafe_path: &'a Path,
     pub carafe_image: &'a [u8],
     pub ready: ReadyToken,
@@ -74,6 +77,7 @@ pub enum InjectError {
     Timeout,
     Unsupported(String),
     Plugin(String),
+    External(String),
     Config(String),
 }
 
@@ -87,6 +91,7 @@ impl fmt::Display for InjectError {
             InjectError::Timeout => write!(f, "carafe did not signal ready before the timeout"),
             InjectError::Unsupported(m) => write!(f, "unsupported: {m}"),
             InjectError::Plugin(m) => write!(f, "plugin: {m}"),
+            InjectError::External(m) => write!(f, "external: {m}"),
             InjectError::Config(m) => write!(f, "config: {m}"),
         }
     }
@@ -98,6 +103,69 @@ pub trait Injector {
     fn name(&self) -> &str;
     fn portability(&self) -> Portability;
     fn inject(&self, req: &InjectionRequest) -> Result<LoadInfo, InjectError>;
+}
+
+// Wire format for the external-process method: the harness writes one frame to
+// the user command's stdin, the command reads it and performs the load out of
+// process. Length-prefixed and platform-agnostic so both ends share this code
+// and it round-trips in host tests. carafe_image is empty for path-based loads.
+pub mod external {
+    use std::io::{self, Cursor, Read, Write};
+
+    pub struct ExternalPayload {
+        pub pid: u32,
+        pub carafe_path: String,
+        pub carafe_image: Vec<u8>,
+        pub ready_token: String,
+    }
+
+    fn put(buf: &mut Vec<u8>, b: &[u8]) {
+        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        buf.extend_from_slice(b);
+    }
+
+    pub fn write_request(
+        w: &mut impl Write,
+        pid: u32,
+        carafe_path: &str,
+        carafe_image: &[u8],
+        ready_token: &str,
+    ) -> io::Result<()> {
+        let mut buf = pid.to_le_bytes().to_vec();
+        put(&mut buf, carafe_path.as_bytes());
+        put(&mut buf, carafe_image);
+        put(&mut buf, ready_token.as_bytes());
+        w.write_all(&buf)
+    }
+
+    fn read_u32(r: &mut impl Read) -> io::Result<u32> {
+        let mut b = [0u8; 4];
+        r.read_exact(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    fn read_vec(r: &mut impl Read) -> io::Result<Vec<u8>> {
+        let n = read_u32(r)? as usize;
+        let mut v = vec![0u8; n];
+        r.read_exact(&mut v)?;
+        Ok(v)
+    }
+
+    pub fn read_request(r: &mut impl Read) -> io::Result<ExternalPayload> {
+        let mut all = Vec::new();
+        r.read_to_end(&mut all)?;
+        let mut c = Cursor::new(all);
+        let pid = read_u32(&mut c)?;
+        let carafe_path = String::from_utf8_lossy(&read_vec(&mut c)?).into_owned();
+        let carafe_image = read_vec(&mut c)?;
+        let ready_token = String::from_utf8_lossy(&read_vec(&mut c)?).into_owned();
+        Ok(ExternalPayload {
+            pid,
+            carafe_path,
+            carafe_image,
+            ready_token,
+        })
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Deserialize)]
@@ -389,6 +457,76 @@ impl Injector for PluginInjector {
     }
 }
 
+// Hands the target PID plus the carafe path/bytes to a user-configured command
+// over its stdin and lets that command perform the load out of process. The
+// command must be a PE exe in the same Wine prefix to share the handle
+// namespace. Verification is unchanged: the harness owns the ready-token wait,
+// so whatever the command does, the target is resumed only once the carafe
+// reports. The mechanism is opaque to the harness, so it reports below the
+// public-export guarantee.
+#[cfg(windows)]
+pub struct ExternalInjector {
+    pub command: Vec<String>,
+}
+
+#[cfg(windows)]
+impl Injector for ExternalInjector {
+    fn name(&self) -> &str {
+        "external"
+    }
+
+    fn portability(&self) -> Portability {
+        Portability::PrologueBytes
+    }
+
+    fn inject(&self, req: &InjectionRequest) -> Result<LoadInfo, InjectError> {
+        use std::process::{Command, Stdio};
+
+        let (prog, rest) = self
+            .command
+            .split_first()
+            .ok_or_else(|| InjectError::Config("external_command is empty".into()))?;
+
+        let mut child = Command::new(prog)
+            .args(rest)
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                InjectError::External(format!(
+                    "spawning {prog}: {e}; the command must be a PE exe in this Wine prefix"
+                ))
+            })?;
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| InjectError::External("command stdin unavailable".into()))?;
+        external::write_request(
+            &mut stdin,
+            req.target_pid,
+            &req.carafe_path.to_string_lossy(),
+            req.carafe_image,
+            &req.ready.name,
+        )
+        .map_err(|e| InjectError::External(format!("writing protocol frame: {e}")))?;
+        drop(stdin);
+
+        let status = child
+            .wait()
+            .map_err(|e| InjectError::External(format!("waiting on command: {e}")))?;
+        match status.success() {
+            true => Ok(LoadInfo {
+                method: self.name().to_string(),
+                remote_base: None,
+                notes: vec![format!("delegated to: {}", self.command.join(" "))],
+            }),
+            false => Err(InjectError::External(format!(
+                "command {prog} exited with {status}"
+            ))),
+        }
+    }
+}
+
 #[cfg(windows)]
 impl InjectionConfig {
     pub fn injector(&self) -> Result<Box<dyn Injector>, InjectError> {
@@ -402,7 +540,14 @@ impl InjectionConfig {
                     "method = \"plugin\" requires plugin_path".into(),
                 )),
             },
-            Method::External => Err(InjectError::Unsupported("external".into())),
+            Method::External => match self.external_command.as_deref() {
+                Some(cmd) if !cmd.is_empty() => Ok(Box::new(ExternalInjector {
+                    command: cmd.to_vec(),
+                })),
+                _ => Err(InjectError::Config(
+                    "method = \"external\" requires a non-empty external_command".into(),
+                )),
+            },
         }
     }
 }
@@ -435,5 +580,31 @@ mod tests {
             InjectionConfig::from_toml_str("[injection]\nmethod = \"bogus\"\n"),
             Err(InjectError::Config(_))
         ));
+    }
+
+    #[test]
+    fn external_command_parses() {
+        let c = InjectionConfig::from_toml_str(
+            "[injection]\nmethod = \"external\"\nexternal_command = [\"inject.exe\", \"--flag\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.method, Method::External);
+        assert_eq!(
+            c.external_command.as_deref(),
+            Some(&["inject.exe".to_string(), "--flag".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn external_protocol_round_trips() {
+        let mut buf = Vec::new();
+        let image = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        external::write_request(&mut buf, 4321, "c:/decant_interpose.dll", &image, "decant_ready_7")
+            .unwrap();
+        let got = external::read_request(&mut &buf[..]).unwrap();
+        assert_eq!(got.pid, 4321);
+        assert_eq!(got.carafe_path, "c:/decant_interpose.dll");
+        assert_eq!(got.carafe_image, image);
+        assert_eq!(got.ready_token, "decant_ready_7");
     }
 }

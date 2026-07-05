@@ -1,0 +1,13 @@
+[package]
+name = "decant-external-standard"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Example external-process injector: reads the decant external protocol from stdin, OpenProcess by PID, and performs the standard load. Built only for x86_64-pc-windows-gnu."
+
+[[bin]]
+name = "decant-external-standard"
+path = "src/main.rs"
+
+[dependencies]
+decant-inject = { path = "../../crates/decant-inject" }

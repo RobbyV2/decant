@@ -91,6 +91,7 @@ fn exit_code_for(e: &InjectError) -> u8 {
         InjectError::Unsupported(_) => 9,
         InjectError::Plugin(_) => 10,
         InjectError::Config(_) => 11,
+        InjectError::External(_) => 12,
     }
 }
 
@@ -192,6 +193,7 @@ fn main() -> ExitCode {
         let req = InjectionRequest {
             target: ProcessHandle(pi.h_process),
             main_thread: ThreadHandle(pi.h_thread),
+            target_pid: pi.dw_process_id,
             carafe_path: Path::new(&dll_path),
             carafe_image: &[],
             ready: ReadyToken::new(&token),

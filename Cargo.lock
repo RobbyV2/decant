@@ -484,6 +484,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "decant-external-standard"
+version = "0.1.0"
+dependencies = [
+ "decant-inject",
+]
+
+[[package]]
 name = "decant-inject"
 version = "0.1.0"
 dependencies = [

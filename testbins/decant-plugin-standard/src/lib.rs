@@ -26,6 +26,7 @@ pub unsafe extern "system" fn decant_inject(req: *mut DecantInjectRequest) -> i3
     let ir = InjectionRequest {
         target: ProcessHandle(req.target_process),
         main_thread: ThreadHandle(req.main_thread),
+        target_pid: 0,
         carafe_path: std::path::Path::new(&path),
         carafe_image: image,
         ready: ReadyToken::new(token),
