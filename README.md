@@ -199,6 +199,36 @@ a GUI tool into the prefix first with `WINEPREFIX="$PWD/wine-env/prefix" wine in
 then point `run.sh` at its executable. If a window fails to map after an interrupted run,
 reset the prefix with `WINEPREFIX="$PWD/wine-env/prefix" wineserver -k` before relaunching.
 
+### Injection configuration
+
+`decant-launcher.exe` reads an optional TOML file from `DECANT_CONFIG`. If the file is
+absent, the launcher uses the standard method and a 5000 ms ready-token timeout. A malformed
+file fails before the target is resumed.
+
+```toml
+[injection]
+method = "standard"        # standard | manual-map | thread-hijack | plugin | external
+timeout_ms = 5000
+plugin_path = "my_injector.dll"
+external_command = ["my_inject.exe", "--flag"]
+```
+
+Methods:
+
+- `standard`: public-export `CreateRemoteThread` at `kernel32!LoadLibraryA`; this is the default and keeps the version-agnostic guarantee.
+- `manual-map`: maps `decant_interpose.dll` from its image bytes, applies relocations, resolves imports, runs TLS callbacks, and calls the DLL entry point. It reports `LoaderInternals` portability and is verified only by the carafe ready signal.
+- `thread-hijack`: rewrites the suspended main thread context to run a small loader stub, waits for the ready signal, then releases the stub so it restores registers and jumps to the original instruction pointer. It reports `PrologueBytes` portability.
+- `plugin`: loads a PE cdylib from `plugin_path` and calls its `decant_inject` export through the versioned ABI.
+- `external`: starts `external_command`, writes one protocol frame containing the target PID, carafe path, carafe bytes, and ready-token name, then waits for the same ready signal.
+
+Bring-your-own injectors must run PE-side in the same Wine prefix as the launcher. The process
+handle is a wineserver handle, so an arbitrary Linux program cannot use it directly. A plugin
+exports `decant_inject_abi() -> u32` and `decant_inject(*mut DecantInjectRequest) -> i32`; return
+0 after starting the load, and let the harness wait on the ready token. Low-level plugin code can
+reuse `decant_inject::sdk` for remote allocation, read/write, protection changes, remote
+`LoadLibraryA`, remote `GetProcAddress`, and remote-thread start/wait without reaching into Wine
+internals.
+
 ## Limits
 
 memflow reads and writes existing memory and enumerates or resolves. It does not run guest
@@ -235,6 +265,7 @@ surface is the most stable part of Wine, so the DLL runs on any Wine version wit
 tied to Wine's layout.
 
 - Delivery: launcher-driven remote-thread injection (`decant-launcher`). Suspended-create, then `LoadLibrary` via `CreateRemoteThread`, then `DllMain` installs the IAT hooks. The target stays unmodified.
+- Alternative delivery: `manual-map` consumes the carafe image bytes and does not register the DLL in the loader module list; the same ready-token verification confirms hook installation.
 - Limitation: a tool that issues a raw `syscall` instruction, never calling the named `Nt*` export, bypasses export-level interception. Catching it would need Wine-internal syscall-dispatch hooking, which Decant avoids to keep portability.
 
 See the injection and interception, and version-agnosticism sections of [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -256,9 +287,12 @@ with `--target x86_64-pc-windows-gnu`. x86_64 throughout.
 | `crates/decant-cli` | host | user CLI |
 | `crates/decant-wine-harness` | host | launches exes under Wine for `cargo test` |
 | `crates/decant-interpose` | win-gnu (cdylib) | interposer DLL (the carafe), IAT patching |
+| `crates/decant-inject` | host + win-gnu | injection trait, config, ABI, SDK, and shipped injectors |
 | `testbins/guest-target` | win-gnu | sample target for VM tests |
 | `testbins/sample-tool` | win-gnu | stand-in tool for harness tests |
-| `testbins/decant-launcher` | win-gnu | suspended-create and remote-thread DLL injector |
+| `testbins/decant-launcher` | win-gnu | suspended-create injection harness |
+| `testbins/decant-plugin-standard` | win-gnu (cdylib) | example plugin wrapping the standard injector |
+| `testbins/decant-external-standard` | win-gnu | example external command wrapping the standard injector |
 | `testbins/dll-smoke` | win-gnu | loads `hello-dll`, checks the toolchain under Wine |
 | `testbins/hello-dll` | win-gnu (cdylib) | minimal PE32+ DLL exporting `add` |
 | `xtask` | host | build and test orchestration |
@@ -270,7 +304,7 @@ provides an interposer that redirects an unmodified tool's Win32 calls. The memf
 backend is validated against a Windows 10 guest; the interposer vector is documented
 in the injection and interception section of the architecture doc.
 
-79 tests, run offline with no VM.
+The regular test set runs offline with no VM.
 
 ## Testing
 
@@ -279,6 +313,7 @@ Two modes behind one trait: a mock backend offline, and memflow against a VM.
 ```bash
 cargo test               # mock mode: protocol, dispatch, scanner/resolver, CLI; no VM
 cargo xtask wine-smoke   # cross-compile and load a DLL under Wine
+cargo xtask inject-test  # standard, plugin, manual-map, thread-hijack, external, timeout
 cargo test -- --ignored  # VM mode, gated on DECANT_LIVE=1 and a running guest
 ```
 

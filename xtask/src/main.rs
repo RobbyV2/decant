@@ -278,6 +278,56 @@ fn inject_test() -> Result<()> {
     }
 
     std::fs::write(
+        stage.join("manual_map.toml"),
+        "[injection]\nmethod = \"manual-map\"\n",
+    )
+    .context("writing manual-map config")?;
+    let manual_map_env = [
+        ("DECANT_AUTOHOOK", "1"),
+        ("DECANT_CONFIG", "manual_map.toml"),
+    ];
+    let r_manual_map = run_under_wine(
+        &launcher,
+        &["sample-tool.exe", "--inject-test"],
+        &prefix,
+        &manual_map_env,
+    )
+    .context("running manual-map injection")?;
+    println!(
+        "inject-test manual-map injection: stdout={:?}",
+        r_manual_map.stdout.trim()
+    );
+    if !r_manual_map.ok_with("INTERCEPTED") {
+        eprintln!("stderr:\n{}", r_manual_map.stderr);
+        bail!("manual-map injection FAIL: expected INTERCEPTED via the mapped image");
+    }
+
+    std::fs::write(
+        stage.join("thread_hijack.toml"),
+        "[injection]\nmethod = \"thread-hijack\"\n",
+    )
+    .context("writing thread-hijack config")?;
+    let thread_hijack_env = [
+        ("DECANT_AUTOHOOK", "1"),
+        ("DECANT_CONFIG", "thread_hijack.toml"),
+    ];
+    let r_thread_hijack = run_under_wine(
+        &launcher,
+        &["sample-tool.exe", "--inject-test"],
+        &prefix,
+        &thread_hijack_env,
+    )
+    .context("running thread-hijack injection")?;
+    println!(
+        "inject-test thread-hijack injection: stdout={:?}",
+        r_thread_hijack.stdout.trim()
+    );
+    if !r_thread_hijack.ok_with("INTERCEPTED") {
+        eprintln!("stderr:\n{}", r_thread_hijack.stderr);
+        bail!("thread-hijack injection FAIL: expected INTERCEPTED via the hijacked main thread");
+    }
+
+    std::fs::write(
         stage.join("plugin_bad.toml"),
         "[injection]\nmethod = \"plugin\"\nplugin_path = \"decant_interpose.dll\"\n",
     )
@@ -380,7 +430,7 @@ fn inject_test() -> Result<()> {
     }
 
     println!(
-        "inject-test: PASS (standard + plugin + external injection INTERCEPTED via the ready signal; broken carafe times out; baseline passthrough)"
+        "inject-test: PASS (standard + plugin + manual-map + thread-hijack + external injection INTERCEPTED via the ready signal; broken carafe times out; baseline passthrough)"
     );
     Ok(())
 }

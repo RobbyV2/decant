@@ -1,3 +1,5 @@
+#![allow(clippy::missing_safety_doc)]
+
 #[cfg(windows)]
 use decant_inject::{
     DECANT_INJECT_ABI, DecantInjectRequest, InjectionRequest, Injector, ProcessHandle, ReadyToken,

@@ -178,7 +178,7 @@ are members built only with `--target x86_64-pc-windows-gnu`.
 | `testbins/dll-smoke` | win-gnu (exe) | loads `hello-dll`, proves the toolchain under Wine |
 | `testbins/guest-target` | win-gnu | sample target for VM tests |
 | `testbins/sample-tool` | win-gnu | stand-in memory tool for harness tests |
-| `testbins/decant-launcher` | win-gnu | suspended-create and remote-thread DLL injector |
+| `testbins/decant-launcher` | win-gnu | suspended-create injection harness |
 | `xtask` | host | build/test orchestration |
 
 ---
@@ -421,10 +421,10 @@ this is about interception visibility, not power over the guest.
 
 ## 12. Pluggable injection and method-agnostic verification
 
-Section 9 fixes one delivery mechanism into the tool. Injection becomes a capability behind a
+Section 9 fixes one delivery mechanism into the tool. Injection is now a capability behind a
 single trait, so a user can pick a shipped method by config or supply their own against a
-stable boundary. The differentiator is the harness and its verification contract, not any one
-injector.
+stable boundary. The harness and its verification contract are the durable interface; injectors
+are implementations of that interface.
 
 An `Injector` performs only the load: `inject(&InjectionRequest) -> Result<LoadInfo,
 InjectError>`. The harness owns spawning the target suspended and resuming it; an injector
@@ -447,11 +447,22 @@ alive and hooking, it reports. Waiting on the token stays in the harness, so a p
 report "hooks installed" on its own.
 
 Pre-made injectors are selected by config: `[injection] method = "standard" | "manual-map" |
-"plugin" | "external"` with `timeout_ms`. Bring-your-own is a `PluginInjector` that loads a user cdylib
-exporting `decant_inject` against a versioned `#[repr(C)]` ABI (`DECANT_INJECT_ABI`); the host
-resolves the export, checks the ABI version, marshals the request, and maps the result back.
-The plugin returns once the carafe's `DllMain` is reached; the harness still owns the
-ready-token wait.
+"thread-hijack" | "plugin" | "external"` with `timeout_ms`. The standard method is the current
+`LoadLibraryA` remote-thread path. The manual-map method consumes `carafe_image`, maps a PE32+
+image into the suspended tool process, applies base relocations, resolves imports, runs TLS
+callbacks, protects sections, and calls the DLL entry point. Because that image is not registered
+with the Wine loader, the ready-token signal is the only success criterion.
+
+The thread-hijack method rewrites the suspended main thread's instruction pointer to a small
+loader stub. The harness resumes the thread into that stub, waits for the carafe's ready signal,
+then sets a release event; only then does the stub restore the saved register state and jump to
+the original instruction pointer. This method reports `PrologueBytes` portability because it
+lands on injected code bytes, even though it still uses public exports for the loader calls.
+
+Bring-your-own is a `PluginInjector` that loads a user cdylib exporting `decant_inject` against a
+versioned `#[repr(C)]` ABI (`DECANT_INJECT_ABI`); the host resolves the export, checks the ABI
+version, marshals the request, and maps the result back. The plugin returns once the carafe's
+`DllMain` is reached; the harness still owns the ready-token wait.
 
 Injection primitives act on a Windows process handle inside a wineserver prefix, so a
 bring-your-own injector cannot be an arbitrary Linux program; it must run PE-side, in the same
@@ -491,3 +502,8 @@ bring-your-own external command needs no linkage against Decant, only agreement 
 Both boundaries share the same PE-side constraint: an injector acts on a process handle inside a
 wineserver prefix, so it must run as a Windows image in that prefix, not as an arbitrary Linux
 program. Any toolchain targeting Windows qualifies.
+
+The Windows-only `decant_inject::sdk` module exposes the public-export primitives used by the
+shipped methods: remote allocation, read, write, protection changes, remote thread start and wait,
+remote `LoadLibraryA`, remote `GetProcAddress`, and a small remote-call helper. Plugin authors can
+compose APC or thread-control methods against this surface without binding to Wine internals.

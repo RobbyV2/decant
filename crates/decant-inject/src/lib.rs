@@ -1,3 +1,5 @@
+#![allow(clippy::manual_c_str_literals, clippy::missing_safety_doc)]
+
 use std::ffi::c_void;
 use std::fmt;
 use std::path::Path;
@@ -71,11 +73,15 @@ pub struct LoadInfo {
 #[derive(Debug)]
 pub enum InjectError {
     RemoteAlloc(u32),
+    RemoteRead(u32),
     RemoteWrite(u32),
+    RemoteProtect(u32),
     ResolveLoadLibrary,
     RemoteThread(u32),
     Timeout,
     Unsupported(String),
+    ManualMap(String),
+    ThreadHijack(String),
     Plugin(String),
     External(String),
     Config(String),
@@ -85,11 +91,15 @@ impl fmt::Display for InjectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             InjectError::RemoteAlloc(e) => write!(f, "remote allocation failed (err={e})"),
+            InjectError::RemoteRead(e) => write!(f, "remote read failed (err={e})"),
             InjectError::RemoteWrite(e) => write!(f, "remote write failed (err={e})"),
+            InjectError::RemoteProtect(e) => write!(f, "remote protection change failed (err={e})"),
             InjectError::ResolveLoadLibrary => write!(f, "could not resolve kernel32!LoadLibraryA"),
             InjectError::RemoteThread(e) => write!(f, "remote thread creation failed (err={e})"),
             InjectError::Timeout => write!(f, "carafe did not signal ready before the timeout"),
             InjectError::Unsupported(m) => write!(f, "unsupported: {m}"),
+            InjectError::ManualMap(m) => write!(f, "manual-map: {m}"),
+            InjectError::ThreadHijack(m) => write!(f, "thread-hijack: {m}"),
             InjectError::Plugin(m) => write!(f, "plugin: {m}"),
             InjectError::External(m) => write!(f, "external: {m}"),
             InjectError::Config(m) => write!(f, "config: {m}"),
@@ -108,7 +118,7 @@ pub trait Injector {
 // Wire format for the external-process method: the harness writes one frame to
 // the user command's stdin, the command reads it and performs the load out of
 // process. Length-prefixed and platform-agnostic so both ends share this code
-// and it round-trips in host tests. carafe_image is empty for path-based loads.
+// and it round-trips in host tests.
 pub mod external {
     use std::io::{self, Cursor, Read, Write};
 
@@ -231,45 +241,21 @@ impl InjectionConfig {
 }
 
 #[cfg(windows)]
-mod win32 {
-    use std::ffi::c_void;
+pub mod sdk;
 
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        pub fn VirtualAllocEx(
-            process: *mut c_void,
-            address: *mut c_void,
-            size: usize,
-            allocation_type: u32,
-            protect: u32,
-        ) -> *mut c_void;
-        pub fn WriteProcessMemory(
-            process: *mut c_void,
-            base_address: *mut c_void,
-            buffer: *const c_void,
-            size: usize,
-            written: *mut usize,
-        ) -> i32;
-        pub fn CreateRemoteThread(
-            process: *mut c_void,
-            thread_attributes: *const c_void,
-            stack_size: usize,
-            start_address: *mut c_void,
-            parameter: *mut c_void,
-            creation_flags: u32,
-            thread_id: *mut u32,
-        ) -> *mut c_void;
-        pub fn GetModuleHandleA(module_name: *const u8) -> *mut c_void;
-        pub fn GetProcAddress(module: *mut c_void, proc_name: *const u8) -> *mut c_void;
-        pub fn LoadLibraryA(file_name: *const u8) -> *mut c_void;
-        pub fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
-        pub fn CloseHandle(object: *mut c_void) -> i32;
-        pub fn GetLastError() -> u32;
-    }
+#[cfg(windows)]
+mod manual_map;
 
-    pub const MEM_COMMIT_RESERVE: u32 = 0x0000_1000 | 0x0000_2000;
-    pub const PAGE_READWRITE: u32 = 0x04;
-    pub const INFINITE: u32 = 0xFFFF_FFFF;
+#[cfg(windows)]
+mod thread_hijack;
+
+#[cfg(windows)]
+pub use manual_map::ManualMapInjector;
+#[cfg(windows)]
+pub use thread_hijack::ThreadHijackInjector;
+
+pub fn thread_hijack_release_event_name(ready_name: &str) -> String {
+    format!("{ready_name}_release")
 }
 
 // Public-exports-only remote-thread LoadLibrary. Binds to documented kernel32
@@ -288,57 +274,21 @@ impl Injector for StandardInjector {
     }
 
     fn inject(&self, req: &InjectionRequest) -> Result<LoadInfo, InjectError> {
-        use win32::*;
-
         let mut path_bytes = req.carafe_path.to_string_lossy().into_owned().into_bytes();
         path_bytes.push(0);
 
         unsafe {
             let proc = req.target.0;
-            let remote = VirtualAllocEx(
-                proc,
-                std::ptr::null_mut(),
-                path_bytes.len(),
-                MEM_COMMIT_RESERVE,
-                PAGE_READWRITE,
-            );
-            if remote.is_null() {
-                return Err(InjectError::RemoteAlloc(GetLastError()));
-            }
+            let remote = sdk::alloc(proc, path_bytes.len(), sdk::PAGE_READWRITE)?;
+            sdk::write(proc, remote, &path_bytes)?;
 
-            let mut written = 0usize;
-            if WriteProcessMemory(
-                proc,
-                remote,
-                path_bytes.as_ptr() as *const c_void,
-                path_bytes.len(),
-                &mut written,
-            ) == 0
-            {
-                return Err(InjectError::RemoteWrite(GetLastError()));
-            }
-
-            let kernel32 = GetModuleHandleA(b"kernel32.dll\0".as_ptr());
-            let load_library = GetProcAddress(kernel32, b"LoadLibraryA\0".as_ptr());
+            let kernel32 = sdk::raw::GetModuleHandleA(b"kernel32.dll\0".as_ptr());
+            let load_library = sdk::raw::GetProcAddress(kernel32, b"LoadLibraryA\0".as_ptr());
             if load_library.is_null() {
                 return Err(InjectError::ResolveLoadLibrary);
             }
 
-            let thread = CreateRemoteThread(
-                proc,
-                std::ptr::null(),
-                0,
-                load_library,
-                remote,
-                0,
-                std::ptr::null_mut(),
-            );
-            if thread.is_null() {
-                return Err(InjectError::RemoteThread(GetLastError()));
-            }
-
-            WaitForSingleObject(thread, INFINITE);
-            CloseHandle(thread);
+            sdk::create_remote_thread_and_wait(proc, load_library, remote)?;
 
             Ok(LoadInfo {
                 method: self.name().to_string(),
@@ -391,8 +341,6 @@ impl Injector for PluginInjector {
     }
 
     fn inject(&self, req: &InjectionRequest) -> Result<LoadInfo, InjectError> {
-        use win32::*;
-
         type AbiFn = unsafe extern "system" fn() -> u32;
         type InjectFn = unsafe extern "system" fn(*mut DecantInjectRequest) -> i32;
 
@@ -403,16 +351,16 @@ impl Injector for PluginInjector {
         let token_w = wide_z(&req.ready.name);
 
         unsafe {
-            let lib = LoadLibraryA(lib_path.as_ptr());
+            let lib = sdk::raw::LoadLibraryA(lib_path.as_ptr());
             if lib.is_null() {
                 return Err(InjectError::Plugin(format!(
                     "loading plugin {} failed (err={}); a plugin must be a PE cdylib in this Wine prefix",
                     self.path.display(),
-                    GetLastError()
+                    sdk::raw::GetLastError()
                 )));
             }
 
-            let abi_sym = GetProcAddress(lib, b"decant_inject_abi\0".as_ptr());
+            let abi_sym = sdk::raw::GetProcAddress(lib, b"decant_inject_abi\0".as_ptr());
             if abi_sym.is_null() {
                 return Err(InjectError::Plugin(
                     "plugin missing export 'decant_inject_abi'".into(),
@@ -425,7 +373,7 @@ impl Injector for PluginInjector {
                 )));
             }
 
-            let inject_sym = GetProcAddress(lib, b"decant_inject\0".as_ptr());
+            let inject_sym = sdk::raw::GetProcAddress(lib, b"decant_inject\0".as_ptr());
             if inject_sym.is_null() {
                 return Err(InjectError::Plugin(
                     "plugin missing export 'decant_inject'".into(),
@@ -532,8 +480,8 @@ impl InjectionConfig {
     pub fn injector(&self) -> Result<Box<dyn Injector>, InjectError> {
         match self.method {
             Method::Standard => Ok(Box::new(StandardInjector)),
-            Method::ManualMap => Err(InjectError::Unsupported("manual-map".into())),
-            Method::ThreadHijack => Err(InjectError::Unsupported("thread-hijack".into())),
+            Method::ManualMap => Ok(Box::new(ManualMapInjector)),
+            Method::ThreadHijack => Ok(Box::new(ThreadHijackInjector)),
             Method::Plugin => match &self.plugin_path {
                 Some(p) => Ok(Box::new(PluginInjector { path: p.clone() })),
                 None => Err(InjectError::Config(

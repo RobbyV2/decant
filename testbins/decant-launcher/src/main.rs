@@ -1,9 +1,12 @@
+#![allow(clippy::manual_c_str_literals)]
+
 use std::ffi::c_void;
 use std::path::Path;
 use std::process::ExitCode;
 
 use decant_inject::{
-    InjectError, InjectionConfig, InjectionRequest, ProcessHandle, ReadyToken, ThreadHandle,
+    InjectError, InjectionConfig, InjectionRequest, Method, ProcessHandle, ReadyToken,
+    ThreadHandle, thread_hijack_release_event_name,
 };
 
 type Handle = *mut c_void;
@@ -65,6 +68,7 @@ unsafe extern "system" {
         initial_state: i32,
         name: *const u8,
     ) -> Handle;
+    fn SetEvent(handle: Handle) -> i32;
     fn SetEnvironmentVariableA(name: *const u8, value: *const u8) -> i32;
     fn TerminateProcess(process: Handle, exit_code: u32) -> i32;
 }
@@ -84,11 +88,15 @@ fn wide(s: &str) -> Vec<u16> {
 fn exit_code_for(e: &InjectError) -> u8 {
     match e {
         InjectError::RemoteAlloc(_) => 3,
+        InjectError::RemoteRead(_) => 13,
         InjectError::RemoteWrite(_) => 4,
+        InjectError::RemoteProtect(_) => 14,
         InjectError::ResolveLoadLibrary => 5,
         InjectError::RemoteThread(_) => 6,
         InjectError::Timeout => 8,
         InjectError::Unsupported(_) => 9,
+        InjectError::ManualMap(_) => 15,
+        InjectError::ThreadHijack(_) => 16,
         InjectError::Plugin(_) => 10,
         InjectError::Config(_) => 11,
         InjectError::External(_) => 12,
@@ -153,6 +161,14 @@ fn main() -> ExitCode {
         );
     }
 
+    let carafe_image = match std::fs::read(&dll_path) {
+        Ok(image) => image,
+        Err(e) => {
+            eprintln!("launcher: reading {dll_path}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
     let token = format!("decant_ready_{}", std::process::id());
     let mut token_c = token.clone().into_bytes();
     token_c.push(0);
@@ -164,6 +180,23 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         SetEnvironmentVariableA(b"DECANT_READY_EVENT\0".as_ptr(), token_c.as_ptr());
+        let release = match cfg.method {
+            Method::ThreadHijack => {
+                let mut release_c = thread_hijack_release_event_name(&token).into_bytes();
+                release_c.push(0);
+                let h = CreateEventA(std::ptr::null(), 1, 0, release_c.as_ptr());
+                if h.is_null() {
+                    eprintln!(
+                        "launcher: CreateEventA(thread-hijack release) failed (err={})",
+                        GetLastError()
+                    );
+                    CloseHandle(ready);
+                    return ExitCode::from(2);
+                }
+                h
+            }
+            _ => std::ptr::null_mut(),
+        };
 
         let mut si: StartupInfoW = std::mem::zeroed();
         si.cb = std::mem::size_of::<StartupInfoW>() as u32;
@@ -195,7 +228,7 @@ fn main() -> ExitCode {
             main_thread: ThreadHandle(pi.h_thread),
             target_pid: pi.dw_process_id,
             carafe_path: Path::new(&dll_path),
-            carafe_image: &[],
+            carafe_image: &carafe_image,
             ready: ReadyToken::new(&token),
         };
 
@@ -204,8 +237,26 @@ fn main() -> ExitCode {
             Err(e) => {
                 eprintln!("launcher: injection failed: {e}");
                 TerminateProcess(pi.h_process, 1);
+                if !release.is_null() {
+                    CloseHandle(release);
+                }
                 return ExitCode::from(exit_code_for(&e));
             }
+        }
+
+        if cfg.method == Method::ThreadHijack && ResumeThread(pi.h_thread) == u32::MAX {
+            eprintln!(
+                "launcher: ResumeThread(thread-hijack loader) failed (err={})",
+                GetLastError()
+            );
+            TerminateProcess(pi.h_process, 1);
+            CloseHandle(ready);
+            if !release.is_null() {
+                CloseHandle(release);
+            }
+            CloseHandle(pi.h_thread);
+            CloseHandle(pi.h_process);
+            return ExitCode::from(7);
         }
 
         if WaitForSingleObject(ready, cfg.timeout_ms) != WAIT_OBJECT_0 {
@@ -213,15 +264,36 @@ fn main() -> ExitCode {
             eprintln!("launcher: {e}");
             TerminateProcess(pi.h_process, 1);
             CloseHandle(ready);
+            if !release.is_null() {
+                CloseHandle(release);
+            }
             CloseHandle(pi.h_thread);
             CloseHandle(pi.h_process);
             return ExitCode::from(exit_code_for(&e));
         }
         CloseHandle(ready);
 
-        if ResumeThread(pi.h_thread) == u32::MAX {
-            eprintln!("launcher: ResumeThread failed (err={})", GetLastError());
-            return ExitCode::from(7);
+        match cfg.method {
+            Method::ThreadHijack => {
+                if SetEvent(release) == 0 {
+                    eprintln!(
+                        "launcher: SetEvent(thread-hijack release) failed (err={})",
+                        GetLastError()
+                    );
+                    TerminateProcess(pi.h_process, 1);
+                    CloseHandle(release);
+                    CloseHandle(pi.h_thread);
+                    CloseHandle(pi.h_process);
+                    return ExitCode::from(7);
+                }
+                CloseHandle(release);
+            }
+            _ => {
+                if ResumeThread(pi.h_thread) == u32::MAX {
+                    eprintln!("launcher: ResumeThread failed (err={})", GetLastError());
+                    return ExitCode::from(7);
+                }
+            }
         }
 
         WaitForSingleObject(pi.h_process, INFINITE);
