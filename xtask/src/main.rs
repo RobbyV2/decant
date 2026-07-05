@@ -242,8 +242,34 @@ fn inject_test() -> Result<()> {
         bail!("launcher injection FAIL: expected INTERCEPTED on the unmodified tool");
     }
 
+    std::fs::write(stage.join("fault.toml"), "[injection]\ntimeout_ms = 500\n")
+        .context("writing fault config")?;
+    let fault = [
+        ("DECANT_AUTOHOOK", "1"),
+        ("DECANT_FAULT", "nohooks"),
+        ("DECANT_CONFIG", "fault.toml"),
+    ];
+    let r3 = run_under_wine(
+        &launcher,
+        &["sample-tool.exe", "--inject-test"],
+        &prefix,
+        &fault,
+    )
+    .context("running broken-carafe timeout")?;
     println!(
-        "inject-test: PASS (cooperative bootstrap + launcher injection both INTERCEPTED; baseline passthrough)"
+        "inject-test broken carafe: status={} stderr={:?}",
+        r3.status,
+        r3.stderr.trim()
+    );
+    if r3.status != 8 {
+        bail!(
+            "broken-carafe FAIL: expected the harness to time out (exit 8), got exit {}",
+            r3.status
+        );
+    }
+
+    println!(
+        "inject-test: PASS (launcher injection INTERCEPTED via the ready signal; broken carafe times out; baseline passthrough)"
     );
     Ok(())
 }

@@ -59,9 +59,18 @@ unsafe extern "system" {
     fn GetStdHandle(std_handle: i32) -> Handle;
     fn CloseHandle(object: Handle) -> i32;
     fn GetLastError() -> u32;
+    fn CreateEventA(
+        attributes: *const c_void,
+        manual_reset: i32,
+        initial_state: i32,
+        name: *const u8,
+    ) -> Handle;
+    fn SetEnvironmentVariableA(name: *const u8, value: *const u8) -> i32;
+    fn TerminateProcess(process: Handle, exit_code: u32) -> i32;
 }
 
 const CREATE_SUSPENDED: u32 = 0x0000_0004;
+const WAIT_OBJECT_0: u32 = 0;
 const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
 const STD_INPUT: i32 = -10;
 const STD_OUTPUT: i32 = -11;
@@ -143,7 +152,18 @@ fn main() -> ExitCode {
         );
     }
 
+    let token = format!("decant_ready_{}", std::process::id());
+    let mut token_c = token.clone().into_bytes();
+    token_c.push(0);
+
     unsafe {
+        let ready = CreateEventA(std::ptr::null(), 1, 0, token_c.as_ptr());
+        if ready.is_null() {
+            eprintln!("launcher: CreateEventA failed (err={})", GetLastError());
+            return ExitCode::from(2);
+        }
+        SetEnvironmentVariableA(b"DECANT_READY_EVENT\0".as_ptr(), token_c.as_ptr());
+
         let mut si: StartupInfoW = std::mem::zeroed();
         si.cb = std::mem::size_of::<StartupInfoW>() as u32;
         si.dw_flags = STARTF_USESTDHANDLES;
@@ -174,16 +194,28 @@ fn main() -> ExitCode {
             main_thread: ThreadHandle(pi.h_thread),
             carafe_path: Path::new(&dll_path),
             carafe_image: &[],
-            ready: ReadyToken::none(),
+            ready: ReadyToken::new(&token),
         };
 
         match injector.inject(&req) {
             Ok(_) => {}
             Err(e) => {
                 eprintln!("launcher: injection failed: {e}");
+                TerminateProcess(pi.h_process, 1);
                 return ExitCode::from(exit_code_for(&e));
             }
         }
+
+        if WaitForSingleObject(ready, cfg.timeout_ms) != WAIT_OBJECT_0 {
+            let e = InjectError::Timeout;
+            eprintln!("launcher: {e}");
+            TerminateProcess(pi.h_process, 1);
+            CloseHandle(ready);
+            CloseHandle(pi.h_thread);
+            CloseHandle(pi.h_process);
+            return ExitCode::from(exit_code_for(&e));
+        }
+        CloseHandle(ready);
 
         if ResumeThread(pi.h_thread) == u32::MAX {
             eprintln!("launcher: ResumeThread failed (err={})", GetLastError());
