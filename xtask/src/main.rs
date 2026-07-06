@@ -17,7 +17,6 @@ const WIN_CRATES: &[&str] = &[
     "decant-external-standard",
     "dll-smoke",
     "hello-dll",
-    "guest-inject-fixture",
 ];
 
 fn main() -> ExitCode {
@@ -171,22 +170,16 @@ fn wine_smoke() -> Result<()> {
 fn guest_inject_fixture() -> Result<()> {
     let root = repo_root();
 
-    let mut build = cargo();
-    build.args([
-        "build",
-        "--target",
-        WIN_TARGET,
-        "-p",
-        "guest-inject-fixture",
-    ]);
-    run("cargo build guest-inject-fixture", &mut build)?;
+    let artifacts = build_guest_inject_fixture_artifacts(&root)?;
+    let exe = artifacts.exe;
+    let _ = artifacts
+        .payloads
+        .first()
+        .ok_or_else(|| anyhow!("guest fixture built no payload DLLs"))?;
 
     setup()?;
 
-    let out_dir = root.join("target").join(WIN_TARGET).join("debug");
-    let dll = out_dir.join("guest_inject_probe.dll");
-    let exe = out_dir.join("guest-inject-target.exe");
-    for artifact in [&dll, &exe] {
+    for artifact in std::iter::once(&exe).chain(artifacts.payloads.iter()) {
         if !artifact.exists() {
             bail!("expected build artifact missing: {}", artifact.display());
         }
@@ -195,8 +188,13 @@ fn guest_inject_fixture() -> Result<()> {
     let stage = root.join("target").join("guest-inject-fixture");
     std::fs::create_dir_all(&stage)
         .with_context(|| format!("creating staging dir {}", stage.display()))?;
-    std::fs::copy(&dll, stage.join("guest_inject_probe.dll"))
-        .context("staging guest_inject_probe.dll")?;
+    for payload in &artifacts.payloads {
+        let name = payload
+            .file_name()
+            .ok_or_else(|| anyhow!("payload has no file name: {}", payload.display()))?;
+        std::fs::copy(payload, stage.join(name))
+            .with_context(|| format!("staging {}", payload.display()))?;
+    }
     std::fs::copy(&exe, stage.join("guest-inject-target.exe"))
         .context("staging guest-inject-target.exe")?;
 
@@ -217,7 +215,9 @@ fn guest_inject_fixture() -> Result<()> {
     if out.ok_with("guest-inject-target: self-load PASS") {
         println!("guest-inject-fixture: PASS");
         println!("guest-inject-fixture: exe={}", exe.display());
-        println!("guest-inject-fixture: dll={}", dll.display());
+        for payload in artifacts.payloads {
+            println!("guest-inject-fixture: dll={}", payload.display());
+        }
         Ok(())
     } else {
         if !out.stderr.trim().is_empty() {
@@ -225,6 +225,271 @@ fn guest_inject_fixture() -> Result<()> {
         }
         bail!("guest-inject-fixture: FAIL");
     }
+}
+
+struct GuestInjectFixtureArtifacts {
+    exe: PathBuf,
+    payloads: Vec<PathBuf>,
+}
+
+fn build_guest_inject_fixture_artifacts(root: &Path) -> Result<GuestInjectFixtureArtifacts> {
+    let native = root
+        .join("testbins")
+        .join("guest-inject-fixture")
+        .join("native");
+    let out_dir = root.join("target").join(WIN_TARGET).join("debug");
+    std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+
+    let exe = out_dir.join("guest-inject-target.exe");
+
+    let mut target = Command::new("x86_64-w64-mingw32-gcc");
+    target
+        .current_dir(root)
+        .args([
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Os",
+            "-ffreestanding",
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-nostdlib",
+            "-Wl,-e,mainCRTStartup",
+            "-Wl,--subsystem,console",
+            "-o",
+        ])
+        .arg(&exe)
+        .arg(native.join("target.c"))
+        .arg("-lkernel32");
+    run("build guest-inject-target.exe", &mut target)?;
+
+    let payloads = vec![
+        build_guest_payload(root, &native, &out_dir, "guest_inject_probe.dll", &[])?,
+        build_guest_payload(
+            root,
+            &native,
+            &out_dir,
+            "guest_inject_imports.dll",
+            &[
+                ("DECANT_PAYLOAD_TEXT", "\"decant imports ok\""),
+                ("DECANT_PAYLOAD_IMPORT_STRESS", "1"),
+            ],
+        )?,
+        build_guest_payload(
+            root,
+            &native,
+            &out_dir,
+            "guest_inject_tls.dll",
+            &[
+                ("DECANT_PAYLOAD_TEXT", "\"decant tls ok\""),
+                ("DECANT_PAYLOAD_TLS_CALLBACK", "1"),
+            ],
+        )?,
+        build_guest_rust_payload(root, &out_dir)?,
+    ];
+
+    assert_pe_has_data_directory(&payloads[2], 9, "TLS")?;
+
+    Ok(GuestInjectFixtureArtifacts { exe, payloads })
+}
+
+fn build_guest_payload(
+    root: &Path,
+    native: &Path,
+    out_dir: &Path,
+    name: &str,
+    defines: &[(&str, &str)],
+) -> Result<PathBuf> {
+    let dll = out_dir.join(name);
+    let mut payload = Command::new("x86_64-w64-mingw32-gcc");
+    payload
+        .current_dir(root)
+        .args([
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Os",
+            "-ffreestanding",
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-nostdlib",
+            "-shared",
+            "-Wl,-e,DllMain",
+            "-o",
+        ])
+        .arg(&dll)
+        .arg(native.join("payload.c"))
+        .arg("-lkernel32");
+    for (key, value) in defines {
+        payload.arg(format!("-D{key}={value}"));
+    }
+    run(&format!("build {name}"), &mut payload)?;
+    assert_pe_has_dir64_relocation(&dll)?;
+
+    Ok(dll)
+}
+
+fn build_guest_rust_payload(root: &Path, out_dir: &Path) -> Result<PathBuf> {
+    let mut build = cargo();
+    build.args([
+        "build",
+        "--target",
+        WIN_TARGET,
+        "-p",
+        "guest-inject-fixture",
+    ]);
+    run("build guest-inject rust payload", &mut build)?;
+
+    let built = root
+        .join("target")
+        .join(WIN_TARGET)
+        .join("debug")
+        .join("guest_inject_fixture.dll");
+    let staged = out_dir.join("guest_inject_rust.dll");
+    std::fs::copy(&built, &staged)
+        .with_context(|| format!("copying {} to {}", built.display(), staged.display()))?;
+    assert_pe_has_dir64_relocation(&staged)?;
+    Ok(staged)
+}
+
+fn assert_pe_has_dir64_relocation(path: &Path) -> Result<()> {
+    const IMAGE_DIRECTORY_ENTRY_BASERELOC: usize = 5;
+    const IMAGE_REL_BASED_DIR64: u16 = 10;
+
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    if read_u16(&bytes, 0)? != 0x5A4D {
+        bail!("{} is not an MZ image", path.display());
+    }
+    let nt = read_u32(&bytes, 0x3C)? as usize;
+    if read_u32(&bytes, nt)? != 0x0000_4550 {
+        bail!("{} is not a PE image", path.display());
+    }
+    let file = nt + 4;
+    let section_count = read_u16(&bytes, file + 2)? as usize;
+    let optional_size = read_u16(&bytes, file + 16)? as usize;
+    let opt = file + 20;
+    if read_u16(&bytes, opt)? != 0x20B {
+        bail!("{} is not a PE32+ image", path.display());
+    }
+    let dir_count = read_u32(&bytes, opt + 108)? as usize;
+    if dir_count <= IMAGE_DIRECTORY_ENTRY_BASERELOC {
+        bail!("{} has no base relocation data directory", path.display());
+    }
+    let reloc_dir = opt + 112 + IMAGE_DIRECTORY_ENTRY_BASERELOC * 8;
+    let reloc_rva = read_u32(&bytes, reloc_dir)?;
+    let reloc_size = read_u32(&bytes, reloc_dir + 4)?;
+    if reloc_rva == 0 || reloc_size < 8 {
+        bail!(
+            "{} must keep a base relocation directory for fallback-base manual-map tests",
+            path.display()
+        );
+    }
+
+    let section_table = opt + optional_size;
+    let reloc_file = rva_to_file_offset(&bytes, section_table, section_count, reloc_rva)?;
+    let end = reloc_file
+        .checked_add(reloc_size as usize)
+        .ok_or_else(|| anyhow!("relocation directory size overflows"))?;
+    if end > bytes.len() {
+        bail!(
+            "{} relocation directory exceeds file bounds",
+            path.display()
+        );
+    }
+
+    let mut pos = reloc_file;
+    let mut has_dir64 = false;
+    while pos + 8 <= end {
+        let block_size = read_u32(&bytes, pos + 4)? as usize;
+        if block_size < 8 || pos + block_size > end {
+            bail!("{} has an invalid relocation block", path.display());
+        }
+        let entries = (block_size - 8) / 2;
+        pos += 8;
+        for i in 0..entries {
+            let entry = read_u16(&bytes, pos + i * 2)?;
+            if entry >> 12 == IMAGE_REL_BASED_DIR64 {
+                has_dir64 = true;
+            }
+        }
+        pos += entries * 2;
+    }
+    if !has_dir64 {
+        bail!(
+            "{} must contain at least one DIR64 base relocation",
+            path.display()
+        );
+    }
+    println!("guest-inject-fixture: dll reloc rva=0x{reloc_rva:x} size=0x{reloc_size:x}");
+    Ok(())
+}
+
+fn assert_pe_has_data_directory(path: &Path, index: usize, name: &str) -> Result<()> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    if read_u16(&bytes, 0)? != 0x5A4D {
+        bail!("{} is not an MZ image", path.display());
+    }
+    let nt = read_u32(&bytes, 0x3C)? as usize;
+    if read_u32(&bytes, nt)? != 0x0000_4550 {
+        bail!("{} is not a PE image", path.display());
+    }
+    let file = nt + 4;
+    let opt = file + 20;
+    if read_u16(&bytes, opt)? != 0x20B {
+        bail!("{} is not a PE32+ image", path.display());
+    }
+    let dir_count = read_u32(&bytes, opt + 108)? as usize;
+    if dir_count <= index {
+        bail!("{} has no {name} data directory", path.display());
+    }
+    let dir = opt + 112 + index * 8;
+    let rva = read_u32(&bytes, dir)?;
+    let size = read_u32(&bytes, dir + 4)?;
+    if rva == 0 || size == 0 {
+        bail!("{} has an empty {name} data directory", path.display());
+    }
+    println!("guest-inject-fixture: {name} dir rva=0x{rva:x} size=0x{size:x}");
+    Ok(())
+}
+
+fn rva_to_file_offset(
+    bytes: &[u8],
+    section_table: usize,
+    section_count: usize,
+    rva: u32,
+) -> Result<usize> {
+    for i in 0..section_count {
+        let off = section_table + i * 40;
+        let virtual_size = read_u32(bytes, off + 8)?;
+        let virtual_address = read_u32(bytes, off + 12)?;
+        let raw_size = read_u32(bytes, off + 16)?;
+        let raw_ptr = read_u32(bytes, off + 20)?;
+        let span = virtual_size.max(raw_size);
+        if rva >= virtual_address && rva < virtual_address + span {
+            return Ok((raw_ptr + (rva - virtual_address)) as usize);
+        }
+    }
+    bail!("RVA 0x{rva:x} is not covered by any section")
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
+    let end = offset
+        .checked_add(2)
+        .ok_or_else(|| anyhow!("offset overflow"))?;
+    let raw = bytes
+        .get(offset..end)
+        .ok_or_else(|| anyhow!("short PE read at offset 0x{offset:x}"))?;
+    Ok(u16::from_le_bytes(raw.try_into().unwrap()))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| anyhow!("offset overflow"))?;
+    let raw = bytes
+        .get(offset..end)
+        .ok_or_else(|| anyhow!("short PE read at offset 0x{offset:x}"))?;
+    Ok(u32::from_le_bytes(raw.try_into().unwrap()))
 }
 
 fn inject_test() -> Result<()> {

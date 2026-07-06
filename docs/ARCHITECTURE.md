@@ -38,8 +38,10 @@ outside via [memflow](https://github.com/memflow/memflow).
   └────────────────────────────────────────────────────────────────┘
 ```
 
-- **The guest**: the Windows VM and its `target.exe`. Decant reads and writes its
-  memory from outside, never runs code in it (section 3).
+- **The guest**: the Windows VM and its `target.exe`. The interposed tool API reads
+  and writes its memory from outside. Explicit guest injection is a separate domain
+  where the daemon maps DLL bytes and invokes the payload through a configured guest
+  execution method (section 3).
 - **The cellar** (`decant-daemon`): a host-side TCP server owning the active
   `MemoryBackend` and dispatching `decant-protocol` requests to it; `--backend mock`
   (default, no VM) or `memflow` (VM).
@@ -75,8 +77,9 @@ fn memory_map(&self, pid: Pid) -> Result<Vec<MemRegion>>;
 
 The [`Request`/`Response`](../crates/decant-protocol/src/lib.rs) wire enums mirror these
 one-to-one. Translate the nine once and every Win32 API above them is handled; an exotic
-toolhelp/psapi combination still bottoms out in read, query, or enumerate. Anything
-requiring the guest to execute code does not fit, and is not simulated (section 3).
+toolhelp/psapi combination still bottoms out in read, query, or enumerate. Anything requiring
+arbitrary tool-initiated guest execution does not fit this interface and is not simulated
+(section 3). Guest DLL mapping uses the separate guest injection request type.
 
 ---
 
@@ -90,13 +93,16 @@ exposes it. Two consequences:
    the carafe lives in the Wine-hosted tool. They are separate processes bridged only by
    TCP; that split is why a daemon exists.
 
-2. **Unsupported operations.** memflow reads and writes guest memory and enumerates
-   processes, modules, and exports, but cannot run guest code: no `VirtualAllocEx`,
-   `CreateRemoteThread`, DLL injection into the target, or calling a guest function. A
-   request needing guest execution returns `ProtoError::Unsupported { op }`
-   (`BackendError::Unsupported` on the backend side) and increments
-   `Diagnostics::unsupported_ops`, never a false success. Read, write, scan, and
-   pointer-resolve are supported.
+2. **Tool API unsupported operations.** The Wine-hosted tool sees a synthetic process handle.
+   Through that handle, Decant exposes guest read/write, scan, module/export lookup, and
+   pointer resolution. It does not translate arbitrary tool-initiated process-control calls into
+   guest execution: `VirtualAllocEx`, `CreateRemoteThread`, DLL injection, and direct guest
+   function calls return `ProtoError::Unsupported { op }` (`BackendError::Unsupported` on the
+   backend side) and increment `Diagnostics::unsupported_ops`, never a false success. Explicit
+   no-guest-software DLL injection is a separate `decant-cli guest-inject` path with its own
+   method/capability contract; it is not exposed through the synthetic handle. The implemented
+   guest method maps DLL bytes and invokes the payload through an IAT-hook call in the selected
+   target.
 
 The synthetic process handle services the full handle tail. `OpenProcess` mints it; then
 `ReadProcessMemory`/`WriteProcessMemory`, `CloseHandle`/`NtClose`, `DuplicateHandle`,
@@ -121,8 +127,8 @@ handle Decant never mints), so neither is expressible against the guest. Interce
 them would only break the tool's local use.
 
 The carafe is injected into the Wine-hosted tool, which is host-side process
-manipulation; the no-execution limit is about the *guest VM*, which memflow cannot inject
-into.
+manipulation. Guest DLL injection is only performed by the explicit guest injection domain,
+where the daemon accepts a DLL byte image and applies the guest mapper/execution policy.
 
 ---
 
@@ -262,6 +268,15 @@ Operational facts for running against a guest:
   module for lower overhead; it needs root and takes the qemu process PID as its arg. Both
   pass the arg as memflow's **default (unnamed) arg**; a `pid=` *named* arg fails
   `Error(Connector, ArgValidation)`.
+- These arg shapes are not interchangeable. For qemu, run with a VM name:
+  `DECANT_CONNECTOR_ARGS=<vm-name> decant-daemon --backend memflow --connector qemu`.
+  For kvm, run with the qemu PID:
+  `DECANT_CONNECTOR_ARGS=$(pgrep -f 'guest=<vm-name>') sudo -E decant-daemon --backend memflow --connector kvm`.
+  If qemu finds the qemu process and memory map but memflow-win32 then fails with
+  `unable to find dtb`, the daemon exits before binding its TCP port. That is a connector
+  and Windows-OS-layer startup failure, not a target-process failure. KVM may still work
+  on the same guest, or the operator can provide memflow-win32 hints through
+  `DECANT_OS_ARGS=':arch=x64,dtb=<hex-dtb-without-0x>,kernel_hint=<hex-va-without-0x>'`.
 - The plugin ABI is the integer `MEMFLOW_PLUGIN_VERSION` (`=1`), not the crate version, so
   a `memflow` 0.2.4 core loads 0.2.1 plugins.
 - `MEMFLOW_PLUGIN_PATH` must point at the directory holding the
@@ -275,7 +290,9 @@ memflow handles take `&mut self` and are not `Sync`, while `MemoryBackend` is `&
 process per pid (an owned `os.clone().into_process_by_pid`, refreshed on pid change)
 rather than re-resolving every read and rebuilding the address translation; the daemon
 sets `TCP_NODELAY` on accepted connections. Together these keep a multi-region scan
-interactive.
+interactive. If a write fails after guest-side allocation, the backend clears that cached
+process view and retries; large writes fall back to page-sized chunks so newly materialized
+pages are addressed through fresh translation state.
 
 Install the plugins on the VM host (x86_64 Linux):
 
@@ -492,6 +509,117 @@ timeout_ms = 5000          # ready-token wait before the harness kills the targe
 plugin_path = "my_injector.dll"          # required for method = "plugin"
 external_command = ["my_inject.exe", "--flag"]   # required for method = "external"
 ```
+
+No-guest-software DLL mapping uses the same config model with `domain = "guest"`. The guest
+target can be a concrete `pid`, or a `process` name plus `process_pattern`; the optional pattern
+is a generic hex signature with `?`/`??` wildcards and is resolved by the daemon immediately
+before injection.
+
+```toml
+[injection]
+domain = "guest"
+method = "manual-map"
+timeout_ms = 10000
+
+[guest]
+process = "target.exe"          # or: pid = 1234
+process_pattern = "44 45 ?? 41"
+stage_pattern = "44 45 43 41 4E 54 3A 3A 53 54 41 47 45 30 30"
+result_pattern = "44 45 43 41 4E 54 3A 3A 52 45 53 55 4C 54 30 34"
+payload_path = "payload.dll"
+allocation = "virtual-alloc"
+dependency_policy = "require-loaded"
+tls = "callbacks-only"
+final_protections = "section"
+loader_metadata = "reject-unsupported" # reject-unsupported | best-effort | allow-unsupported
+call_stack = "native"                  # native | registered-unwind
+permission_transitions = "standard"    # standard | write-through-final
+thread_starts = "existing-thread"      # existing-thread | require-module-backed
+image_backing = "private"              # private | sec-image
+hook_module = "kernel32.dll"
+hook_function = "Sleep"
+
+[guest.execution]
+method = "iat-hook"
+timeout_ms = 10000
+```
+
+The memflow guest injection backend handles PE32+ x64 images, DIR64 relocations, ordinary and
+delay imports, ordinal imports, API-set fallbacks, forwarded exports for modules already loaded
+in the target, loader-driven dependency loads through the target's `LoadLibraryA` and
+`GetProcAddress`, and section-derived final page protections. With the default
+`final_protections = "section"` path, it allocates RW memory, writes the image, applies
+PE-derived permissions, then calls TLS callbacks and `DllMain`; `rwx` remains an explicit
+compatibility mode. `loader_metadata = "best-effort"` registers x64 unwind metadata through guest
+`RtlAddFunctionTable` and seeds the load-config security cookie when the mapped image exposes the
+default cookie slot. It does not synthesize loader-private PEB loader entries, VAD/section-object
+state, CFG registration, or loader-managed TLS slots. `call_stack = "registered-unwind"`
+registers x64 unwind metadata for the IAT-hook stub and uses a single framed stack allocation so
+stack walking can unwind through the stub; it does not spoof caller frames or shape the stack to
+impersonate another call path.
+`permission_transitions = "write-through-final"` allocates with final-ish image permissions,
+materializes demand-zero pages by read-touch when possible, writes through memflow, and skips
+final protection calls whose target protection already matches the allocation protection. It
+checks critical writes by reading them back; the allocation/write/protect sequence is still
+observable. `thread_starts = "require-module-backed"` keeps the
+IAT-hook path on an existing target thread and verifies that the IAT slot, original import target,
+and staging cave are inside loaded module ranges; it verifies module-backed hook plumbing but does
+not inspect payload entrypoints, helper calls, or synthesize kernel thread-start metadata. `image_backing = "sec-image"` stages the payload as a guest temp file and
+maps it through `CreateFileMappingW(SEC_IMAGE)` + `MapViewOfFile(FILE_MAP_COPY)`, so the
+executable region starts as a real kernel-created image-file section rather than private
+committed memory; Decant then applies relocations, imports, delay imports, the load-config
+security cookie, TLS callbacks, and `DllMain` on top of that view. The section object and image-file VAD backing are
+produced by the NT memory manager through public guest exports, not forged. Pages Decant patches
+(imports, security cookie, IAT) become copy-on-write private pages, while unpatched pages remain
+file-backed, so the section object is real but the modified view is not identical to the on-disk
+image. `sec-image` requires
+`allocation = "virtual-alloc"` for helper buffers and `final_protections = "section"`, because an
+image-file-backed mapping uses PE-derived page protections rather than a single RWX region. `iat-hook` is the
+implemented execution path: it snapshots the configured IAT slot plus stage/result bytes, patches
+them, lets one target thread run the requested function, reads the return value, and restores on
+success, timeout, or error. The result block is temporary call scratch for this path, not a
+payload success marker. The guest stub does not write the IAT slot from inside the target; the
+host transaction owns restoration because it can write through page protections via memflow. For
+`VirtualAlloc` mappings, Decant then executes a second IAT-hook call that writes one byte per
+allocated page, materializing demand-zero pages before the host writes the mapped image. This path
+is import-triggered: execution occurs when the target calls the configured import. Operators
+should provide `stage_pattern` or `stage_base` for executable stub bytes plus `result_pattern` or
+`result_base` for a writable scratch slot; without them, auto-selection is limited to memory that
+passes those separate permission checks. The strict `loader_metadata = "reject-unsupported"`
+default fails payloads that require static TLS slots, unwind registration, or load-config
+processing; `best-effort` registers the public runtime metadata Decant can safely express, and
+`allow-unsupported` skips the guards only for payloads that do not rely on the corresponding
+loader registration. The schema parses `thread-hijack`, `apc`, package/session
+selectors, and static TLS registration, but this backend returns unsupported errors for them until
+the needed thread/context, APC, or TLS support exists.
+
+The mapper reports, but does not hide or synthesize away, manual-map artifacts. Successful
+`GuestLoadInfo.notes` include `artifact audit:` entries covering private or SEC_IMAGE-backed image
+memory, missing PEB/module-list/section-object/VAD loader state, PE metadata handled by Decant
+instead of `LdrLoadDll`, section-derived versus explicit-RWX permissions, loader metadata status
+for TLS/unwind/load-config records, call-stack policy, permission-transition policy,
+thread-start policy, image-backing policy, and the IAT-hook call path. Decant does not create
+fake PEB loader entries, VADs, or section objects; with `image_backing = "sec-image"` the section
+object and image-file VAD backing are real kernel-created state produced through public guest
+exports, not forged. It does not spoof caller frames or shape the stack to impersonate another
+call path. It does not hide all allocation/write/protect observability. It does not synthesize or
+rewrite thread start metadata.
+
+The tracked guest fixture lives in `testbins/guest-inject-fixture/native/`. `xtask
+guest-inject-fixture` builds a CRT-free target EXE with separate executable stub bytes and a
+writable result block, plus a payload DLL that contains a real DIR64 relocation. The xtask fails
+if that relocation disappears, because fallback-base manual mapping must exercise relocation
+application. `scripts/decant.sh guest-fixture` builds the same artifacts, starts or reuses a
+memflow daemon, locates the target by its fixture marker, injects the payload bytes, and checks
+the fixture payload's marker update as a test assertion. Normal guest injection does not add a
+marker or depend on the target reporting success.
+
+Fate-style UWP support maps to access and selection policy rather than a distinct mapper:
+loader-based PE-side methods must grant the AppContainer SID (for example `S-1-15-2-1`) read and
+execute access to a path-loaded DLL before `LoadLibraryW` can open it. Private guest byte
+manual-map does not require a guest-visible DLL path; `image_backing = "sec-image"` stages a
+temporary guest file to obtain a real image section, and loader-style methods use guest-visible
+paths as well.
 
 The cdylib boundary is a versioned C ABI. A plugin exports `decant_inject_abi() -> u32`
 returning `DECANT_INJECT_ABI` and `decant_inject(*mut DecantInjectRequest) -> i32` (0 on

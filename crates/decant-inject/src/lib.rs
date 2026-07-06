@@ -5,6 +5,7 @@ use std::fmt;
 use std::path::Path;
 
 pub mod guest;
+mod pe;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Portability {

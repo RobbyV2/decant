@@ -6,10 +6,6 @@ license.workspace = true
 description = "Runs inside the VM: a self-verifying target exe plus a DLL payload for guest injection checks. Built only for x86_64-pc-windows-gnu."
 
 [lib]
-name = "guest_inject_probe"
-crate-type = ["cdylib"]
+name = "guest_inject_fixture"
 path = "src/lib.rs"
-
-[[bin]]
-name = "guest-inject-target"
-path = "src/main.rs"
+crate-type = ["rlib", "cdylib"]

@@ -48,6 +48,14 @@ pub struct Diagnostics {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestInjectInfo {
+    pub method: String,
+    pub pid: Pid,
+    pub remote_base: Option<u64>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProtoError {
     NoSuchProcess {
         pid: Option<u32>,
@@ -132,9 +140,33 @@ pub enum Request {
         base: u64,
         offsets: Vec<u64>,
     },
+    GuestInject {
+        config_toml: String,
+        payload_image: Vec<u8>,
+    },
     ReportUnsupported {
         op: String,
     },
+}
+
+impl Request {
+    pub fn retry_safe(&self) -> bool {
+        matches!(
+            self,
+            Request::Ping
+                | Request::ListProcesses
+                | Request::ProcessByPid(_)
+                | Request::ProcessByName(_)
+                | Request::ModuleList(_)
+                | Request::ModuleByName(_, _)
+                | Request::ModuleExports(_, _)
+                | Request::Read { .. }
+                | Request::MemoryMap(_)
+                | Request::Diagnostics
+                | Request::Scan { .. }
+                | Request::Resolve { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +184,7 @@ pub enum Response {
     Err(ProtoError),
     ScanHits(Vec<u64>),
     Resolved { address: u64, value: Vec<u8> },
+    GuestInjected(GuestInjectInfo),
 }
 
 pub const MAX_MSG_LEN: u32 = 64 * 1024 * 1024;
@@ -242,6 +275,10 @@ mod tests {
             base: 0x1000,
             offsets: vec![0x10, 0x18],
         });
+        roundtrip_req(Request::GuestInject {
+            config_toml: "[injection]\ndomain = \"guest\"\nmethod = \"manual-map\"\n".into(),
+            payload_image: vec![0x4d, 0x5a],
+        });
         roundtrip_req(Request::ReportUnsupported {
             op: "VirtualAllocEx".into(),
         });
@@ -287,6 +324,12 @@ mod tests {
             address: 0x1400010290,
             value: vec![0x39, 5, 0, 0],
         });
+        roundtrip_resp(Response::GuestInjected(GuestInjectInfo {
+            method: "manual-map".into(),
+            pid: Pid(7),
+            remote_base: Some(0x1000),
+            notes: vec!["ok".into()],
+        }));
     }
 
     #[test]
@@ -316,6 +359,35 @@ mod tests {
         assert_eq!(
             read_msg::<_, Request>(&mut cur).unwrap(),
             Request::ProcessByPid(Pid(9))
+        );
+    }
+
+    #[test]
+    fn mutating_requests_are_not_retry_safe() {
+        assert!(
+            !Request::Write {
+                pid: Pid(7),
+                addr: 0x1000,
+                data: vec![1, 2, 3],
+            }
+            .retry_safe()
+        );
+        assert!(
+            !Request::GuestInject {
+                config_toml: String::new(),
+                payload_image: Vec::new(),
+            }
+            .retry_safe()
+        );
+        assert!(!Request::ReportUnsupported { op: "x".into() }.retry_safe());
+        assert!(Request::ListProcesses.retry_safe());
+        assert!(
+            Request::Read {
+                pid: Pid(7),
+                addr: 0x1000,
+                len: 8,
+            }
+            .retry_safe()
         );
     }
 }

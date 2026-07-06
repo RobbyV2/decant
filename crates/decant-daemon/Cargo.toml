@@ -20,6 +20,7 @@ decant-protocol = { path = "../decant-protocol" }
 decant-backend = { path = "../decant-backend" }
 decant-core = { path = "../decant-core" }
 decant-memflow = { path = "../decant-memflow" }
+decant-inject = { path = "../decant-inject" }
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true

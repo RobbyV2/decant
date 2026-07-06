@@ -51,7 +51,8 @@ impl Client {
 
     pub fn send(&mut self, req: Request) -> Result<Response> {
         let mut last: Option<std::io::Error> = None;
-        for _ in 0..2 {
+        let attempts = if req.retry_safe() { 2 } else { 1 };
+        for _ in 0..attempts {
             if self.conn.is_none() {
                 let stream = TcpStream::connect(&self.endpoint)?;
                 let _ = stream.set_nodelay(true);

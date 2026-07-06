@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use decant_client::Client;
 use decant_inject::DecantConfig;
-use decant_inject::guest::{GuestCapabilities, GuestInjectionPlan};
+use decant_inject::guest::GuestInjectionPlan;
 use decant_protocol::{Pid, Request, Response};
 
 #[derive(Debug, Parser)]
@@ -138,80 +139,85 @@ fn run() -> Result<()> {
 }
 
 fn guest_inject(client: &mut Client, json: bool, config_path: &Path) -> Result<()> {
-    let config = DecantConfig::load(config_path)
+    let config_toml = std::fs::read_to_string(config_path)
+        .with_context(|| format!("reading {}", config_path.display()))?;
+    let config = DecantConfig::from_toml_str(&config_toml)
         .map_err(|e| anyhow!("{e}"))
         .with_context(|| format!("loading {}", config_path.display()))?;
     let plan = GuestInjectionPlan::from_config(&config).map_err(|e| anyhow!("{e}"))?;
+    let request_timeout_ms = u64::from(plan.timeout_ms)
+        .saturating_add(u64::from(plan.execution.timeout_ms))
+        .saturating_add(30_000)
+        .max(300_000);
+    client.set_timeout(Duration::from_millis(request_timeout_ms));
     let image = std::fs::read(&plan.payload_path)
         .with_context(|| format!("reading {}", plan.payload_path.display()))?;
-    let process = match (&plan.target.pid, &plan.target.name) {
-        (Some(pid), _) => client.send(Request::ProcessByPid(Pid(*pid))),
-        (None, Some(name)) => client.send(Request::ProcessByName(name.clone())),
-        (None, None) => bail!("guest target is unset"),
-    }
-    .context("resolving guest target")?;
-    let process = match process {
-        Response::Process(p) => p,
+    let resp = client
+        .send(Request::GuestInject {
+            config_toml,
+            payload_image: image,
+        })
+        .context("guest injection request")?;
+    let info = match resp {
+        Response::GuestInjected(info) => info,
         Response::Err(e) => bail!("daemon error: {e}"),
         other => bail!("unexpected response: {other:?}"),
     };
-    let modules = match client
-        .send(Request::ModuleList(process.pid))
-        .context("listing guest modules")?
-    {
-        Response::Modules(modules) => modules.len(),
-        Response::Err(e) => bail!("daemon error: {e}"),
-        other => bail!("unexpected response: {other:?}"),
+    let image_allocation = match plan.image_backing.label() {
+        "sec-image" => "sec-image",
+        _ => plan.allocation.label(),
     };
-    let regions = match client
-        .send(Request::MemoryMap(process.pid))
-        .context("reading guest memory map")?
-    {
-        Response::MemoryMap(regions) => regions.len(),
-        Response::Err(e) => bail!("daemon error: {e}"),
-        other => bail!("unexpected response: {other:?}"),
-    };
-    let missing = GuestCapabilities::memflow_passive().missing_manual_map();
-    let op = format!("guest {} injection", plan.method.label());
     match json {
         true => {
             println!(
                 "{}",
                 serde_json::json!({
-                    "target": { "pid": process.pid.0, "name": process.name },
+                    "target": plan.target.label(),
                     "payload_path": plan.payload_path,
-                    "payload_bytes": image.len(),
-                    "method": plan.method.label(),
+                    "method": info.method,
+                    "pid": info.pid.0,
+                    "remote_base": info.remote_base,
                     "allocation": plan.allocation.label(),
+                    "image_allocation": image_allocation,
+                    "dependency_policy": plan.dependency_policy.label(),
                     "execution": plan.execution.method.label(),
-                    "verification": plan.verification.method.label(),
-                    "module_count": modules,
-                    "memory_region_count": regions,
-                    "unsupported": missing,
+                    "tls": plan.tls.label(),
+                    "final_protections": plan.final_protections.label(),
+                    "loader_metadata": plan.loader_metadata.label(),
+                    "call_stack": plan.call_stack.label(),
+                    "permission_transitions": plan.permission_transitions.label(),
+                    "thread_starts": plan.thread_starts.label(),
+                    "image_backing": plan.image_backing.label(),
+                    "notes": info.notes,
                 })
             );
         }
         false => {
-            println!("target:          {} {}", process.pid, process.name);
-            println!(
-                "payload:         {} ({} bytes)",
-                plan.payload_path.display(),
-                image.len()
-            );
-            println!("method:          {}", plan.method.label());
+            println!("target:          {}", plan.target.label());
+            println!("payload:         {}", plan.payload_path.display());
+            println!("method:          {}", info.method);
+            println!("pid:             {}", info.pid);
+            match info.remote_base {
+                Some(base) => println!("remote base:     {base:#018x}"),
+                None => println!("remote base:     <none>"),
+            }
             println!("allocation:      {}", plan.allocation.label());
+            println!("image allocation: {image_allocation}");
+            println!("dependencies:    {}", plan.dependency_policy.label());
             println!("execution:       {}", plan.execution.method.label());
-            println!("verification:    {}", plan.verification.method.label());
-            println!("modules:         {modules}");
-            println!("memory regions:  {regions}");
-            println!("unsupported:     {}", missing.join(", "));
+            println!("tls:             {}", plan.tls.label());
+            println!("protections:     {}", plan.final_protections.label());
+            println!("loader metadata: {}", plan.loader_metadata.label());
+            println!("call stack:      {}", plan.call_stack.label());
+            println!("perm transitions: {}", plan.permission_transitions.label());
+            println!("thread starts:   {}", plan.thread_starts.label());
+            println!("image backing:   {}", plan.image_backing.label());
+            for note in info.notes {
+                println!("note:            {note}");
+            }
         }
     }
-    let _ = client.send(Request::ReportUnsupported { op });
-    bail!(
-        "guest manual-map requires backend operations not exposed by the current daemon: {}",
-        missing.join(", ")
-    )
+    Ok(())
 }
 
 fn emit(resp: Response, json: bool, read_base: Option<u64>) -> Result<()> {

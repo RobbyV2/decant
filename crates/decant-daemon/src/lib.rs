@@ -4,7 +4,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use decant_backend::MemoryBackend;
-use decant_protocol::{Diagnostics, ProtoError, Request, Response, read_msg, write_msg};
+use decant_inject::DecantConfig;
+use decant_inject::guest::{
+    GuestCapabilities, GuestInjectError, GuestInjectionPlan, GuestInjectionRequest, GuestInjector,
+    GuestManualMapInjector, GuestMemoryBackend, GuestMemoryRegion, GuestModuleInfo,
+    GuestProcessInfo,
+};
+use decant_protocol::{
+    Diagnostics, GuestInjectInfo, Pid, ProtoError, Request, Response, read_msg, write_msg,
+};
 
 #[derive(Debug)]
 pub struct Diag {
@@ -98,12 +106,146 @@ pub fn dispatch(req: Request, backend: &dyn MemoryBackend, diag: &Diag) -> Respo
                 Err(e) => Response::Err(core_err_to_proto(e)),
             }
         }
+        Request::GuestInject {
+            config_toml,
+            payload_image,
+        } => guest_inject(&config_toml, &payload_image, backend, diag),
         Request::ReportUnsupported { op } => {
             diag.unsupported_ops.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(%op, "unsupported operation refused at the interposer");
             Response::Pong
         }
     }
+}
+
+struct BackendGuest<'a> {
+    backend: &'a dyn MemoryBackend,
+}
+
+impl GuestMemoryBackend for BackendGuest<'_> {
+    fn capabilities(&self) -> GuestCapabilities {
+        GuestCapabilities::memflow_guest_injection()
+    }
+
+    fn list_processes(&self) -> Result<Vec<GuestProcessInfo>, GuestInjectError> {
+        self.backend
+            .list_processes()
+            .map(|processes| {
+                processes
+                    .into_iter()
+                    .map(|p| GuestProcessInfo {
+                        pid: p.pid.0,
+                        name: p.name,
+                    })
+                    .collect()
+            })
+            .map_err(guest_backend)
+    }
+
+    fn module_list(&self, pid: u32) -> Result<Vec<GuestModuleInfo>, GuestInjectError> {
+        self.backend
+            .module_list(Pid(pid))
+            .map(|modules| {
+                modules
+                    .into_iter()
+                    .map(|m| GuestModuleInfo {
+                        name: m.name,
+                        base: m.base,
+                        size: m.size,
+                    })
+                    .collect()
+            })
+            .map_err(guest_backend)
+    }
+
+    fn module_exports(
+        &self,
+        pid: u32,
+        module: &str,
+    ) -> Result<Vec<(String, u64)>, GuestInjectError> {
+        self.backend
+            .module_exports(Pid(pid), module)
+            .map_err(guest_backend)
+    }
+
+    fn memory_map(&self, pid: u32) -> Result<Vec<GuestMemoryRegion>, GuestInjectError> {
+        self.backend
+            .memory_map(Pid(pid))
+            .map(|regions| {
+                regions
+                    .into_iter()
+                    .map(|r| GuestMemoryRegion {
+                        base: r.base,
+                        size: r.size,
+                        readable: r.readable,
+                        writable: r.writable,
+                        executable: r.executable,
+                    })
+                    .collect()
+            })
+            .map_err(guest_backend)
+    }
+
+    fn read(&self, pid: u32, addr: u64, len: usize) -> Result<Vec<u8>, GuestInjectError> {
+        self.backend
+            .read(Pid(pid), addr, len)
+            .map_err(guest_backend)
+    }
+
+    fn write(&self, pid: u32, addr: u64, data: &[u8]) -> Result<(), GuestInjectError> {
+        self.backend
+            .write(Pid(pid), addr, data)
+            .map(|_| ())
+            .map_err(guest_backend)
+    }
+}
+
+fn guest_inject(
+    config_toml: &str,
+    payload_image: &[u8],
+    backend: &dyn MemoryBackend,
+    diag: &Diag,
+) -> Response {
+    let config = match DecantConfig::from_toml_str(config_toml) {
+        Ok(config) => config,
+        Err(e) => {
+            return Response::Err(ProtoError::Backend {
+                message: e.to_string(),
+            });
+        }
+    };
+    let plan = match GuestInjectionPlan::from_config(&config) {
+        Ok(plan) => plan,
+        Err(e) => return guest_error(e, diag),
+    };
+    let guest = BackendGuest { backend };
+    let req = GuestInjectionRequest {
+        payload_path: &plan.payload_path,
+        payload_image,
+        plan: &plan,
+    };
+    match GuestManualMapInjector.inject(&guest, &req) {
+        Ok(info) => Response::GuestInjected(GuestInjectInfo {
+            method: info.method,
+            pid: Pid(info.pid),
+            remote_base: info.remote_base,
+            notes: info.notes,
+        }),
+        Err(e) => guest_error(e, diag),
+    }
+}
+
+fn guest_backend(e: decant_backend::BackendError) -> GuestInjectError {
+    GuestInjectError::Backend(e.to_string())
+}
+
+fn guest_error(e: GuestInjectError, diag: &Diag) -> Response {
+    if matches!(e, GuestInjectError::Unsupported { .. }) {
+        diag.unsupported_ops.fetch_add(1, Ordering::Relaxed);
+    }
+    Response::Err(ProtoError::Backend {
+        message: e.to_string(),
+    })
 }
 
 fn core_err_to_proto(e: decant_core::CoreError) -> ProtoError {
