@@ -342,6 +342,19 @@ impl GuestMemoryBackend for MemflowBackend {
             .map(|_| ())
             .map_err(guest_other)
     }
+
+    fn spoof_vad_type(
+        &self,
+        pid: u32,
+        base: u64,
+        size: u64,
+    ) -> std::result::Result<(), GuestInjectError> {
+        let _ = (pid, base, size);
+        Err(GuestInjectError::Unsupported {
+            operation: "VAD type spoofing",
+            reason: "the memflow backend does not expose a versioned, validated Windows VAD mutation API".into(),
+        })
+    }
 }
 
 fn module_by_name_ci<P: memflow::os::Process + ?Sized>(

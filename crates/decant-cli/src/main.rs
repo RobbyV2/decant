@@ -188,6 +188,12 @@ fn guest_inject(client: &mut Client, json: bool, config_path: &Path) -> Result<(
                     "permission_transitions": plan.permission_transitions.label(),
                     "thread_starts": plan.thread_starts.label(),
                     "image_backing": plan.image_backing.label(),
+                    "base_address": plan.base_address.label(),
+                    "header_wipe": plan.header_wipe.label(),
+                    "loader_entries": plan.loader_entries.label(),
+                    "stack_shaping": plan.stack_shaping.label(),
+                    "cleanup": plan.cleanup.label(),
+                    "vad_spoof": plan.vad_spoof.label(),
                     "notes": info.notes,
                 })
             );
@@ -212,6 +218,12 @@ fn guest_inject(client: &mut Client, json: bool, config_path: &Path) -> Result<(
             println!("perm transitions: {}", plan.permission_transitions.label());
             println!("thread starts:   {}", plan.thread_starts.label());
             println!("image backing:   {}", plan.image_backing.label());
+            println!("base address:    {}", plan.base_address.label());
+            println!("header wipe:     {}", plan.header_wipe.label());
+            println!("loader entries:  {}", plan.loader_entries.label());
+            println!("stack shaping:   {}", plan.stack_shaping.label());
+            println!("cleanup:         {}", plan.cleanup.label());
+            println!("vad spoof:       {}", plan.vad_spoof.label());
             for note in info.notes {
                 println!("note:            {note}");
             }

@@ -55,10 +55,24 @@ default-members = [
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-repository = "https://example.invalid/decant"
+repository = "https://github.com/RobbyV2/decant"
+homepage = "https://github.com/RobbyV2/decant"
+readme = "README.md"
+keywords = ["memflow", "wine", "windows", "memory", "vm"]
+categories = ["development-tools", "command-line-utilities", "os"]
 
 [workspace.dependencies]
+decant = { version = "0.1.0", path = "crates/decant" }
+decant-backend = { version = "0.1.0", path = "crates/decant-backend" }
+decant-client = { version = "0.1.0", path = "crates/decant-client" }
+decant-core = { version = "0.1.0", path = "crates/decant-core" }
+decant-daemon = { version = "0.1.0", path = "crates/decant-daemon" }
+decant-inject = { version = "0.1.0", path = "crates/decant-inject" }
+decant-memflow = { version = "0.1.0", path = "crates/decant-memflow" }
+decant-protocol = { version = "0.1.0", path = "crates/decant-protocol" }
+decant-wine-harness = { version = "0.1.0", path = "crates/decant-wine-harness" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

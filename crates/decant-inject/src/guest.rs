@@ -18,6 +18,8 @@ const STAGE_UNWIND_OFFSET: u64 = 0x3E0;
 const STAGE_SCRATCH_SIZE: usize = (STAGE_UNWIND_OFFSET - STAGE_SCRATCH_OFFSET) as usize;
 const GUEST_PAGE_SIZE: usize = 0x1000;
 const SCAN_CHUNK: u64 = 0x10000;
+const SPOOFED_RETURN_SCAN_LIMIT: u64 = 0x40000;
+const SPOOFED_CALL_LANDING_DELTA: u64 = 46;
 const MEM_COMMIT_RESERVE: u64 = 0x0000_1000 | 0x0000_2000;
 const PAGE_NOACCESS: u64 = 0x01;
 const PAGE_READONLY: u64 = 0x02;
@@ -25,6 +27,7 @@ const PAGE_READWRITE: u64 = 0x04;
 const PAGE_EXECUTE: u64 = 0x10;
 const PAGE_EXECUTE_READ: u64 = 0x20;
 const PAGE_EXECUTE_READWRITE: u64 = 0x40;
+const CFG_CALL_TARGET_VALID: u64 = 0x1;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
 const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
@@ -94,6 +97,7 @@ impl GuestAllocationMethod {
 pub enum GuestExecutionMethod {
     #[default]
     IatHook,
+    RemoteThread,
     ThreadHijack,
     Apc,
     ExternalAgent,
@@ -104,6 +108,7 @@ impl GuestExecutionMethod {
     pub fn label(self) -> &'static str {
         match self {
             GuestExecutionMethod::IatHook => "iat-hook",
+            GuestExecutionMethod::RemoteThread => "remote-thread",
             GuestExecutionMethod::ThreadHijack => "thread-hijack",
             GuestExecutionMethod::Apc => "apc",
             GuestExecutionMethod::ExternalAgent => "external-agent",
@@ -263,6 +268,108 @@ impl GuestImageBacking {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GuestBaseAddress {
+    #[default]
+    Preferred,
+    Randomized,
+}
+
+impl GuestBaseAddress {
+    pub fn label(self) -> &'static str {
+        match self {
+            GuestBaseAddress::Preferred => "preferred",
+            GuestBaseAddress::Randomized => "randomized",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GuestHeaderWipe {
+    #[default]
+    None,
+    AfterLoad,
+}
+
+impl GuestHeaderWipe {
+    pub fn label(self) -> &'static str {
+        match self {
+            GuestHeaderWipe::None => "none",
+            GuestHeaderWipe::AfterLoad => "after-load",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GuestLoaderEntries {
+    #[default]
+    Absent,
+    Synthesized,
+}
+
+impl GuestLoaderEntries {
+    pub fn label(self) -> &'static str {
+        match self {
+            GuestLoaderEntries::Absent => "absent",
+            GuestLoaderEntries::Synthesized => "synthesized",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GuestStackShaping {
+    #[default]
+    Native,
+    Spoofed,
+}
+
+impl GuestStackShaping {
+    pub fn label(self) -> &'static str {
+        match self {
+            GuestStackShaping::Native => "native",
+            GuestStackShaping::Spoofed => "spoofed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GuestCleanup {
+    #[default]
+    Resident,
+    Tracked,
+}
+
+impl GuestCleanup {
+    pub fn label(self) -> &'static str {
+        match self {
+            GuestCleanup::Resident => "resident",
+            GuestCleanup::Tracked => "tracked",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GuestVadSpoof {
+    #[default]
+    Off,
+    VadImageMap,
+}
+
+impl GuestVadSpoof {
+    pub fn label(self) -> &'static str {
+        match self {
+            GuestVadSpoof::Off => "off",
+            GuestVadSpoof::VadImageMap => "vad-image-map",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GuestExecutionConfig {
@@ -334,6 +441,18 @@ pub struct GuestInjectionConfig {
     pub thread_starts: GuestThreadStartPolicy,
     #[serde(default)]
     pub image_backing: GuestImageBacking,
+    #[serde(default)]
+    pub base_address: GuestBaseAddress,
+    #[serde(default)]
+    pub header_wipe: GuestHeaderWipe,
+    #[serde(default)]
+    pub loader_entries: GuestLoaderEntries,
+    #[serde(default)]
+    pub stack_shaping: GuestStackShaping,
+    #[serde(default)]
+    pub cleanup: GuestCleanup,
+    #[serde(default)]
+    pub vad_spoof: GuestVadSpoof,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -413,6 +532,12 @@ pub struct GuestInjectionPlan {
     pub permission_transitions: GuestPermissionTransitions,
     pub thread_starts: GuestThreadStartPolicy,
     pub image_backing: GuestImageBacking,
+    pub base_address: GuestBaseAddress,
+    pub header_wipe: GuestHeaderWipe,
+    pub loader_entries: GuestLoaderEntries,
+    pub stack_shaping: GuestStackShaping,
+    pub cleanup: GuestCleanup,
+    pub vad_spoof: GuestVadSpoof,
     pub target_module: Option<String>,
     pub stage_base: Option<u64>,
     pub stage_pattern: Option<GuestBytePattern>,
@@ -487,6 +612,21 @@ impl GuestInjectionPlan {
                 "guest.image_backing = \"sec-image\" requires allocation = \"virtual-alloc\"; VirtualAlloc is used for helper buffers while the payload image is mapped through SEC_IMAGE".into(),
             ));
         }
+        if config.guest.loader_entries == GuestLoaderEntries::Synthesized
+            && config.guest.image_backing == GuestImageBacking::SecImage
+        {
+            return Err(GuestInjectError::Config(
+                "guest.loader_entries = \"synthesized\" is incompatible with image_backing = \"sec-image\"; SEC_IMAGE mappings already create real section state".into(),
+            ));
+        }
+        if config.guest.vad_spoof == GuestVadSpoof::VadImageMap
+            && config.guest.image_backing != GuestImageBacking::Private
+        {
+            return Err(GuestInjectError::Config(
+                "guest.vad_spoof = \"vad-image-map\" applies only to image_backing = \"private\""
+                    .into(),
+            ));
+        }
         Ok(Self {
             method: config.injection.method,
             target,
@@ -500,6 +640,12 @@ impl GuestInjectionPlan {
             permission_transitions: config.guest.permission_transitions,
             thread_starts: config.guest.thread_starts,
             image_backing: config.guest.image_backing,
+            base_address: config.guest.base_address,
+            header_wipe: config.guest.header_wipe,
+            loader_entries: config.guest.loader_entries,
+            stack_shaping: config.guest.stack_shaping,
+            cleanup: config.guest.cleanup,
+            vad_spoof: config.guest.vad_spoof,
             target_module: config.guest.target_module.clone(),
             stage_base: config.guest.stage_base,
             stage_pattern: match config.guest.stage_pattern.as_deref() {
@@ -543,6 +689,7 @@ pub struct GuestCapabilities {
     pub static_tls: bool,
     pub exception_registration: bool,
     pub loader_reference: bool,
+    pub vad_spoof: bool,
 }
 
 impl GuestCapabilities {
@@ -570,6 +717,7 @@ impl GuestCapabilities {
             static_tls: false,
             exception_registration: true,
             loader_reference: false,
+            vad_spoof: false,
         }
     }
 
@@ -739,6 +887,13 @@ pub trait GuestMemoryBackend {
         memory_iat_preserve_touch(self, pid, hook, addr, len, timeout_ms)
     }
 
+    fn spoof_vad_type(&self, _pid: u32, _base: u64, _size: u64) -> Result<(), GuestInjectError> {
+        Err(GuestInjectError::Unsupported {
+            operation: "VAD type spoofing",
+            reason: "this backend does not expose kernel memory access".into(),
+        })
+    }
+
     fn resolve_process(
         &self,
         target: &GuestProcessSelector,
@@ -845,6 +1000,13 @@ pub struct GuestIatHook {
     pub stub_addr: u64,
     pub result_addr: u64,
     pub call_stack: GuestCallStackPolicy,
+    pub spoofed_return: Option<GuestSpoofedReturn>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuestSpoofedReturn {
+    pub gadget_addr: u64,
+    pub stack_adjust: u8,
 }
 
 struct GuestInjectionLock {
@@ -914,6 +1076,7 @@ impl GuestInjector for GuestManualMapInjector {
             permission_transitions = req.plan.permission_transitions.label(),
             thread_starts = req.plan.thread_starts.label(),
             image_backing = req.plan.image_backing.label(),
+            vad_spoof = req.plan.vad_spoof.label(),
             hook_module = %req.plan.hook_module,
             hook_function = %req.plan.hook_function,
             timeout_ms = req.plan.execution.timeout_ms,
@@ -926,11 +1089,18 @@ impl GuestInjector for GuestManualMapInjector {
                     "payload_image is empty; guest injection requires DLL bytes".into(),
                 ));
             }
-            let missing = backend.capabilities().missing_manual_map();
+            let capabilities = backend.capabilities();
+            let missing = capabilities.missing_manual_map();
             if !missing.is_empty() {
                 return Err(GuestInjectError::Unsupported {
                     operation: "guest injection",
                     reason: format!("manual-map method backend missing {}", missing.join(", ")),
+                });
+            }
+            if req.plan.vad_spoof == GuestVadSpoof::VadImageMap && !capabilities.vad_spoof {
+                return Err(GuestInjectError::Unsupported {
+                    operation: "VAD type spoofing",
+                    reason: "this backend does not expose validated VAD mutation support".into(),
                 });
             }
             tracing::debug!("guest injection backend requirements satisfied");
@@ -940,7 +1110,7 @@ impl GuestInjector for GuestManualMapInjector {
             let _injection_lock = GuestInjectionLock::acquire(process.pid)?;
 
             match req.plan.execution.method {
-                GuestExecutionMethod::IatHook => {}
+                GuestExecutionMethod::IatHook | GuestExecutionMethod::RemoteThread => {}
                 other => {
                     return Err(GuestInjectError::Unsupported {
                         operation: "guest injection",
@@ -1008,6 +1178,11 @@ impl GuestInjector for GuestManualMapInjector {
                 stub_addr: stage + STAGE_STUB_OFFSET,
                 result_addr,
                 call_stack: req.plan.call_stack,
+                spoofed_return: if req.plan.stack_shaping == GuestStackShaping::Spoofed {
+                    Some(find_spoofed_return(backend, process.pid)?)
+                } else {
+                    None
+                },
             };
             tracing::info!(
                 pid = process.pid,
@@ -1099,95 +1274,64 @@ impl GuestInjector for GuestManualMapInjector {
                 == GuestPermissionTransitions::WriteThroughFinal
                 && !protection_is_writable(allocation_protection);
 
-            let (remote_base, materialize_allocated_pages) = if req.plan.image_backing
-                == GuestImageBacking::SecImage
-            {
-                tracing::info!(
-                    pid = process.pid,
-                    "mapping payload through a guest SEC_IMAGE file-backed section"
-                );
-                let base = allocate_sec_image(
-                    backend,
-                    process.pid,
-                    &hook,
-                    virtual_alloc,
-                    stage,
-                    req.payload_image,
-                    req.plan.execution.timeout_ms,
-                )?;
-                (base, false)
-            } else {
-                match req.plan.allocation {
-                    GuestAllocationMethod::VirtualAlloc => {
-                        tracing::info!(
-                            pid = process.pid,
-                            preferred_base = format_args!("{:#x}", pe.image_base),
-                            size = pe.size_of_image,
-                            protection = format_args!("{allocation_protection:#x}"),
-                            "calling guest VirtualAlloc at preferred image base through IAT hook"
-                        );
-                        let preferred = backend.call_iat_hook(
-                            process.pid,
-                            &hook,
-                            virtual_alloc,
-                            [
-                                pe.image_base,
-                                pe.size_of_image as u64,
-                                MEM_COMMIT_RESERVE,
-                                allocation_protection,
-                            ],
-                            req.plan.execution.timeout_ms,
-                        )?;
-                        let remote = if preferred != 0 || !pe.has_relocation_directory() {
-                            preferred
-                        } else {
-                            tracing::info!(
-                                pid = process.pid,
-                                preferred_base = format_args!("{:#x}", pe.image_base),
-                                "preferred image base unavailable; retrying guest VirtualAlloc at any base"
-                            );
-                            backend.call_iat_hook(
+            let (remote_base, materialize_allocated_pages) =
+                if req.plan.image_backing == GuestImageBacking::SecImage {
+                    tracing::info!(
+                        pid = process.pid,
+                        "mapping payload through a guest SEC_IMAGE file-backed section"
+                    );
+                    let base = allocate_sec_image(
+                        backend,
+                        process.pid,
+                        &hook,
+                        virtual_alloc,
+                        stage,
+                        req.payload_image,
+                        req.plan.execution.timeout_ms,
+                    )?;
+                    (base, false)
+                } else {
+                    match req.plan.allocation {
+                        GuestAllocationMethod::VirtualAlloc => {
+                            let remote = allocate_virtual(
+                                backend,
                                 process.pid,
                                 &hook,
                                 virtual_alloc,
-                                [
-                                    0,
-                                    pe.size_of_image as u64,
-                                    MEM_COMMIT_RESERVE,
-                                    allocation_protection,
-                                ],
+                                &pe,
+                                allocation_protection,
+                                req.plan.base_address,
                                 req.plan.execution.timeout_ms,
-                            )?
-                        };
-                        (remote, true)
-                    }
-                    GuestAllocationMethod::ExistingRegion => match req.plan.stage_base {
-                        Some(base) => {
-                            let remote = base + 0x1000;
-                            tracing::info!(
-                                pid = process.pid,
-                                remote_base = format_args!("{remote:#x}"),
-                                "using configured guest existing region"
-                            );
-                            (remote, false)
+                            )?;
+                            (remote, true)
                         }
-                        None => {
-                            return Err(GuestInjectError::Config(
+                        GuestAllocationMethod::ExistingRegion => match req.plan.stage_base {
+                            Some(base) => {
+                                let remote = base + 0x1000;
+                                tracing::info!(
+                                    pid = process.pid,
+                                    remote_base = format_args!("{remote:#x}"),
+                                    "using configured guest existing region"
+                                );
+                                (remote, false)
+                            }
+                            None => {
+                                return Err(GuestInjectError::Config(
                                 "guest allocation = \"existing-region\" requires guest.stage_base"
                                     .into(),
                             ));
-                        }
-                    },
-                    GuestAllocationMethod::PageTableMap => {
-                        return Err(GuestInjectError::Unsupported {
+                            }
+                        },
+                        GuestAllocationMethod::PageTableMap => {
+                            return Err(GuestInjectError::Unsupported {
                             operation: "guest page-table-map",
                             reason:
                                 "use allocation = \"virtual-alloc\" for the in-process allocator"
                                     .into(),
                         });
+                        }
                     }
-                }
-            };
+                };
             if remote_base == 0 {
                 return Err(GuestInjectError::Backend(
                     "guest image allocation returned NULL".into(),
@@ -1341,6 +1485,7 @@ impl GuestInjector for GuestManualMapInjector {
             pe.resolve_delay_imports(&mut image, &mut resolve_payload_import)?;
             tracing::info!("payload delay imports resolved");
             let has_static_tls = pe.has_static_tls(&image)?;
+            let mut tls_slot_index: Option<u32> = None;
             match (req.plan.tls, has_static_tls) {
                 (GuestTlsMode::RequireStatic, _) => {
                     return Err(GuestInjectError::Unsupported {
@@ -1348,11 +1493,101 @@ impl GuestInjector for GuestManualMapInjector {
                         reason: "static TLS registration requires loader-managed TLS slots; use tls = \"callbacks-only\" or tls = \"skip\" with the current backend".into(),
                     });
                 }
-                (_, true) if !req.plan.loader_metadata.allows_unregistered_metadata() => {
+                (_, true)
+                    if !req.plan.loader_metadata.allows_unregistered_metadata()
+                        && req.plan.loader_entries != GuestLoaderEntries::Synthesized =>
+                {
                     return Err(GuestInjectError::Unsupported {
                         operation: "guest static TLS",
                         reason: "payload uses static TLS; guest injection can call TLS callbacks but cannot register loader-managed TLS slots. Rebuild without static TLS or set guest.loader_metadata = \"best-effort\"/\"allow-unsupported\" only when the payload does not read static TLS".into(),
                     });
+                }
+                (GuestTlsMode::CallbacksOnly, true)
+                    if req.plan.loader_entries == GuestLoaderEntries::Synthesized =>
+                {
+                    let tls_alloc =
+                        resolve_import_symbol(backend, process.pid, "kernel32.dll", "TlsAlloc")?;
+                    let tls_set_value =
+                        resolve_import_symbol(backend, process.pid, "kernel32.dll", "TlsSetValue")?;
+                    let raw_slot = backend.call_iat_hook(
+                        process.pid,
+                        &hook,
+                        tls_alloc,
+                        [0, 0, 0, 0],
+                        req.plan.execution.timeout_ms,
+                    )?;
+                    let slot = raw_slot as u32;
+                    if slot == u32::MAX {
+                        return Err(GuestInjectError::Backend(
+                            "guest TlsAlloc returned TLS_OUT_OF_INDEXES".into(),
+                        ));
+                    }
+                    if let Some(index_offset) = pe.tls_index_offset(&image, remote_base as usize)? {
+                        image[index_offset..index_offset + 4].copy_from_slice(&slot.to_le_bytes());
+                        tracing::info!(
+                            pid = process.pid,
+                            tls_slot = slot,
+                            index_offset = format_args!("{index_offset:#x}"),
+                            "static TLS slot allocated; index patched into local image buffer"
+                        );
+                        tls_slot_index = Some(slot);
+                        if let Some(template) = pe.tls_template(&image, remote_base as usize)? {
+                            let template_buf = backend.call_iat_hook(
+                                process.pid,
+                                &hook,
+                                virtual_alloc,
+                                [0, template.len() as u64, MEM_COMMIT_RESERVE, PAGE_READWRITE],
+                                req.plan.execution.timeout_ms,
+                            )?;
+                            if template_buf != 0 {
+                                backend.touch_iat_hook(
+                                    process.pid,
+                                    &hook,
+                                    template_buf,
+                                    template.len(),
+                                    req.plan.execution.timeout_ms,
+                                )?;
+                                write_verified(
+                                    backend,
+                                    process.pid,
+                                    template_buf,
+                                    &template,
+                                    "TLS template copy",
+                                )?;
+                                let set_ok = backend.call_iat_hook(
+                                    process.pid,
+                                    &hook,
+                                    tls_set_value,
+                                    [slot as u64, template_buf, 0, 0],
+                                    req.plan.execution.timeout_ms,
+                                )?;
+                                if set_ok == 0 {
+                                    tracing::warn!(
+                                        pid = process.pid,
+                                        slot,
+                                        "guest TlsSetValue returned FALSE; static TLS template not installed for the current helper/target thread"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        pid = process.pid,
+                                        slot,
+                                        template_buf = format_args!("{template_buf:#x}"),
+                                        template_len = template.len(),
+                                        "static TLS template copied and TlsSetValue called for the current helper thread"
+                                    );
+                                    if req.plan.execution.method
+                                        == GuestExecutionMethod::RemoteThread
+                                    {
+                                        tracing::warn!(
+                                            pid = process.pid,
+                                            slot,
+                                            "remote-thread DllMain runs on a new thread; static TLS template is not propagated to that thread"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 (GuestTlsMode::CallbacksOnly, true) => {
                     tracing::warn!(
@@ -1466,7 +1701,7 @@ impl GuestInjector for GuestManualMapInjector {
                     GuestLoaderMetadataPolicy::BestEffort => {
                         tracing::debug!(
                             pid = process.pid,
-                            "payload load-config was processed with available public metadata hooks; CFG and other loader-private entries are not synthesized"
+                            "payload load-config was processed with available public metadata hooks; broader loader-private entries are not synthesized"
                         );
                     }
                     GuestLoaderMetadataPolicy::AllowUnsupported => {
@@ -1515,19 +1750,172 @@ impl GuestInjector for GuestManualMapInjector {
                 }
             }
 
+            let mut peb_entry_addr: Option<u64> = None;
+            let mut peb_entry_unlinked = false;
+            let mut cfg_marked = false;
+            let mut cfg_target_count = 0u32;
+            if req.plan.loader_entries == GuestLoaderEntries::Synthesized {
+                if should_request_cfg_call_target(req.plan, &pe)
+                    && let Ok(set_valid_call_targets) = resolve_import_symbol(
+                        backend,
+                        process.pid,
+                        "kernel32.dll",
+                        "SetProcessValidCallTargets",
+                    )
+                {
+                    let targets = pe.cfg_call_targets(&image)?;
+                    cfg_target_count = targets.len() as u32;
+                    if !targets.is_empty() {
+                        let info_bytes = targets.len() * 16;
+                        let cfg_info = backend.call_iat_hook(
+                            process.pid,
+                            &hook,
+                            virtual_alloc,
+                            [0, info_bytes as u64, MEM_COMMIT_RESERVE, PAGE_READWRITE],
+                            req.plan.execution.timeout_ms,
+                        )?;
+                        if cfg_info != 0 {
+                            backend.touch_iat_hook(
+                                process.pid,
+                                &hook,
+                                cfg_info,
+                                info_bytes,
+                                req.plan.execution.timeout_ms,
+                            )?;
+                            let mut info = vec![0u8; info_bytes];
+                            for (i, &rva) in targets.iter().enumerate() {
+                                let off = i * 16;
+                                info[off..off + 8].copy_from_slice(&(rva as u64).to_le_bytes());
+                                info[off + 8..off + 16]
+                                    .copy_from_slice(&CFG_CALL_TARGET_VALID.to_le_bytes());
+                            }
+                            write_verified(
+                                backend,
+                                process.pid,
+                                cfg_info,
+                                &info,
+                                "CFG_CALL_TARGET_INFO array",
+                            )?;
+                            let ok = call_guest_proc(
+                                backend,
+                                process.pid,
+                                &hook,
+                                stage + STAGE_TRAMPOLINE_OFFSET,
+                                stage + STAGE_PARAM_OFFSET,
+                                set_valid_call_targets,
+                                &cfg_call_target_registration_args(
+                                    remote_base,
+                                    pe.size_of_image as u64,
+                                    targets.len() as u64,
+                                    cfg_info,
+                                ),
+                                req.plan.execution.timeout_ms,
+                                "SetProcessValidCallTargets",
+                            )?;
+                            if let Ok(virtual_free) = resolve_import_symbol(
+                                backend,
+                                process.pid,
+                                "kernel32.dll",
+                                "VirtualFree",
+                            ) {
+                                let _ = backend.call_iat_hook(
+                                    process.pid,
+                                    &hook,
+                                    virtual_free,
+                                    [cfg_info, 0, MEM_RELEASE, 0],
+                                    req.plan.execution.timeout_ms,
+                                );
+                            }
+                            if ok != 0 {
+                                cfg_marked = true;
+                                tracing::info!(
+                                    pid = process.pid,
+                                    remote_base = format_args!("{remote_base:#x}"),
+                                    target_count = targets.len(),
+                                    "CFG: marked all export/entry targets as valid indirect call targets"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    pid = process.pid,
+                                    "CFG: SetProcessValidCallTargets returned FALSE; process may not have CFG enabled"
+                                );
+                            }
+                        }
+                    }
+                }
+                let dll_name = req
+                    .payload_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("payload.dll");
+                let entry_point = pe
+                    .entry(remote_base as usize)?
+                    .map(|e| e as u64)
+                    .unwrap_or(0);
+                peb_entry_addr = Some(synthesize_peb_loader_entry(
+                    backend,
+                    process.pid,
+                    &hook,
+                    virtual_alloc,
+                    stage,
+                    remote_base,
+                    entry_point,
+                    pe.size_of_image as u32,
+                    dll_name,
+                    req.plan.execution.timeout_ms,
+                )?);
+                if req.plan.cleanup == GuestCleanup::Tracked
+                    && let Some(peb_entry) = peb_entry_addr
+                {
+                    unlink_synthesized_peb_loader_entry(backend, process.pid, peb_entry)?;
+                    peb_entry_unlinked = true;
+                }
+            }
+
+            if req.plan.vad_spoof == GuestVadSpoof::VadImageMap {
+                if req.plan.image_backing != GuestImageBacking::Private {
+                    return Err(GuestInjectError::Unsupported {
+                        operation: "VAD type spoofing",
+                        reason: "vad-image-map applies only to private image backing".into(),
+                    });
+                }
+                backend.spoof_vad_type(process.pid, remote_base, pe.size_of_image as u64)?;
+                tracing::info!(
+                    pid = process.pid,
+                    remote_base = format_args!("{remote_base:#x}"),
+                    "VAD type spoofed to VadImageMap for private mapping"
+                );
+            }
+
             if let Some(entry) = pe.entry(remote_base as usize)? {
                 tracing::info!(
                     pid = process.pid,
                     entry = format_args!("{entry:#x}"),
+                    execution = req.plan.execution.method.label(),
                     "calling payload DllMain"
                 );
-                let ok = backend.call_iat_hook(
-                    process.pid,
-                    &hook,
-                    entry as u64,
-                    [remote_base, DLL_PROCESS_ATTACH as u64, 0, 0],
-                    req.plan.execution.timeout_ms,
-                )?;
+                let ok = match req.plan.execution.method {
+                    GuestExecutionMethod::RemoteThread => invoke_dllmain_remote_thread(
+                        backend,
+                        process.pid,
+                        &hook,
+                        virtual_alloc,
+                        stage,
+                        entry as u64,
+                        remote_base,
+                        &image,
+                        &pe,
+                        req.plan.thread_starts == GuestThreadStartPolicy::RequireModuleBacked,
+                        req.plan.execution.timeout_ms,
+                    )?,
+                    _ => backend.call_iat_hook(
+                        process.pid,
+                        &hook,
+                        entry as u64,
+                        [remote_base, DLL_PROCESS_ATTACH as u64, 0, 0],
+                        req.plan.execution.timeout_ms,
+                    )?,
+                };
                 tracing::info!(
                     pid = process.pid,
                     entry_result = ok,
@@ -1538,6 +1926,35 @@ impl GuestInjector for GuestManualMapInjector {
                 }
             } else {
                 tracing::info!("payload has no entry point");
+            }
+
+            if req.plan.header_wipe == GuestHeaderWipe::AfterLoad {
+                let wipe_len = pe.size_of_headers.min(0x1000);
+                let zeros = vec![0u8; wipe_len];
+                if req.plan.image_backing == GuestImageBacking::SecImage {
+                    let vp = virtual_protect.expect(
+                        "header wipe requires final_protections = section so VirtualProtect is resolved",
+                    );
+                    guest_virtual_protect(
+                        backend,
+                        process.pid,
+                        &hook,
+                        vp,
+                        remote_base,
+                        wipe_len as u64,
+                        PAGE_READWRITE,
+                        hook.result_addr + OLD_PROTECT_RESULT_OFFSET,
+                        req.plan.execution.timeout_ms,
+                        "header wipe",
+                    )?;
+                }
+                write_verified(backend, process.pid, remote_base, &zeros, "PE header wipe")?;
+                tracing::info!(
+                    pid = process.pid,
+                    remote_base = format_args!("{remote_base:#x}"),
+                    bytes = wipe_len,
+                    "PE headers wiped"
+                );
             }
 
             let mut notes = vec![
@@ -1564,10 +1981,42 @@ impl GuestInjector for GuestManualMapInjector {
                 ),
                 format!("thread_starts={}", req.plan.thread_starts.label()),
                 format!("image_backing={}", req.plan.image_backing.label()),
+                format!("base_address={}", req.plan.base_address.label()),
+                format!("header_wipe={}", req.plan.header_wipe.label()),
+                format!("loader_entries={}", req.plan.loader_entries.label()),
+                format!("stack_shaping={}", req.plan.stack_shaping.label()),
+                format!("cleanup={}", req.plan.cleanup.label()),
+                format!("vad_spoof={}", req.plan.vad_spoof.label()),
             ];
             notes.append(&mut loader_metadata_notes);
             notes.append(&mut call_stack_notes);
             notes.append(&mut thread_start_notes);
+            if let Some(peb_entry) = peb_entry_addr {
+                match peb_entry_unlinked {
+                    true => notes.push(format!(
+                        "loader entries: synthesized transient LDR_DATA_TABLE_ENTRY at {peb_entry:#x}, then unlinked from PEB InLoadOrder/InMemoryOrder lists by cleanup=tracked"
+                    )),
+                    false => notes.push(format!(
+                        "loader entries: synthesized LDR_DATA_TABLE_ENTRY at {peb_entry:#x} linked into PEB InLoadOrder/InMemoryOrder lists"
+                    )),
+                }
+            }
+            if let Some(slot) = tls_slot_index {
+                let thread_scope = match req.plan.execution.method {
+                    GuestExecutionMethod::RemoteThread => {
+                        "current helper thread only; the remote DllMain thread and other existing threads are not covered"
+                    }
+                    _ => "current target thread only; other threads are not covered",
+                };
+                notes.push(format!(
+                    "static TLS: allocated slot {slot} via TlsAlloc, patched index into image, copied TLS template, and called TlsSetValue for {thread_scope}"
+                ));
+            }
+            if cfg_marked {
+                notes.push(format!(
+                    "CFG: marked {cfg_target_count} export/entry targets as valid indirect call targets via SetProcessValidCallTargets before DllMain"
+                ));
+            }
             notes.extend(guest_artifact_notes(req, &pe, remote_base, has_static_tls));
 
             Ok(GuestLoadInfo {
@@ -2061,7 +2510,17 @@ fn guest_artifact_notes(
                 "artifact audit: payload image at {remote_base:#x} is backed by a real SEC_IMAGE section over a staged guest copy of the payload file; the section object and image-file VAD backing are kernel-created, not forged; only patched pages (imports, security cookie) become copy-on-write private, unpatched pages remain file-backed"
             ),
         },
-        "artifact audit: PEB loader lists, normal module enumeration, and loader VAD/section-object metadata are not synthesized by guest manual-map".into(),
+        match req.plan.loader_entries {
+            GuestLoaderEntries::Absent => {
+                "artifact audit: PEB loader lists, normal module enumeration, and loader VAD/section-object metadata are not synthesized by guest manual-map".into()
+            }
+            GuestLoaderEntries::Synthesized if req.plan.cleanup == GuestCleanup::Tracked => {
+                "artifact audit: synthesized LDR_DATA_TABLE_ENTRY is linked transiently into PEB InLoadOrder/InMemoryOrder lists, then unlinked by cleanup=tracked to avoid leaving loader-owned shutdown state behind".into()
+            }
+            GuestLoaderEntries::Synthesized => {
+                "artifact audit: synthesized LDR_DATA_TABLE_ENTRY linked into PEB InLoadOrder/InMemoryOrder lists; initialization-order links are left private to avoid loader shutdown ownership of the manual map".into()
+            }
+        },
         match req.plan.image_backing {
             GuestImageBacking::Private => {
                 "artifact audit: PE headers, sections, imports, relocations, delay imports, TLS callbacks, and entrypoint were processed by decant rather than the Windows loader".into()
@@ -2071,8 +2530,16 @@ fn guest_artifact_notes(
             }
         },
         format!(
-            "artifact audit: execution method iat-hook runs on the target thread that calls {}!{}; no remote thread or APC is created by this path",
-            req.plan.hook_module, req.plan.hook_function
+            "artifact audit: execution method {} runs DllMain{}; {}",
+            req.plan.execution.method.label(),
+            match req.plan.execution.method {
+                GuestExecutionMethod::RemoteThread => " on a kernel-created remote thread through a ThreadProc thunk",
+                _ => " on the target thread that calls the hooked import",
+            },
+            match req.plan.execution.method {
+                GuestExecutionMethod::RemoteThread => "the kernel-recorded thread start is the helper thunk, not the payload entrypoint",
+                _ => "no remote thread or APC is created by this path",
+            }
         ),
     ];
 
@@ -2103,14 +2570,32 @@ fn guest_artifact_notes(
         ),
     }
     match req.plan.thread_starts {
-        GuestThreadStartPolicy::ExistingThread => notes.push(
-            "artifact audit: thread_starts=existing-thread creates no guest thread, so no new thread start address is recorded by this path"
-                .into(),
-        ),
-        GuestThreadStartPolicy::RequireModuleBacked => notes.push(
-            "artifact audit: thread_starts=require-module-backed verified the IAT-hook plumbing is inside loaded module ranges; payload entrypoints and helper calls are not thread-start metadata"
-                .into(),
-        ),
+        GuestThreadStartPolicy::ExistingThread => {
+            if req.plan.execution.method == GuestExecutionMethod::RemoteThread {
+                notes.push(
+                    "artifact audit: thread_starts=existing-thread is not applicable to remote-thread execution; a guest thread is created with a helper thunk as its recorded start address, using a temporary thunk when no payload-image cave is available"
+                        .into(),
+                );
+            } else {
+                notes.push(
+                    "artifact audit: thread_starts=existing-thread creates no guest thread, so no new thread start address is recorded by this path"
+                        .into(),
+                );
+            }
+        }
+        GuestThreadStartPolicy::RequireModuleBacked => {
+            if req.plan.execution.method == GuestExecutionMethod::RemoteThread {
+                notes.push(
+                    "artifact audit: thread_starts=require-module-backed requires the remote-thread ThreadProc thunk to be placed in a payload-image executable code cave; no temporary thread-start fallback is allowed"
+                        .into(),
+                );
+            } else {
+                notes.push(
+                    "artifact audit: thread_starts=require-module-backed verified the IAT-hook plumbing is inside loaded module ranges; payload entrypoints and helper calls are not thread-start metadata"
+                        .into(),
+                );
+            }
+        }
     }
 
     if req.plan.dependency_policy == GuestDependencyPolicy::LoadWithGuestLoader {
@@ -2126,10 +2611,22 @@ fn guest_artifact_notes(
         );
     }
     if has_static_tls {
-        notes.push(
-            "artifact audit: static TLS directory is present, but loader-managed TLS slots are not registered"
-                .into(),
-        );
+        match req.plan.loader_entries {
+            GuestLoaderEntries::Synthesized => {
+                let thread_scope = match req.plan.execution.method {
+                    GuestExecutionMethod::RemoteThread => {
+                        "the current helper thread only; the remote DllMain thread and other existing threads are not covered"
+                    }
+                    _ => "the current target thread only; other threads are not covered",
+                };
+                notes.push(format!(
+                    "artifact audit: static TLS slot allocated via TlsAlloc, index patched into image buffer, template copied and TlsSetValue called for {thread_scope}"
+                ));
+            }
+            GuestLoaderEntries::Absent => notes.push(
+                "artifact audit: static TLS directory is present, but loader-managed TLS slots are not registered".into(),
+            ),
+        }
     }
     if pe.has_exception_directory() {
         match req.plan.loader_metadata {
@@ -2146,7 +2643,7 @@ fn guest_artifact_notes(
     if pe.has_load_config() {
         match req.plan.loader_metadata {
             GuestLoaderMetadataPolicy::BestEffort => notes.push(
-                "artifact audit: load-config directory is present; default security-cookie state is seeded when exposed, but CFG and other loader-private entries are not synthesized"
+                "artifact audit: load-config directory is present; default security-cookie state is seeded when exposed, and a CFG valid-call-target mark is requested when loader_entries=synthesized; broader loader-private entries are not synthesized"
                     .into(),
             ),
             _ => notes.push(
@@ -2154,6 +2651,40 @@ fn guest_artifact_notes(
                     .into(),
             ),
         }
+    }
+    match req.plan.header_wipe {
+        GuestHeaderWipe::None => {}
+        GuestHeaderWipe::AfterLoad => notes.push(
+            "artifact audit: PE headers (DOS header, NT headers, section headers) were zeroed after DllMain returned".into(),
+        ),
+    }
+    match req.plan.stack_shaping {
+        GuestStackShaping::Native => {}
+        GuestStackShaping::Spoofed => {
+            if req.plan.execution.method == GuestExecutionMethod::RemoteThread {
+                notes.push(
+                    "artifact audit: stack_shaping=spoofed is disabled for remote-thread launch helpers; remote-thread DllMain runs through a ThreadProc thunk and is not stack-shaped"
+                        .into(),
+                );
+            } else {
+                notes.push(
+                    "artifact audit: stack_shaping=spoofed writes a synthetic return address from a loaded module onto the stack before payload calls so stack walks attribute the call to a legitimate module"
+                        .into(),
+                );
+            }
+        }
+    }
+    match req.plan.cleanup {
+        GuestCleanup::Resident => {}
+        GuestCleanup::Tracked => notes.push(
+            "artifact audit: cleanup=tracked removes transient loader-list links after load; payload memory remains resident for the running fixture".into(),
+        ),
+    }
+    match req.plan.vad_spoof {
+        GuestVadSpoof::Off => {}
+        GuestVadSpoof::VadImageMap => notes.push(
+            "artifact audit: vad_spoof=vad-image-map completed before DllMain; this mutates only VAD metadata for a private mapping and does not create a real SEC_IMAGE section object, so deep kernel inspection may still distinguish it from loader-created image backing".into(),
+        ),
     }
     notes
 }
@@ -2237,6 +2768,571 @@ fn protect_guest_sections(
     Ok(())
 }
 
+fn find_spoofed_return(
+    backend: &dyn GuestMemoryBackend,
+    pid: u32,
+) -> Result<GuestSpoofedReturn, GuestInjectError> {
+    let modules = backend.module_list(pid)?;
+    let regions = backend.memory_map(pid).unwrap_or_else(|err| {
+        tracing::debug!(
+            pid,
+            error = %err,
+            "stack spoofing: guest memory map unavailable; falling back to bounded module scan"
+        );
+        Vec::new()
+    });
+
+    for preferred in ["ntdll.dll", "kernel32.dll", "kernelbase.dll"] {
+        for module in modules
+            .iter()
+            .filter(|module| module.name.eq_ignore_ascii_case(preferred))
+        {
+            for (start, end) in spoofed_return_scan_ranges(module, &regions) {
+                if let Some(gadget) = find_spoofed_return_in_guest_range(backend, pid, start, end)?
+                {
+                    tracing::info!(
+                        pid,
+                        addr = format_args!("{:#x}", gadget.gadget_addr),
+                        module = %module.name,
+                        stack_adjust = format_args!("{:#x}", gadget.stack_adjust),
+                        range_start = format_args!("{start:#x}"),
+                        range_end = format_args!("{end:#x}"),
+                        "stack spoofing: found shadow-space-safe return gadget"
+                    );
+                    return Ok(gadget);
+                }
+            }
+        }
+    }
+
+    Err(GuestInjectError::Backend(
+        "stack spoofing: no shadow-space-safe return gadget found in readable executable ntdll/kernel32/kernelbase ranges".into(),
+    ))
+}
+
+fn spoofed_return_scan_ranges(
+    module: &GuestModuleInfo,
+    regions: &[GuestMemoryRegion],
+) -> Vec<(u64, u64)> {
+    let module_end = module.base.saturating_add(module.size);
+    let mut ranges = Vec::new();
+    let mut remaining = module.size.min(SPOOFED_RETURN_SCAN_LIMIT);
+
+    for region in regions {
+        if remaining == 0 {
+            break;
+        }
+        if !region.readable || !region.executable {
+            continue;
+        }
+        let region_end = region.base.saturating_add(region.size);
+        let start = region.base.max(module.base);
+        let end = region_end.min(module_end);
+        if start >= end {
+            continue;
+        }
+        let capped_end = start.saturating_add((end - start).min(remaining));
+        ranges.push((start, capped_end));
+        remaining = remaining.saturating_sub(capped_end - start);
+    }
+
+    if ranges.is_empty() && module.size != 0 {
+        ranges.push((
+            module.base,
+            module
+                .base
+                .saturating_add(module.size.min(SPOOFED_RETURN_SCAN_LIMIT)),
+        ));
+    }
+
+    ranges
+}
+
+fn find_spoofed_return_in_guest_range(
+    backend: &dyn GuestMemoryBackend,
+    pid: u32,
+    start: u64,
+    end: u64,
+) -> Result<Option<GuestSpoofedReturn>, GuestInjectError> {
+    let mut addr = start;
+    while addr < end {
+        let len = (end - addr).min(GUEST_PAGE_SIZE as u64) as usize;
+        match backend.read(pid, addr, len) {
+            Ok(bytes) => {
+                if let Some((off, stack_adjust)) = find_spoofed_return_gadget(&bytes) {
+                    return Ok(Some(GuestSpoofedReturn {
+                        gadget_addr: addr + off as u64,
+                        stack_adjust,
+                    }));
+                }
+            }
+            Err(err) if is_process_gone_error(&err) => return Err(err),
+            Err(err) => {
+                tracing::debug!(
+                    pid,
+                    addr = format_args!("{addr:#x}"),
+                    len,
+                    error = %err,
+                    "stack spoofing: skipping unreadable scan chunk"
+                );
+            }
+        }
+        addr = addr.saturating_add(len as u64);
+    }
+    Ok(None)
+}
+
+fn find_spoofed_return_gadget(bytes: &[u8]) -> Option<(usize, u8)> {
+    for (stack_adjust, pattern) in [
+        (0x20, [0x48, 0x83, 0xC4, 0x20, 0xC3]),
+        (0x28, [0x48, 0x83, 0xC4, 0x28, 0xC3]),
+    ] {
+        if let Some(off) = bytes.windows(pattern.len()).position(|w| w == pattern) {
+            return Some((off, stack_adjust));
+        }
+    }
+    None
+}
+
+fn random_base_address() -> u64 {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let pid = std::process::id() as u64;
+    let mut state = time ^ pid.rotate_left(17) ^ 0x9E37_79B9_7F4A_7C15;
+    state ^= state >> 33;
+    state = state.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    state ^= state >> 33;
+    let range = 0x7FF0_0000_0000u64 - 0x1000_0000u64;
+    let offset = state % range;
+    let base = 0x1000_0000u64 + offset;
+    base & !0xFFFF
+}
+
+fn remote_thread_param_block(
+    entry_point: u64,
+    remote_base: u64,
+    exit_code: u64,
+    status: u64,
+) -> [u8; REMOTE_THREAD_PARAM_SIZE] {
+    let values = [
+        entry_point,
+        remote_base,
+        DLL_PROCESS_ATTACH as u64,
+        0,
+        exit_code,
+        status,
+    ];
+    let mut block = [0u8; REMOTE_THREAD_PARAM_SIZE];
+    for (i, value) in values.into_iter().enumerate() {
+        let off = i * 8;
+        block[off..off + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    block
+}
+
+fn poll_remote_thread_exit(
+    backend: &dyn GuestMemoryBackend,
+    pid: u32,
+    status_addr: u64,
+    exit_code_addr: u64,
+    timeout_ms: u32,
+) -> Result<u64, GuestInjectError> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+    loop {
+        let status = read_remote_u32(backend, pid, status_addr)?;
+        if status != 0 {
+            return read_remote_u32(backend, pid, exit_code_addr).map(u64::from);
+        }
+        if Instant::now() >= deadline {
+            return Err(GuestInjectError::Backend(format!(
+                "remote thread did not complete within {timeout_ms} ms"
+            )));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn best_effort_virtual_free(
+    backend: &dyn GuestMemoryBackend,
+    pid: u32,
+    hook: &GuestIatHook,
+    virtual_free: u64,
+    addr: u64,
+    timeout_ms: u32,
+) {
+    if addr != 0 {
+        let _ = backend.call_iat_hook(
+            pid,
+            hook,
+            virtual_free,
+            [addr, 0, MEM_RELEASE, 0],
+            timeout_ms,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn invoke_dllmain_remote_thread(
+    backend: &dyn GuestMemoryBackend,
+    pid: u32,
+    hook: &GuestIatHook,
+    virtual_alloc: u64,
+    stage: u64,
+    entry_point: u64,
+    remote_base: u64,
+    image: &[u8],
+    pe: &Pe,
+    require_module_backed_start: bool,
+    timeout_ms: u32,
+) -> Result<u64, GuestInjectError> {
+    let helper_hook = GuestIatHook {
+        spoofed_return: None,
+        ..*hook
+    };
+    let hook = &helper_hook;
+    let trampoline = stage + STAGE_TRAMPOLINE_OFFSET;
+    let param_block = stage + STAGE_PARAM_OFFSET;
+    let create_thread = resolve_import_symbol(backend, pid, "kernel32.dll", "CreateThread")?;
+    let virtual_free = resolve_import_symbol(backend, pid, "kernel32.dll", "VirtualFree")?;
+    let close_handle = resolve_import_symbol(backend, pid, "kernel32.dll", "CloseHandle")?;
+    let virtual_protect = resolve_import_symbol(backend, pid, "kernel32.dll", "VirtualProtect")?;
+
+    let thunk_code_size = REMOTE_THREAD_DLLMAIN_THUNK.len();
+    let scratch = backend.call_iat_hook(
+        pid,
+        hook,
+        virtual_alloc,
+        [
+            0,
+            REMOTE_THREAD_THUNK_ALLOCATION_SIZE,
+            MEM_COMMIT_RESERVE,
+            PAGE_EXECUTE_READWRITE,
+        ],
+        timeout_ms,
+    )?;
+    if scratch == 0 {
+        return Err(GuestInjectError::Backend(
+            "VirtualAlloc returned NULL for remote-thread scratch".into(),
+        ));
+    }
+    if let Err(err) = backend.touch_iat_hook(
+        pid,
+        hook,
+        scratch,
+        REMOTE_THREAD_THUNK_ALLOCATION_SIZE as usize,
+        timeout_ms,
+    ) {
+        best_effort_virtual_free(backend, pid, hook, virtual_free, scratch, timeout_ms);
+        return Err(err);
+    }
+
+    let thunk_param = scratch + REMOTE_THREAD_PARAM_OFFSET;
+    let exit_code_slot = scratch + REMOTE_THREAD_EXIT_CODE_OFFSET;
+    let status_slot = scratch + REMOTE_THREAD_STATUS_OFFSET;
+    let tid_slot = scratch + REMOTE_THREAD_THREAD_ID_OFFSET;
+    let mut scratch_region = vec![0u8; REMOTE_THREAD_THREAD_ID_OFFSET as usize + 8];
+    scratch_region[REMOTE_THREAD_PARAM_OFFSET as usize
+        ..REMOTE_THREAD_PARAM_OFFSET as usize + REMOTE_THREAD_PARAM_SIZE]
+        .copy_from_slice(&remote_thread_param_block(
+            entry_point,
+            remote_base,
+            exit_code_slot,
+            status_slot,
+        ));
+
+    let (thunk_addr, thread_start_location) = match find_in_image_code_cave(
+        pe,
+        image,
+        thunk_code_size,
+    ) {
+        Some(thunk_offset) => {
+            let thunk_addr = remote_base + thunk_offset as u64;
+            if let Err(err) = guest_virtual_protect(
+                backend,
+                pid,
+                hook,
+                virtual_protect,
+                thunk_addr,
+                thunk_code_size as u64,
+                PAGE_EXECUTE_READWRITE,
+                hook.result_addr + OLD_PROTECT_RESULT_OFFSET,
+                timeout_ms,
+                "remote-thread in-image thunk",
+            ) {
+                best_effort_virtual_free(backend, pid, hook, virtual_free, scratch, timeout_ms);
+                return Err(err);
+            }
+            let old_protect =
+                match backend.read(pid, hook.result_addr + OLD_PROTECT_RESULT_OFFSET, 4) {
+                    Ok(old_protect) => old_protect,
+                    Err(err) => {
+                        best_effort_virtual_free(
+                            backend,
+                            pid,
+                            hook,
+                            virtual_free,
+                            scratch,
+                            timeout_ms,
+                        );
+                        return Err(err);
+                    }
+                };
+            if let Err(err) = write_verified(
+                backend,
+                pid,
+                thunk_addr,
+                REMOTE_THREAD_DLLMAIN_THUNK,
+                "remote-thread in-image thunk",
+            ) {
+                best_effort_virtual_free(backend, pid, hook, virtual_free, scratch, timeout_ms);
+                return Err(err);
+            }
+            let old_protect = u32::from_le_bytes(old_protect[0..4].try_into().unwrap()) as u64;
+            if old_protect != 0 {
+                let _ = guest_virtual_protect(
+                    backend,
+                    pid,
+                    hook,
+                    virtual_protect,
+                    thunk_addr,
+                    thunk_code_size as u64,
+                    old_protect,
+                    hook.result_addr + OLD_PROTECT_RESULT_OFFSET,
+                    timeout_ms,
+                    "remote-thread in-image thunk restore",
+                );
+            }
+            tracing::info!(
+                pid,
+                thunk_addr = format_args!("{thunk_addr:#x}"),
+                entry_point = format_args!("{entry_point:#x}"),
+                "DllMain thunk written into payload image code cave; thread start will be module-backed"
+            );
+            (thunk_addr, "payload-image code cave")
+        }
+        None => {
+            if require_module_backed_start {
+                best_effort_virtual_free(backend, pid, hook, virtual_free, scratch, timeout_ms);
+                return Err(GuestInjectError::Backend(
+                    "remote-thread module-backed start requires an executable payload-image code cave for the DllMain thunk"
+                        .into(),
+                ));
+            }
+            scratch_region[..thunk_code_size].copy_from_slice(REMOTE_THREAD_DLLMAIN_THUNK);
+            tracing::info!(
+                pid,
+                thunk_addr = format_args!("{scratch:#x}"),
+                entry_point = format_args!("{entry_point:#x}"),
+                "remote-thread: no payload-image code cave available; using temporary ThreadProc thunk"
+            );
+            (scratch, "temporary helper allocation")
+        }
+    };
+    if let Err(err) = write_verified(
+        backend,
+        pid,
+        scratch,
+        &scratch_region,
+        "remote-thread scratch",
+    ) {
+        best_effort_virtual_free(backend, pid, hook, virtual_free, scratch, timeout_ms);
+        return Err(err);
+    }
+
+    let saved = match backend.read(pid, trampoline, GUEST_PROC_TRAMPOLINE.len()) {
+        Ok(saved) => saved,
+        Err(err) => {
+            best_effort_virtual_free(backend, pid, hook, virtual_free, scratch, timeout_ms);
+            return Err(err);
+        }
+    };
+    if let Err(err) = write_verified(
+        backend,
+        pid,
+        trampoline,
+        GUEST_PROC_TRAMPOLINE,
+        "remote-thread trampoline",
+    ) {
+        best_effort_virtual_free(backend, pid, hook, virtual_free, scratch, timeout_ms);
+        return Err(err);
+    }
+
+    let thread_handle = call_guest_proc(
+        backend,
+        pid,
+        hook,
+        trampoline,
+        param_block,
+        create_thread,
+        &[0, 0, thunk_addr, thunk_param, 0, tid_slot],
+        timeout_ms,
+        "CreateThread",
+    );
+    if let Err(err) = backend.write(pid, trampoline, &saved) {
+        tracing::warn!(
+            pid,
+            error = %err,
+            "failed to restore guest proc trampoline after remote-thread create"
+        );
+    }
+    let thread_handle = match thread_handle {
+        Ok(handle) => handle,
+        Err(err) => {
+            best_effort_virtual_free(backend, pid, hook, virtual_free, scratch, timeout_ms);
+            return Err(err);
+        }
+    };
+    if thread_handle == 0 {
+        best_effort_virtual_free(backend, pid, hook, virtual_free, scratch, timeout_ms);
+        return Err(GuestInjectError::Backend(
+            "CreateThread returned NULL".into(),
+        ));
+    }
+    tracing::info!(
+        pid,
+        thread_handle = format_args!("{thread_handle:#x}"),
+        thunk_addr = format_args!("{thunk_addr:#x}"),
+        thread_start = thread_start_location,
+        "guest thread created; kernel-recorded start address selected"
+    );
+
+    let exit_code =
+        match poll_remote_thread_exit(backend, pid, status_slot, exit_code_slot, timeout_ms) {
+            Ok(exit_code) => exit_code,
+            Err(err) => {
+                let _ = backend.call_iat_hook(
+                    pid,
+                    hook,
+                    close_handle,
+                    [thread_handle, 0, 0, 0],
+                    timeout_ms.min(250),
+                );
+                best_effort_virtual_free(
+                    backend,
+                    pid,
+                    hook,
+                    virtual_free,
+                    scratch,
+                    timeout_ms.min(250),
+                );
+                return Err(err);
+            }
+        };
+    let _ = backend.call_iat_hook(
+        pid,
+        hook,
+        close_handle,
+        [thread_handle, 0, 0, 0],
+        timeout_ms.min(250),
+    );
+    best_effort_virtual_free(
+        backend,
+        pid,
+        hook,
+        virtual_free,
+        scratch,
+        timeout_ms.min(250),
+    );
+    tracing::info!(
+        pid,
+        thread_handle = format_args!("{thread_handle:#x}"),
+        exit_code,
+        "remote thread completed; DllMain return value retrieved"
+    );
+    Ok(exit_code)
+}
+
+fn find_in_image_code_cave(pe: &Pe, image: &[u8], size: usize) -> Option<usize> {
+    for section in &pe.sections {
+        if section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
+            continue;
+        }
+        let start = section.virtual_address as usize;
+        let sec_size = guest_section_size(section) as usize;
+        if start + sec_size > image.len() {
+            continue;
+        }
+        if let Some(off) = find_code_cave(&image[start..start + sec_size], size) {
+            return Some(start + off);
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn allocate_virtual(
+    backend: &dyn GuestMemoryBackend,
+    pid: u32,
+    hook: &GuestIatHook,
+    virtual_alloc: u64,
+    pe: &Pe,
+    allocation_protection: u64,
+    base_policy: GuestBaseAddress,
+    timeout_ms: u32,
+) -> Result<u64, GuestInjectError> {
+    let size = pe.size_of_image as u64;
+    let try_alloc = |addr: u64| {
+        backend.call_iat_hook(
+            pid,
+            hook,
+            virtual_alloc,
+            [addr, size, MEM_COMMIT_RESERVE, allocation_protection],
+            timeout_ms,
+        )
+    };
+    match base_policy {
+        GuestBaseAddress::Preferred => {
+            tracing::info!(
+                pid,
+                preferred_base = format_args!("{:#x}", pe.image_base),
+                size,
+                protection = format_args!("{allocation_protection:#x}"),
+                "calling guest VirtualAlloc at preferred image base through IAT hook"
+            );
+            let preferred = try_alloc(pe.image_base)?;
+            if preferred != 0 || !pe.has_relocation_directory() {
+                return Ok(preferred);
+            }
+            tracing::info!(
+                pid,
+                preferred_base = format_args!("{:#x}", pe.image_base),
+                "preferred image base unavailable; retrying guest VirtualAlloc at any base"
+            );
+            try_alloc(0)
+        }
+        GuestBaseAddress::Randomized => {
+            if !pe.has_relocation_directory() {
+                tracing::info!(
+                    pid,
+                    "base_address=randomized but payload has no relocation directory; using preferred base"
+                );
+                return try_alloc(pe.image_base);
+            }
+            for attempt in 0..3u32 {
+                let candidate = random_base_address();
+                tracing::info!(
+                    pid,
+                    attempt,
+                    candidate = format_args!("{candidate:#x}"),
+                    size,
+                    "calling guest VirtualAlloc at randomized base"
+                );
+                let result = try_alloc(candidate)?;
+                if result != 0 {
+                    return Ok(result);
+                }
+            }
+            tracing::info!(
+                pid,
+                "randomized base attempts exhausted; falling back to any base"
+            );
+            try_alloc(0)
+        }
+    }
+}
+
 fn initial_allocation_protection(plan: &GuestInjectionPlan, pe: &Pe) -> u64 {
     match (plan.final_protections, plan.permission_transitions) {
         (GuestFinalProtections::Rwx, _) => PAGE_EXECUTE_READWRITE,
@@ -2287,16 +3383,33 @@ fn validate_guest_thread_start_policy(
     hook: &GuestIatHook,
 ) -> Result<Vec<String>, GuestInjectError> {
     match plan.thread_starts {
-        GuestThreadStartPolicy::ExistingThread => Ok(vec![
-            "thread starts: existing target thread is used; decant does not create guest thread-start metadata"
-                .into(),
-        ]),
+        GuestThreadStartPolicy::ExistingThread => {
+            if plan.execution.method == GuestExecutionMethod::RemoteThread {
+                Ok(vec![
+                    "thread starts: remote-thread execution creates a guest thread; thread_starts=existing-thread is not applicable to this execution method"
+                        .into(),
+                ])
+            } else {
+                Ok(vec![
+                    "thread starts: existing target thread is used; decant does not create guest thread-start metadata"
+                        .into(),
+                ])
+            }
+        }
         GuestThreadStartPolicy::RequireModuleBacked => {
+            if plan.execution.method == GuestExecutionMethod::RemoteThread {
+                return Ok(vec![
+                    "thread starts: remote-thread execution requires a payload-image code cave for a module-backed ThreadProc thunk"
+                        .into(),
+                    "thread starts: payloads without a large enough executable cave fail rather than falling back to a temporary thread start"
+                        .into(),
+                ]);
+            }
             if plan.execution.method != GuestExecutionMethod::IatHook {
                 return Err(GuestInjectError::Unsupported {
                     operation: "guest thread start policy",
                     reason: format!(
-                        "thread_starts = \"require-module-backed\" is implemented for iat-hook execution, not {}",
+                        "thread_starts = \"require-module-backed\" is implemented for iat-hook and remote-thread execution, not {}",
                         plan.execution.method.label()
                     ),
                 });
@@ -2492,6 +3605,24 @@ const MEM_RELEASE: u64 = 0x8000;
 const STAGE_TRAMPOLINE_OFFSET: u64 = STAGE_SCRATCH_OFFSET;
 const STAGE_PARAM_OFFSET: u64 = STAGE_SCRATCH_OFFSET + 0x60;
 const GUEST_PARAM_BLOCK_SIZE: usize = 0x58;
+
+const REMOTE_THREAD_THUNK_ALLOCATION_SIZE: u64 = 0x1000;
+const REMOTE_THREAD_PARAM_OFFSET: u64 = 0x80;
+const REMOTE_THREAD_PARAM_SIZE: usize = 0x30;
+const REMOTE_THREAD_EXIT_CODE_OFFSET: u64 = 0x100;
+const REMOTE_THREAD_STATUS_OFFSET: u64 = 0x108;
+const REMOTE_THREAD_THREAD_ID_OFFSET: u64 = 0x110;
+
+const _: () = {
+    assert!(
+        REMOTE_THREAD_PARAM_OFFSET + REMOTE_THREAD_PARAM_SIZE as u64
+            <= REMOTE_THREAD_EXIT_CODE_OFFSET
+    );
+    assert!(REMOTE_THREAD_EXIT_CODE_OFFSET + 4 <= REMOTE_THREAD_STATUS_OFFSET);
+    assert!(REMOTE_THREAD_STATUS_OFFSET + 4 <= REMOTE_THREAD_THREAD_ID_OFFSET);
+    assert!(REMOTE_THREAD_THREAD_ID_OFFSET + 8 <= REMOTE_THREAD_THUNK_ALLOCATION_SIZE);
+};
+
 const SEC_IMAGE_PATH_CHARS: u64 = 0x400;
 const SEC_IMAGE_PATH_BYTES: u64 = SEC_IMAGE_PATH_CHARS * 2;
 
@@ -2501,6 +3632,25 @@ const GUEST_PROC_TRAMPOLINE: &[u8] = &[
     0x28, 0x48, 0x8B, 0x41, 0x40, 0x48, 0x89, 0x44, 0x24, 0x30, 0x48, 0x8B, 0x41, 0x48, 0x48, 0x89,
     0x44, 0x24, 0x38, 0x4C, 0x8B, 0x49, 0x28, 0x4C, 0x8B, 0x41, 0x20, 0x48, 0x8B, 0x51, 0x18, 0x48,
     0x8B, 0x49, 0x10, 0x4C, 0x89, 0xD0, 0xFF, 0xD0, 0x48, 0x89, 0xEC, 0x5D, 0xC3,
+];
+const GUEST_GET_PEB_TRAMPOLINE: &[u8] =
+    &[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00, 0xC3];
+const REMOTE_THREAD_DLLMAIN_THUNK: &[u8] = &[
+    0x53, // push rbx
+    0x48, 0x83, 0xEC, 0x20, // sub rsp, 0x20
+    0x48, 0x89, 0xCB, // mov rbx, rcx
+    0x48, 0x8B, 0x03, // mov rax, [rbx]
+    0x48, 0x8B, 0x4B, 0x08, // mov rcx, [rbx+8]
+    0x48, 0x8B, 0x53, 0x10, // mov rdx, [rbx+0x10]
+    0x4C, 0x8B, 0x43, 0x18, // mov r8, [rbx+0x18]
+    0xFF, 0xD0, // call rax
+    0x4C, 0x8B, 0x53, 0x20, // mov r10, [rbx+0x20]
+    0x41, 0x89, 0x02, // mov [r10], eax
+    0x4C, 0x8B, 0x53, 0x28, // mov r10, [rbx+0x28]
+    0x41, 0xC7, 0x02, 0x01, 0x00, 0x00, 0x00, // mov dword ptr [r10], 1
+    0x48, 0x83, 0xC4, 0x20, // add rsp, 0x20
+    0x5B, // pop rbx
+    0xC3, // ret
 ];
 
 struct SecImageCleanup<'a> {
@@ -2596,6 +3746,21 @@ fn decode_wide(bytes: &[u8]) -> String {
     String::from_utf16_lossy(&pairs[..len])
 }
 
+fn should_request_cfg_call_target(plan: &GuestInjectionPlan, pe: &Pe) -> bool {
+    plan.loader_entries == GuestLoaderEntries::Synthesized
+        && plan.loader_metadata == GuestLoaderMetadataPolicy::BestEffort
+        && pe.has_load_config()
+}
+
+fn cfg_call_target_registration_args(
+    remote_base: u64,
+    region_size: u64,
+    target_count: u64,
+    cfg_info: u64,
+) -> [u64; 5] {
+    [u64::MAX, remote_base, region_size, target_count, cfg_info]
+}
+
 #[allow(clippy::too_many_arguments)]
 fn call_guest_proc(
     backend: &dyn GuestMemoryBackend,
@@ -2643,6 +3808,7 @@ fn allocate_sec_image(
     let write_file = resolve_import_symbol(backend, pid, "kernel32.dll", "WriteFile")?;
     let close_handle = resolve_import_symbol(backend, pid, "kernel32.dll", "CloseHandle")?;
     let virtual_free = resolve_import_symbol(backend, pid, "kernel32.dll", "VirtualFree")?;
+
     let create_file_mapping =
         resolve_import_symbol(backend, pid, "kernel32.dll", "CreateFileMappingW")?;
     let map_view = resolve_import_symbol(backend, pid, "kernel32.dll", "MapViewOfFile")?;
@@ -2898,6 +4064,151 @@ fn allocate_sec_image(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn synthesize_peb_loader_entry(
+    backend: &dyn GuestMemoryBackend,
+    pid: u32,
+    hook: &GuestIatHook,
+    virtual_alloc: u64,
+    stage: u64,
+    remote_base: u64,
+    entry_point: u64,
+    size_of_image: u32,
+    dll_name: &str,
+    timeout_ms: u32,
+) -> Result<u64, GuestInjectError> {
+    let trampoline = stage + STAGE_TRAMPOLINE_OFFSET;
+    let saved = backend.read(pid, trampoline, GUEST_GET_PEB_TRAMPOLINE.len())?;
+    write_verified(
+        backend,
+        pid,
+        trampoline,
+        GUEST_GET_PEB_TRAMPOLINE,
+        "PEB lookup trampoline",
+    )?;
+
+    let peb = backend.call_iat_hook(pid, hook, trampoline, [0, 0, 0, 0], timeout_ms)?;
+    let _ = backend.write(pid, trampoline, &saved);
+    if peb == 0 {
+        return Err(GuestInjectError::Backend(
+            "PEB synthesis: guest PEB lookup returned null".into(),
+        ));
+    }
+    let ldr_bytes = backend.read(pid, peb + 0x18, 8)?;
+    let ldr = u64::from_le_bytes(ldr_bytes[0..8].try_into().unwrap());
+    if ldr == 0 {
+        return Err(GuestInjectError::Backend(format!(
+            "PEB Ldr is null for guest PEB {peb:#x}"
+        )));
+    }
+
+    let entry_size = 0x830u64;
+    let entry = backend.call_iat_hook(
+        pid,
+        hook,
+        virtual_alloc,
+        [0, entry_size, MEM_COMMIT_RESERVE, PAGE_READWRITE],
+        timeout_ms,
+    )?;
+    if entry == 0 {
+        let _ = backend.write(pid, trampoline, &saved);
+        return Err(GuestInjectError::Backend(
+            "PEB synthesis: VirtualAlloc for LDR entry returned NULL".into(),
+        ));
+    }
+    backend.touch_iat_hook(pid, hook, entry, entry_size as usize, timeout_ms)?;
+
+    let mut entry_data = vec![0u8; entry_size as usize];
+    entry_data[0x30..0x38].copy_from_slice(&remote_base.to_le_bytes());
+    entry_data[0x38..0x40].copy_from_slice(&entry_point.to_le_bytes());
+    entry_data[0x40..0x44].copy_from_slice(&size_of_image.to_le_bytes());
+    let init_links = entry + 0x20;
+    entry_data[0x20..0x28].copy_from_slice(&init_links.to_le_bytes());
+    entry_data[0x28..0x30].copy_from_slice(&init_links.to_le_bytes());
+
+    let base_name_wide = encode_wide(dll_name);
+    let full_name = format!("C:\\Windows\\System32\\{dll_name}");
+    let full_name_wide = encode_wide(&full_name);
+    let base_name_offset = 0x200usize;
+    let full_name_offset = 0x410usize;
+    entry_data[base_name_offset..base_name_offset + base_name_wide.len()]
+        .copy_from_slice(&base_name_wide);
+    entry_data[full_name_offset..full_name_offset + full_name_wide.len()]
+        .copy_from_slice(&full_name_wide);
+
+    let base_name_len = (base_name_wide.len() - 2) as u16;
+    let full_name_len = (full_name_wide.len() - 2) as u16;
+    entry_data[0x48..0x4A].copy_from_slice(&full_name_len.to_le_bytes());
+    entry_data[0x4A..0x4C].copy_from_slice(&(full_name_wide.len() as u16).to_le_bytes());
+    entry_data[0x50..0x58].copy_from_slice(&(entry + full_name_offset as u64).to_le_bytes());
+    entry_data[0x58..0x5A].copy_from_slice(&base_name_len.to_le_bytes());
+    entry_data[0x5A..0x5C].copy_from_slice(&(base_name_wide.len() as u16).to_le_bytes());
+    entry_data[0x60..0x68].copy_from_slice(&(entry + base_name_offset as u64).to_le_bytes());
+
+    write_verified(backend, pid, entry, &entry_data, "LDR_DATA_TABLE_ENTRY")?;
+
+    let list_insert = |list_head: u64, links_offset: u64| -> Result<(), GuestInjectError> {
+        let links = entry + links_offset;
+        let head_blink_bytes = backend.read(pid, list_head + 8, 8)?;
+        let head_blink = u64::from_le_bytes(head_blink_bytes[0..8].try_into().unwrap());
+        let flink = list_head.to_le_bytes();
+        let blink = head_blink.to_le_bytes();
+        backend.write(pid, links, &flink)?;
+        backend.write(pid, links + 8, &blink)?;
+        backend.write(pid, head_blink, &links.to_le_bytes())?;
+        backend.write(pid, list_head + 8, &links.to_le_bytes())?;
+        Ok(())
+    };
+    list_insert(ldr + 0x10, 0x00)?;
+    list_insert(ldr + 0x20, 0x10)?;
+
+    let _ = backend.write(pid, trampoline, &saved);
+    tracing::info!(
+        pid,
+        peb = format_args!("{peb:#x}"),
+        ldr = format_args!("{ldr:#x}"),
+        entry = format_args!("{entry:#x}"),
+        remote_base = format_args!("{remote_base:#x}"),
+        "synthesized PEB loader entry linked into InLoadOrder and InMemoryOrder lists"
+    );
+    Ok(entry)
+}
+
+fn unlink_synthesized_peb_loader_entry(
+    backend: &dyn GuestMemoryBackend,
+    pid: u32,
+    entry: u64,
+) -> Result<(), GuestInjectError> {
+    unlink_guest_list_entry(backend, pid, entry)?;
+    unlink_guest_list_entry(backend, pid, entry + 0x10)?;
+    tracing::info!(
+        pid,
+        entry = format_args!("{entry:#x}"),
+        "unlinked synthesized PEB loader entry from load and memory lists"
+    );
+    Ok(())
+}
+
+fn unlink_guest_list_entry(
+    backend: &dyn GuestMemoryBackend,
+    pid: u32,
+    links: u64,
+) -> Result<(), GuestInjectError> {
+    let bytes = backend.read(pid, links, 16)?;
+    let flink = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let blink = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    if flink == 0 || blink == 0 {
+        return Err(GuestInjectError::Backend(format!(
+            "PEB synthesis cleanup: list entry {links:#x} has null links"
+        )));
+    }
+    backend.write(pid, flink + 8, &blink.to_le_bytes())?;
+    backend.write(pid, blink, &flink.to_le_bytes())?;
+    backend.write(pid, links, &links.to_le_bytes())?;
+    backend.write(pid, links + 8, &links.to_le_bytes())?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn guest_virtual_protect(
     backend: &dyn GuestMemoryBackend,
     pid: u32,
@@ -3021,8 +4332,13 @@ fn call_stub(hook: &GuestIatHook, function: u64, args: [u64; 4]) -> Vec<u8> {
     code.mov_abs(Reg64::Rdx, args[1]);
     code.mov_abs(Reg64::R8, args[2]);
     code.mov_abs(Reg64::R9, args[3]);
-    code.mov_abs(Reg64::Rax, function);
-    code.call_rax_windows_x64();
+    match hook.spoofed_return {
+        Some(gadget) => emit_spoofed_call(&mut code, hook, function, gadget, 0),
+        None => {
+            code.mov_abs(Reg64::Rax, function);
+            code.call_rax_windows_x64();
+        }
+    }
     code.mov_abs(Reg64::R10, hook.result_addr + 8);
     code.store_rax_at_r10();
     code.mov_abs(Reg64::R10, hook.result_addr);
@@ -3048,8 +4364,13 @@ fn framed_call_stub(hook: &GuestIatHook, function: u64, args: [u64; 4]) -> Vec<u
     code.mov_abs(Reg64::Rdx, args[1]);
     code.mov_abs(Reg64::R8, args[2]);
     code.mov_abs(Reg64::R9, args[3]);
-    code.mov_abs(Reg64::Rax, function);
-    code.call_rax_with_current_frame();
+    match hook.spoofed_return {
+        Some(gadget) => emit_spoofed_call(&mut code, hook, function, gadget, 8),
+        None => {
+            code.mov_abs(Reg64::Rax, function);
+            code.call_rax_with_current_frame();
+        }
+    }
     code.mov_abs(Reg64::R10, hook.result_addr + 8);
     code.store_rax_at_r10();
     code.mov_abs(Reg64::R10, hook.result_addr);
@@ -3185,6 +4506,39 @@ fn preserve_import_args(code: &mut X64Stub) {
     code.push(Reg64::Rdx);
     code.push(Reg64::R8);
     code.push(Reg64::R9);
+}
+
+fn emit_spoofed_call(
+    code: &mut X64Stub,
+    hook: &GuestIatHook,
+    function: u64,
+    gadget: GuestSpoofedReturn,
+    desired_frame_mod: u8,
+) {
+    let (frame_size, post_add) = spoofed_stack_frame(gadget.stack_adjust, desired_frame_mod);
+    let landing = code.len();
+    let landing_addr = hook.stub_addr + landing as u64 + SPOOFED_CALL_LANDING_DELTA;
+    code.sub_rsp(frame_size);
+    code.mov_abs(Reg64::R11, gadget.gadget_addr);
+    code.store_reg_at_rsp_disp(Reg64::R11, 0);
+    code.mov_abs(Reg64::Rax, landing_addr);
+    code.store_reg_at_rsp_disp(Reg64::Rax, 8 + gadget.stack_adjust);
+    code.mov_abs(Reg64::Rax, function);
+    code.jmp_rax();
+    if post_add != 0 {
+        code.add_rsp(post_add);
+    }
+}
+
+fn spoofed_stack_frame(stack_adjust: u8, desired_frame_mod: u8) -> (u8, u8) {
+    let base = 16u16 + u16::from(stack_adjust);
+    let desired = u16::from(desired_frame_mod);
+    let post_add = (16 + desired - (base % 16)) % 16;
+    let frame_size = base + post_add;
+    (
+        u8::try_from(frame_size).expect("spoofed stack frame fits in imm8"),
+        u8::try_from(post_add).expect("spoofed stack fixup fits in imm8"),
+    )
 }
 
 fn tail_jump_original_import(code: &mut X64Stub, original_target: u64) {
@@ -3353,6 +4707,9 @@ impl X64Stub {
 
     fn store_reg_at_rsp_disp(&mut self, reg: Reg64, disp: u8) {
         match reg {
+            Reg64::Rax => self
+                .bytes
+                .extend_from_slice(&[0x48, 0x89, 0x44, 0x24, disp]),
             Reg64::Rcx => self
                 .bytes
                 .extend_from_slice(&[0x48, 0x89, 0x4C, 0x24, disp]),
@@ -3365,6 +4722,9 @@ impl X64Stub {
             Reg64::R9 => self
                 .bytes
                 .extend_from_slice(&[0x4C, 0x89, 0x4C, 0x24, disp]),
+            Reg64::R11 => self
+                .bytes
+                .extend_from_slice(&[0x4C, 0x89, 0x5C, 0x24, disp]),
             _ => unreachable!("unsupported stack spill register"),
         }
     }
@@ -4412,9 +5772,73 @@ mod tests {
 
     #[test]
     fn memflow_capabilities_cover_iat_hook_manual_map() {
-        let missing = GuestCapabilities::memflow_guest_injection().missing_manual_map();
+        let capabilities = GuestCapabilities::memflow_guest_injection();
+        let missing = capabilities.missing_manual_map();
         assert!(missing.is_empty(), "{missing:?}");
-        assert!(GuestCapabilities::memflow_guest_injection().exception_registration);
+        assert!(capabilities.exception_registration);
+        assert!(!capabilities.vad_spoof);
+    }
+
+    struct VadRejectBackend;
+
+    impl GuestMemoryBackend for VadRejectBackend {
+        fn capabilities(&self) -> GuestCapabilities {
+            GuestCapabilities::memflow_guest_injection()
+        }
+
+        fn list_processes(&self) -> Result<Vec<GuestProcessInfo>, GuestInjectError> {
+            panic!("vad spoof rejection should happen before process access")
+        }
+
+        fn module_list(&self, _pid: u32) -> Result<Vec<GuestModuleInfo>, GuestInjectError> {
+            panic!("vad spoof rejection should happen before module access")
+        }
+
+        fn module_exports(
+            &self,
+            _pid: u32,
+            _module: &str,
+        ) -> Result<Vec<(String, u64)>, GuestInjectError> {
+            panic!("vad spoof rejection should happen before export access")
+        }
+
+        fn memory_map(&self, _pid: u32) -> Result<Vec<GuestMemoryRegion>, GuestInjectError> {
+            panic!("vad spoof rejection should happen before memory-map access")
+        }
+
+        fn read(&self, _pid: u32, _addr: u64, _len: usize) -> Result<Vec<u8>, GuestInjectError> {
+            panic!("vad spoof rejection should happen before memory reads")
+        }
+
+        fn write(&self, _pid: u32, _addr: u64, _data: &[u8]) -> Result<(), GuestInjectError> {
+            panic!("vad spoof rejection should happen before memory writes")
+        }
+    }
+
+    #[test]
+    fn vad_spoof_is_rejected_before_guest_access_when_backend_cannot_do_it() {
+        let config = DecantConfig::from_toml_str(
+            "[injection]\ndomain = \"guest\"\nmethod = \"manual-map\"\n\
+             [guest]\npid = 1\npayload_path = \"payload.dll\"\n\
+             vad_spoof = \"vad-image-map\"\n",
+        )
+        .unwrap();
+        let plan = GuestInjectionPlan::from_config(&config).unwrap();
+        let injector = GuestManualMapInjector;
+        let req = GuestInjectionRequest {
+            plan: &plan,
+            payload_path: std::path::Path::new("payload.dll"),
+            payload_image: &[0x4d],
+        };
+
+        match injector.inject(&VadRejectBackend, &req) {
+            Err(GuestInjectError::Unsupported { operation, reason }) => {
+                assert_eq!(operation, "VAD type spoofing");
+                assert!(reason.contains("VAD mutation support"), "{reason}");
+            }
+            Ok(_) => panic!("expected VAD spoof rejection"),
+            Err(err) => panic!("expected VAD spoof unsupported error, got {err:?}"),
+        }
     }
 
     #[test]
@@ -4458,6 +5882,7 @@ mod tests {
             stub_addr: 0x3000,
             result_addr: 0x4000,
             call_stack: GuestCallStackPolicy::Native,
+            spoofed_return: None,
         };
         let stub = call_stub(&hook, 0x5000, [1, 2, 3, 4]);
         assert!(
@@ -4495,6 +5920,46 @@ mod tests {
     }
 
     #[test]
+    fn iat_hook_spoofed_stub_keeps_landing_after_shadow_space() {
+        let hook = GuestIatHook {
+            iat_slot: 0x1000,
+            original_target: 0x2000,
+            stub_addr: 0x3000,
+            result_addr: 0x4000,
+            call_stack: GuestCallStackPolicy::Native,
+            spoofed_return: Some(GuestSpoofedReturn {
+                gadget_addr: 0x7000,
+                stack_adjust: 0x20,
+            }),
+        };
+        let stub = call_stub(&hook, 0x5000, [1, 2, 3, 4]);
+        assert!(
+            stub.windows(4).any(|w| w == [0x48, 0x83, 0xEC, 0x30]),
+            "native spoofed call must reserve return, shadow space, and continuation"
+        );
+        assert!(
+            stub.windows(5).any(|w| w == [0x4C, 0x89, 0x5C, 0x24, 0x00]),
+            "spoofed gadget must be placed as the callee return address"
+        );
+        assert!(
+            stub.windows(5).any(|w| w == [0x48, 0x89, 0x44, 0x24, 0x28]),
+            "real continuation must be stored after the 32-byte Windows x64 shadow space"
+        );
+        assert!(
+            !stub.windows(3).any(|w| w == [0x50, 0x41, 0x53]),
+            "spoofed call must not put the continuation in the callee shadow space with pushes"
+        );
+    }
+
+    #[test]
+    fn spoofed_stack_frame_restores_native_and_framed_callers() {
+        assert_eq!(spoofed_stack_frame(0x20, 0), (0x30, 0));
+        assert_eq!(spoofed_stack_frame(0x28, 0), (0x40, 0x08));
+        assert_eq!(spoofed_stack_frame(0x20, 8), (0x38, 0x08));
+        assert_eq!(spoofed_stack_frame(0x28, 8), (0x38, 0));
+    }
+
+    #[test]
     fn iat_hook_touch_stub_materializes_pages_without_iat_write() {
         let hook = GuestIatHook {
             iat_slot: 0x1000,
@@ -4502,6 +5967,7 @@ mod tests {
             stub_addr: 0x3000,
             result_addr: 0x4000,
             call_stack: GuestCallStackPolicy::Native,
+            spoofed_return: None,
         };
         let stub = touch_stub(&hook, 0x5000, GUEST_PAGE_SIZE + 1);
         assert!(
@@ -4537,6 +6003,7 @@ mod tests {
             stub_addr: 0x3000,
             result_addr: 0x4000,
             call_stack: GuestCallStackPolicy::Native,
+            spoofed_return: None,
         };
         let stub = read_touch_stub(&hook, 0x5000, GUEST_PAGE_SIZE + 1);
         assert!(
@@ -4561,6 +6028,7 @@ mod tests {
             stub_addr: 0x3000,
             result_addr: 0x4000,
             call_stack: GuestCallStackPolicy::Native,
+            spoofed_return: None,
         };
         let stub = preserve_touch_stub(&hook, 0x5000, GUEST_PAGE_SIZE + 1);
         assert!(
@@ -4595,6 +6063,66 @@ mod tests {
     }
 
     #[test]
+    fn spoofed_return_scan_uses_executable_module_regions() {
+        let module = GuestModuleInfo {
+            name: "ntdll.dll".into(),
+            base: 0x1000,
+            size: 0x8000,
+        };
+        let regions = vec![
+            GuestMemoryRegion {
+                base: 0x1000,
+                size: 0x1000,
+                readable: true,
+                writable: false,
+                executable: false,
+            },
+            GuestMemoryRegion {
+                base: 0x2000,
+                size: 0x2000,
+                readable: true,
+                writable: false,
+                executable: true,
+            },
+            GuestMemoryRegion {
+                base: 0x9000,
+                size: 0x1000,
+                readable: true,
+                writable: false,
+                executable: true,
+            },
+        ];
+
+        assert_eq!(
+            spoofed_return_scan_ranges(&module, &regions),
+            vec![(0x2000, 0x4000)]
+        );
+    }
+
+    #[test]
+    fn spoofed_return_scan_falls_back_to_bounded_module_range() {
+        let module = GuestModuleInfo {
+            name: "kernel32.dll".into(),
+            base: 0x7fff_0000,
+            size: SPOOFED_RETURN_SCAN_LIMIT + 0x1000,
+        };
+
+        assert_eq!(
+            spoofed_return_scan_ranges(&module, &[]),
+            vec![(0x7fff_0000, 0x7fff_0000 + SPOOFED_RETURN_SCAN_LIMIT)]
+        );
+    }
+
+    #[test]
+    fn spoofed_return_gadget_scan_requires_shadow_space_adjustment() {
+        assert_eq!(
+            find_spoofed_return_gadget(&[0x90, 0x48, 0x83, 0xC4, 0x20, 0xC3]),
+            Some((1, 0x20))
+        );
+        assert_eq!(find_spoofed_return_gadget(&[0x90, 0xC3]), None);
+    }
+
+    #[test]
     fn registered_unwind_stub_uses_single_frame_allocation() {
         let hook = GuestIatHook {
             iat_slot: 0x1000,
@@ -4602,6 +6130,7 @@ mod tests {
             stub_addr: 0x3000,
             result_addr: 0x4000,
             call_stack: GuestCallStackPolicy::RegisteredUnwind,
+            spoofed_return: None,
         };
         let stub = call_stub(&hook, 0x5000, [1, 2, 3, 4]);
         assert!(
@@ -4674,6 +6203,7 @@ mod tests {
             tls: crate::pe::Dir { rva: 0, size: 0 },
             load_config: crate::pe::Dir { rva: 0, size: 0 },
             delay_import: crate::pe::Dir { rva: 0, size: 0 },
+            export_dir: crate::pe::Dir { rva: 0, size: 0 },
             sections: vec![
                 Section {
                     virtual_size: 0x1000,
@@ -4733,7 +6263,7 @@ mod tests {
         let config = DecantConfig::from_toml_str(
             "[injection]\ndomain = \"guest\"\nmethod = \"manual-map\"\n\
              [guest]\npid = 1\npayload_path = \"payload.dll\"\n\
-             dependency_policy = \"require-loaded\"\ntls = \"skip\"\nfinal_protections = \"rwx\"\nloader_metadata = \"reject-unsupported\"\ncall_stack = \"registered-unwind\"\npermission_transitions = \"write-through-final\"\nthread_starts = \"require-module-backed\"\nresult_base = 8192\nresult_pattern = \"44 45\"\n",
+             dependency_policy = \"require-loaded\"\ntls = \"skip\"\nfinal_protections = \"rwx\"\nloader_metadata = \"reject-unsupported\"\ncall_stack = \"registered-unwind\"\npermission_transitions = \"write-through-final\"\nthread_starts = \"require-module-backed\"\nvad_spoof = \"vad-image-map\"\nresult_base = 8192\nresult_pattern = \"44 45\"\n",
         )
         .unwrap();
         let plan = GuestInjectionPlan::from_config(&config).unwrap();
@@ -4753,6 +6283,7 @@ mod tests {
             plan.thread_starts,
             GuestThreadStartPolicy::RequireModuleBacked
         );
+        assert_eq!(plan.vad_spoof, GuestVadSpoof::VadImageMap);
         assert_eq!(plan.result_base, Some(8192));
         assert!(plan.result_pattern.is_some());
     }
@@ -4842,6 +6373,20 @@ mod tests {
             ),
             other => panic!("expected config error, got {other:?}"),
         }
+
+        let err = DecantConfig::from_toml_str(
+            "[injection]\ndomain = \"guest\"\nmethod = \"manual-map\"\n\
+             [guest]\npid = 1\npayload_path = \"payload.dll\"\n\
+             image_backing = \"sec-image\"\nfinal_protections = \"section\"\nvad_spoof = \"vad-image-map\"\n",
+        )
+        .unwrap();
+        match GuestInjectionPlan::from_config(&err).unwrap_err() {
+            GuestInjectError::Config(msg) => assert!(
+                msg.contains("vad-image-map") && msg.contains("private"),
+                "unexpected config error: {msg}"
+            ),
+            other => panic!("expected config error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4849,8 +6394,75 @@ mod tests {
         assert_eq!(GUEST_PROC_TRAMPOLINE.len(), 77);
         assert_eq!(GUEST_PROC_TRAMPOLINE[0], 0x55);
         assert_eq!(*GUEST_PROC_TRAMPOLINE.last().unwrap(), 0xC3);
+        assert_eq!(
+            GUEST_GET_PEB_TRAMPOLINE,
+            &[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0, 0, 0, 0xC3]
+        );
         assert_eq!(GUEST_PARAM_BLOCK_SIZE, 0x58);
         assert!(STAGE_PARAM_OFFSET + GUEST_PARAM_BLOCK_SIZE as u64 <= STAGE_UNWIND_OFFSET);
+    }
+
+    #[test]
+    fn remote_thread_thunk_calls_dllmain_with_three_args() {
+        assert_eq!(&REMOTE_THREAD_DLLMAIN_THUNK[..4], &[0x53, 0x48, 0x83, 0xEC]);
+        assert!(
+            REMOTE_THREAD_DLLMAIN_THUNK
+                .windows(2)
+                .any(|w| w == [0xFF, 0xD0])
+        );
+        assert!(
+            REMOTE_THREAD_DLLMAIN_THUNK
+                .windows(3)
+                .any(|w| w == [0x41, 0x89, 0x02])
+        );
+        assert!(
+            REMOTE_THREAD_DLLMAIN_THUNK
+                .windows(7)
+                .any(|w| w == [0x41, 0xC7, 0x02, 0x01, 0, 0, 0])
+        );
+        assert_eq!(*REMOTE_THREAD_DLLMAIN_THUNK.last().unwrap(), 0xC3);
+        assert!(REMOTE_THREAD_DLLMAIN_THUNK.len() < REMOTE_THREAD_PARAM_OFFSET as usize);
+    }
+
+    #[test]
+    fn cfg_call_target_registration_requires_best_effort_load_config() {
+        let config = DecantConfig::from_toml_str(
+            "[injection]\ndomain = \"guest\"\nmethod = \"manual-map\"\n\
+             [guest]\npid = 1\npayload_path = \"payload.dll\"\n\
+             loader_entries = \"synthesized\"\nloader_metadata = \"best-effort\"\n",
+        )
+        .unwrap();
+        let plan = GuestInjectionPlan::from_config(&config).unwrap();
+        let mut pe = Pe {
+            image_base: 0,
+            entry_rva: 0,
+            size_of_image: 0,
+            size_of_headers: 0,
+            import: crate::pe::Dir { rva: 0, size: 0 },
+            exception: crate::pe::Dir { rva: 0, size: 0 },
+            reloc: crate::pe::Dir { rva: 0, size: 0 },
+            tls: crate::pe::Dir { rva: 0, size: 0 },
+            load_config: crate::pe::Dir { rva: 0, size: 0 },
+            delay_import: crate::pe::Dir { rva: 0, size: 0 },
+            export_dir: crate::pe::Dir { rva: 0, size: 0 },
+            sections: Vec::new(),
+        };
+
+        assert!(!should_request_cfg_call_target(&plan, &pe));
+        pe.load_config = crate::pe::Dir {
+            rva: 0x40,
+            size: 0x60,
+        };
+        assert!(should_request_cfg_call_target(&plan, &pe));
+
+        let reject_config = DecantConfig::from_toml_str(
+            "[injection]\ndomain = \"guest\"\nmethod = \"manual-map\"\n\
+             [guest]\npid = 1\npayload_path = \"payload.dll\"\n\
+             loader_entries = \"synthesized\"\nloader_metadata = \"reject-unsupported\"\n",
+        )
+        .unwrap();
+        let reject_plan = GuestInjectionPlan::from_config(&reject_config).unwrap();
+        assert!(!should_request_cfg_call_target(&reject_plan, &pe));
     }
 
     #[test]

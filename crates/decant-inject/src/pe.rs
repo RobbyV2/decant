@@ -47,6 +47,7 @@ pub(crate) struct Pe {
     pub tls: Dir,
     pub load_config: Dir,
     pub delay_import: Dir,
+    pub export_dir: Dir,
     pub sections: Vec<Section>,
 }
 
@@ -113,6 +114,7 @@ impl Pe {
             tls: dir(IMAGE_DIRECTORY_ENTRY_TLS)?,
             load_config: dir(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG)?,
             delay_import: dir(IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT)?,
+            export_dir: dir(0)?,
             sections,
         })
     }
@@ -338,6 +340,46 @@ impl Pe {
         Ok(index != 0 || (start_raw != 0 && end_raw > start_raw))
     }
 
+    pub(crate) fn tls_index_offset(
+        &self,
+        image: &[u8],
+        remote_base: usize,
+    ) -> Result<Option<usize>, InjectError> {
+        if self.tls.rva == 0 || self.tls.size < 32 {
+            return Ok(None);
+        }
+        let index_va = u64_at(image, self.tls.rva as usize + 16)?;
+        if index_va == 0 {
+            return Ok(None);
+        }
+        let offset = remote_va_to_offset(index_va, remote_base, image.len())?;
+        Ok(Some(offset))
+    }
+
+    pub(crate) fn tls_template(
+        &self,
+        image: &[u8],
+        remote_base: usize,
+    ) -> Result<Option<Vec<u8>>, InjectError> {
+        if self.tls.rva == 0 || self.tls.size < 32 {
+            return Ok(None);
+        }
+        let tls = self.tls.rva as usize;
+        let start_va = u64_at(image, tls)?;
+        let end_va = u64_at(image, tls + 8)?;
+        let zero_fill = u32_at(image, tls + 32)? as usize;
+        if start_va == 0 || end_va == 0 || end_va < start_va {
+            return Ok(Some(vec![0u8; zero_fill]));
+        }
+        let start_off = remote_va_to_offset(start_va, remote_base, image.len())?;
+        let end_off = remote_va_to_offset(end_va, remote_base, image.len())?;
+        let raw_len = end_off - start_off;
+        let mut template = Vec::with_capacity(raw_len + zero_fill);
+        template.extend_from_slice(&image[start_off..end_off]);
+        template.resize(raw_len + zero_fill, 0);
+        Ok(Some(template))
+    }
+
     pub(crate) fn tls_callbacks(
         &self,
         image: &[u8],
@@ -368,6 +410,35 @@ impl Pe {
             0 => Ok(None),
             rva => checked_add(remote_base, rva as usize).map(Some),
         }
+    }
+
+    pub(crate) fn cfg_call_targets(&self, image: &[u8]) -> Result<Vec<u32>, InjectError> {
+        let mut targets = Vec::new();
+        if self.entry_rva != 0 {
+            targets.push(self.entry_rva);
+        }
+        if self.export_dir.rva == 0 || self.export_dir.size < 26 {
+            return Ok(targets);
+        }
+        let exp = self.export_dir.rva as usize;
+        let num_funcs = u32_at(image, exp + 20)? as usize;
+        let func_rva = u32_at(image, exp + 28)? as usize;
+        if func_rva == 0 || num_funcs == 0 {
+            return Ok(targets);
+        }
+        for i in 0..num_funcs {
+            let off = func_rva + i * 4;
+            if off + 4 > image.len() {
+                break;
+            }
+            let rva = u32_at(image, off)?;
+            if rva != 0 {
+                targets.push(rva);
+            }
+        }
+        targets.sort_unstable();
+        targets.dedup();
+        Ok(targets)
     }
 }
 
@@ -464,6 +535,7 @@ mod tests {
             tls: Dir { rva: 0, size: 0 },
             load_config: Dir { rva: 0, size: 0 },
             delay_import: Dir { rva: 0, size: 0 },
+            export_dir: Dir { rva: 0, size: 0 },
             sections: Vec::new(),
         }
     }
@@ -529,5 +601,28 @@ mod tests {
 
         assert_eq!(seeded, None);
         assert_eq!(u64_at(&image, 0x100).unwrap(), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn tls_index_offset_uses_remote_image_base() {
+        let mut pe = minimal_pe();
+        pe.size_of_image = 0x200;
+        pe.tls = Dir {
+            rva: 0x40,
+            size: 0x28,
+        };
+        let remote_base = 0x7000_0000usize;
+        let mut image = vec![0u8; pe.size_of_image];
+        put_u64(
+            &mut image,
+            pe.tls.rva as usize + 16,
+            remote_base as u64 + 0x120,
+        )
+        .unwrap();
+
+        assert_eq!(
+            pe.tls_index_offset(&image, remote_base).unwrap(),
+            Some(0x120)
+        );
     }
 }

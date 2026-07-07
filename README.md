@@ -107,10 +107,10 @@ cargo xtask wine-smoke
 
 ## Master runner
 
-`scripts/decant.sh` is the tracked operator entry point. It builds the required artifacts and keeps the old one-off VM and Wine wrappers behind subcommands.
+`scripts/decant.sh` is the tracked operator entry point. It builds the required artifacts and keeps runtime VM and Wine actions behind subcommands. Fixture and regression harnesses live in `scripts/decant-test.sh`.
 
 ```bash
-# Build host, Wine, and fixture artifacts.
+# Build host and Wine artifacts.
 scripts/decant.sh build
 
 # Run a Wine-hosted tool through the launcher. The target can be Cheat Engine or any PE exe.
@@ -130,7 +130,7 @@ scripts/decant.sh guest-inject \
 
 # Reproduce the tracked VM fixture. Copy target/decant-run/guest-inject-target.exe
 # into the VM, start it there, then run:
-MEMFLOW_PLUGIN_PATH=/opt/memflow scripts/decant.sh guest-fixture --connector kvm --vm win10
+MEMFLOW_PLUGIN_PATH=/opt/memflow scripts/decant-test.sh guest-fixture --connector kvm --vm win10
 ```
 
 The KVM connector normally needs root access for the daemon. If running `guest-fixture` from a non-interactive shell, run `sudo -v` first so the script can start the daemon without a password prompt.
@@ -306,6 +306,7 @@ call_stack = "native"                 # native | registered-unwind
 permission_transitions = "standard"   # standard | write-through-final
 thread_starts = "existing-thread"     # existing-thread | require-module-backed
 image_backing = "private"             # private | sec-image
+vad_spoof = "off"                     # off | vad-image-map
 hook_module = "kernel32.dll"
 hook_function = "Sleep"
 
@@ -323,23 +324,36 @@ mapped image, then applies PE-derived permissions before payload code runs; `rwx
 an explicit compatibility mode. `dependency_policy = "require-loaded"` means every imported
 module must already be present in the target process;
 `load-with-guest-loader` calls the target's `LoadLibraryA` and `GetProcAddress` for missing
-dependencies. Static TLS registration remains unsupported. By default,
+dependencies. Full loader-managed static TLS registration remains unsupported. By default,
 `loader_metadata = "reject-unsupported"` rejects payloads that need static TLS slots, unwind
 registration, or load-config processing. `loader_metadata = "best-effort"` registers x64 unwind
 metadata through guest `RtlAddFunctionTable` and seeds the load-config security cookie when the
-mapped image exposes the default cookie slot; loader-private state such as PEB loader entries,
-VAD/section-object state, CFG registration, and loader-managed TLS slots is still not synthesized.
+mapped image exposes the default cookie slot; loader-private state such as VAD/section-object
+state, full LDR ownership, and per-thread TLS template propagation is still not
+synthesized. When `loader_entries = "synthesized"`, Decant allocates a static TLS
+slot via `TlsAlloc`, patches the index into the image buffer, copies the TLS
+template, and calls `TlsSetValue` for the current helper/target thread. That is
+only valid for code running on the same thread; other existing threads are not
+covered, and the `remote-thread` DllMain thread does not inherit that template.
+For payloads with load-config metadata, `loader_metadata = "best-effort"`
+and `loader_entries = "synthesized"` also request a CFG valid-call-target mark
+for the entry point and exported function RVAs via `SetProcessValidCallTargets`;
+broader CFG/load-config metadata is still not synthesized.
 `allow-unsupported` skips the guards only for payloads that do not rely on the corresponding
 loader registration. `call_stack = "registered-unwind"` registers x64 unwind metadata for the
 IAT-hook stub and uses a single framed stack allocation so stack walking can unwind through the
-stub; it does not spoof caller frames or shape the stack to impersonate another call path. `permission_transitions = "write-through-final"` allocates
-with final-ish image permissions, materializes pages by read-touch when the initial protection is
-not writable, writes the mapped image through memflow, and skips final `VirtualProtect` calls that
-already match the initial protection; the allocation/write/protect sequence is still observable. `thread_starts = "require-module-backed"` keeps the
-IAT-hook path on an existing target thread and rejects runs unless the IAT slot, original import
-target, and staging cave are inside loaded module ranges; it verifies module-backed hook plumbing
-but does not inspect payload entrypoints, helper calls, or synthesize kernel thread-start metadata. `image_backing = "sec-image"` stages the payload as a
-guest temp file and maps it through `CreateFileMappingW(SEC_IMAGE)` +
+stub; it does not, by itself, spoof caller frames or shape the stack to impersonate another call
+path. `permission_transitions = "write-through-final"` allocates with final-ish image
+permissions, materializes pages by read-touch when the initial protection is not writable, writes
+the mapped image through memflow, and skips final `VirtualProtect` calls that already match the
+initial protection; the allocation/write/protect sequence is still observable.
+`thread_starts = "require-module-backed"` keeps the IAT-hook path on an existing target thread
+and rejects runs unless the IAT slot, original import target, and staging cave are inside loaded
+module ranges; it verifies module-backed hook plumbing but does not inspect payload entrypoints
+or helper calls. For `remote-thread`, `require-module-backed` requires a payload-image executable
+code cave for the ThreadProc thunk and refuses to fall back to a temporary thread start.
+`image_backing = "sec-image"` stages the payload as a guest temp file and maps it
+through `CreateFileMappingW(SEC_IMAGE)` +
 `MapViewOfFile(FILE_MAP_COPY)`, so the executable region starts as a real kernel-created
 image-file section instead of private committed memory. Decant then applies relocations, imports,
 delay imports, the load-config security cookie, TLS callbacks, and `DllMain` on top of that view.
@@ -351,7 +365,7 @@ requires `allocation = "virtual-alloc"` for helper buffers and
 `final_protections = "section"`, because an image-file-backed mapping uses PE-derived page
 protections rather than a single RWX region.
 
-`guest.execution.method = "iat-hook"` is the implemented execution path. Decant snapshots the
+`guest.execution.method = "iat-hook"` is the default execution path. Decant snapshots the
 selected thunk, stage bytes, and writable result slot, patches them, lets one target thread run
 the requested call, reads the return value, and restores the IAT-hook transaction (IAT slot,
 stub bytes, result block) on every exit path. The `sec-image` trampoline and
@@ -359,18 +373,39 @@ stub bytes, result block) on every exit path. The `sec-image` trampoline and
 The result slot is execution scratch for this call path, not a payload success marker. For
 repeatable runs, set `guest.stage_pattern` or `guest.stage_base` to executable staging bytes you
 control, and set `guest.result_pattern` or `guest.result_base` to a writable scratch slot;
-otherwise Decant only auto-selects memory that passes those permission checks. `thread-hijack`,
+otherwise Decant only auto-selects memory that passes those permission checks.
+
+`guest.execution.method = "remote-thread"` creates a kernel-tracked guest thread by first
+entering the target through the IAT-hook trampoline, then calling `CreateThread` from inside the
+target process. The thread starts at a `ThreadProc` thunk that calls
+`DllMain(hinst, DLL_PROCESS_ATTACH, NULL)` with the proper x64 calling convention. If the mapped
+payload image has a large enough executable code cave, Decant places that thunk there so the
+kernel-recorded start address is inside the mapped image; otherwise it uses a temporary helper
+allocation. `thread_starts = "require-module-backed"` makes the payload-image code cave
+mandatory and fails rather than using the temporary fallback. The ThreadProc thunk stores
+DllMain's return value and a completion marker in its scratch block; the host polls those bytes
+through the backend instead of requiring another target import call after `CreateThread`.
+Remote-thread launch helpers use native helper-call stack handling even when
+`stack_shaping = "spoofed"` is selected; DllMain itself runs on the new thread through the thunk.
+
+`thread-hijack`,
 `apc`, and package/session selectors are parsed but not implemented by this backend.
 
 Guest injection results include `artifact audit:` notes for the observable properties of the
-selected path: private or SEC_IMAGE-backed image memory, absent loader/module metadata,
+selected path: private or SEC_IMAGE-backed image memory, loader/module metadata state,
 section-derived versus explicit-RWX permissions, registered or unregistered unwind/load-config
 metadata, call-stack policy, permission-transition policy, thread-start policy, image-backing
-policy, and the IAT-hook call path. Decant does not create fake PEB loader entries, VADs, or
-section objects; with `image_backing = "sec-image"` the section object and image-file VAD backing
-are real kernel-created state produced through public guest exports, not forged. It does not spoof
-caller frames or shape the stack to impersonate another call path. It does not hide all
-allocation/write/protect observability. It does not synthesize or rewrite thread start metadata.
+policy, and the selected execution path. When requested, Decant can synthesize partial,
+transient PEB loader-list entries; it does not create VADs or section objects. With
+`image_backing = "sec-image"` the section object and image-file VAD backing are real
+kernel-created state produced through public guest exports, not forged. `stack_shaping =
+"spoofed"` is limited to writing a synthetic return address for selected helper/payload calls; it
+does not synthesize a full caller chain or normalize arbitrary stacks. Decant does not hide all
+allocation/write/protect observability. It does not synthesize or rewrite kernel thread-start
+metadata. `vad_spoof = "vad-image-map"` is parsed as an explicit experimental request, but the
+memflow backend currently returns unsupported rather than mutating undocumented Windows VAD
+fields. Use `image_backing = "sec-image"` for the supported path that obtains real image-file VAD
+backing from the guest memory manager.
 
 For UWP/AppContainer loader-style injection, the relevant extra requirement is DLL file access:
 the AppContainer SID such as `S-1-15-2-1` must be granted read/execute access before
@@ -468,8 +503,8 @@ Two modes behind one trait: a mock backend offline, and memflow against a VM.
 ```bash
 cargo test               # mock mode: protocol, dispatch, scanner/resolver, CLI; no VM
 cargo xtask wine-smoke   # cross-compile and load a DLL under Wine
-cargo xtask inject-test  # standard, plugin, manual-map, thread-hijack, external, timeout
-scripts/decant.sh guest-fixture  # VM guest injection fixture, needs MEMFLOW_PLUGIN_PATH
+scripts/decant-test.sh inject-test  # standard, plugin, manual-map, thread-hijack, external, timeout
+scripts/decant-test.sh guest-fixture  # VM guest injection fixture, needs MEMFLOW_PLUGIN_PATH
 cargo test -- --ignored  # VM mode, gated on DECANT_LIVE=1 and a running guest
 ```
 
