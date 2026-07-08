@@ -1,3 +1,5 @@
+//! Daemon dispatch and TCP serving for Decant RPC requests.
+
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -91,13 +93,13 @@ pub fn dispatch(req: Request, backend: &dyn MemoryBackend, diag: &Diag) -> Respo
         }
         Request::MemoryMap(pid) => finish(backend.memory_map(pid), Response::MemoryMap, diag),
         Request::Scan { pid, pattern } => {
-            match decant_core::scanner::scan_str(backend, pid, &pattern) {
+            match decant_analysis::scanner::scan_str(backend, pid, &pattern) {
                 Ok(hits) => Response::ScanHits(hits),
                 Err(e) => Response::Err(core_err_to_proto(e)),
             }
         }
         Request::Resolve { pid, base, offsets } => {
-            match decant_core::resolve(backend, pid, base, &offsets) {
+            match decant_analysis::resolve(backend, pid, base, &offsets) {
                 Ok(address) => {
                     diag.reads.fetch_add(1, Ordering::Relaxed);
                     let value = backend.read(pid, address, 8).unwrap_or_default();
@@ -248,10 +250,10 @@ fn guest_error(e: GuestInjectError, diag: &Diag) -> Response {
     })
 }
 
-fn core_err_to_proto(e: decant_core::CoreError) -> ProtoError {
+fn core_err_to_proto(e: decant_analysis::CoreError) -> ProtoError {
     match e {
-        decant_core::CoreError::Pattern(message) => ProtoError::Backend { message },
-        decant_core::CoreError::Backend(be) => be.into(),
+        decant_analysis::CoreError::Pattern(message) => ProtoError::Backend { message },
+        decant_analysis::CoreError::Backend(be) => be.into(),
     }
 }
 

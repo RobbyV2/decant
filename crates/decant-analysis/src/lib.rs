@@ -1,3 +1,5 @@
+//! Backend-agnostic AOB scanning and pointer-chain resolution.
+
 #![allow(clippy::manual_map)]
 
 use decant_backend::{BackendError, MemoryBackend, Pid};

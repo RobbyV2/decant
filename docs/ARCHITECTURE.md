@@ -155,7 +155,7 @@ The mock implements every method deterministically and round-trips writes (a `wr
 then a `read` of the same range returns the new bytes), so the read-back
 write-verification strategy works without a VM. This keeps development VM-free:
 
-- `decant-core` (AOB scanner, pointer-chain resolver) runs entirely against a `MockGuest`.
+- `decant-analysis` (AOB scanner, pointer-chain resolver) runs entirely against a `MockGuest`.
 - `decant-daemon` dispatch is tested with the server on a `MockBackend`.
 - `decant-cli` and the carafe's marshaling run end-to-end against the mock behind the daemon.
 
@@ -173,11 +173,11 @@ are members built only with `--target x86_64-pc-windows-gnu`.
 | `crates/decant-protocol` | host + win-gnu | Wire contract + shared domain types; `write_msg`/`read_msg` framing |
 | `crates/decant-backend` | host | `MemoryBackend` trait + `MockBackend`/`MockGuest` |
 | `crates/decant-memflow` | host | `MemflowBackend` |
-| `crates/decant-core` | host | AOB scanner + pointer-chain resolver |
+| `crates/decant-analysis` | host | AOB scanner + pointer-chain resolver |
 | `crates/decant-client` | host + win-gnu | shared RPC `Client` over `decant-protocol` |
 | `crates/decant-daemon` | host | "the cellar", TCP server + dispatch |
 | `crates/decant-cli` | host | user CLI |
-| `crates/decant` | host | library facade re-exporting backends, scanner/resolver, client |
+| `crates/decant-vmi` | host | library facade re-exporting backends, scanner/resolver, client |
 | `crates/decant-wine-harness` | host | launches exes under Wine for `cargo test` |
 | `crates/decant-interpose` | win-gnu (cdylib) | "the carafe" interposer DLL |
 | `testbins/hello-dll` | win-gnu (cdylib) | minimal PE32+ DLL exporting `add` |

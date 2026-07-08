@@ -1,8 +1,10 @@
 <p align="center">
-  <img src="assets/decant_banner_dark_sm.png" alt="Decant">
+  <img src="https://raw.githubusercontent.com/RobbyV2/decant/main/assets/decant_banner_dark_sm.png" alt="Decant">
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/version-0.1.0-blue" alt="Version 0.1.0">
+  <a href="https://github.com/RobbyV2/decant/actions/workflows/build.yml"><img src="https://github.com/RobbyV2/decant/actions/workflows/build.yml/badge.svg?branch=main" alt="CI"></a>
   <img src="https://img.shields.io/badge/edition-2024-orange" alt="Rust">
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License">
   <img src="https://img.shields.io/badge/target-x86__64-lightgrey" alt="x86_64">
@@ -72,7 +74,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 Use Decant as a crate. Embed a backend in your own program, or connect to a daemon.
 
 ```rust
-use decant::prelude::*;
+use decant_vmi::prelude::*;
 
 // In-process backend, the way memflow is used (MemflowBackend needs --features memflow):
 let backend = MemflowBackend::connect("kvm")?;
@@ -464,12 +466,12 @@ with `--target x86_64-pc-windows-gnu`. x86_64 throughout.
 
 | Path | Target | Role |
 |---|---|---|
-| `crates/decant` | host | Library facade: re-exports backends, scanner and resolver, and the client |
+| `crates/decant-vmi` | host | Library facade: re-exports backends, scanner and resolver, and the client |
 | `crates/decant-protocol` | host + win-gnu | Wire contract and shared domain types; `write_msg`/`read_msg` framing |
 | `crates/decant-client` | host + win-gnu | Daemon client over decant-protocol |
 | `crates/decant-backend` | host | `MemoryBackend` trait, `MockBackend`, `MockGuest` |
 | `crates/decant-memflow` | host | `MemflowBackend` (VM, feature-gated) |
-| `crates/decant-core` | host | AOB scanner and pointer-chain resolver |
+| `crates/decant-analysis` | host | AOB scanner and pointer-chain resolver |
 | `crates/decant-daemon` | host | TCP server and dispatch (the cellar) |
 | `crates/decant-cli` | host | user CLI |
 | `crates/decant-wine-harness` | host | launches exes under Wine for `cargo test` |

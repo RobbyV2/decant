@@ -418,15 +418,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "daba87f72c730b508641c9fb6411fc9bba73939eed2cab611c399500511880d0"
 
 [[package]]
-name = "decant"
+name = "decant-analysis"
 version = "0.1.0"
 dependencies = [
  "decant-backend",
- "decant-client",
- "decant-core",
- "decant-daemon",
- "decant-memflow",
  "decant-protocol",
+ "proptest",
+ "thiserror",
 ]
 
 [[package]]
@@ -461,23 +459,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "decant-core"
-version = "0.1.0"
-dependencies = [
- "decant-backend",
- "decant-protocol",
- "proptest",
- "thiserror",
-]
-
-[[package]]
 name = "decant-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "decant-analysis",
  "decant-backend",
- "decant-core",
  "decant-inject",
  "decant-memflow",
  "decant-protocol",
@@ -541,6 +529,18 @@ dependencies = [
  "bincode",
  "proptest",
  "serde",
+]
+
+[[package]]
+name = "decant-vmi"
+version = "0.1.0"
+dependencies = [
+ "decant-analysis",
+ "decant-backend",
+ "decant-client",
+ "decant-daemon",
+ "decant-memflow",
+ "decant-protocol",
 ]
 
 [[package]]

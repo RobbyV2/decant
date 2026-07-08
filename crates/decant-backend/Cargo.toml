@@ -4,9 +4,18 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "The MemoryBackend seam: the one trait everything reads/writes guest memory through, plus the scriptable MockBackend/MockGuest (the tasting)."
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
-decant-protocol = { path = "../decant-protocol" }
+decant-protocol.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

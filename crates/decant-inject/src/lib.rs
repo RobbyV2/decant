@@ -1,3 +1,5 @@
+//! Injection configuration, ABI, and loader implementations used by Decant.
+
 #![allow(clippy::manual_c_str_literals, clippy::missing_safety_doc)]
 
 use std::ffi::c_void;

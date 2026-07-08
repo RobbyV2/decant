@@ -1,3 +1,5 @@
+//! Blocking TCP client for the Decant daemon RPC protocol.
+
 use std::net::TcpStream;
 use std::time::Duration;
 

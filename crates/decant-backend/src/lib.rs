@@ -1,3 +1,5 @@
+//! Backend trait and mock guest model for Decant memory access.
+
 pub use decant_protocol::{MemRegion, ModuleInfo, Pid, ProcessInfo, ProtoError};
 
 mod mock;

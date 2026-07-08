@@ -2,8 +2,8 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::thread;
 
-use decant::prelude::*;
 use decant_daemon::{Diag, serve};
+use decant_vmi::prelude::*;
 
 fn demo_guest() -> MockGuest {
     MockGuest::builder()

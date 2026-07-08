@@ -1,6 +1,8 @@
+//! Facade over Decant backends, scanning, pointer resolution, and daemon RPC.
+
+pub use decant_analysis::{CoreError, Pattern, resolve, scan, scan_with_chunk};
 pub use decant_backend::{BackendError, MemoryBackend, MockBackend, MockGuest};
 pub use decant_client::{Client, ClientError};
-pub use decant_core::{CoreError, Pattern, resolve, scan, scan_with_chunk};
 pub use decant_protocol::{Diagnostics, MemRegion, ModuleInfo, Pid, ProcessInfo, ProtoError};
 
 #[cfg(feature = "memflow")]

@@ -4,9 +4,10 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Example bring-your-own injector plugin: wraps the standard load behind the decant_inject C ABI."
+publish = false
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-decant-inject = { path = "../../crates/decant-inject" }
+decant-inject.workspace = true

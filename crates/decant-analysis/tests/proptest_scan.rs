@@ -1,6 +1,6 @@
+use decant_analysis::Pattern;
+use decant_analysis::scanner::{scan, scan_with_chunk};
 use decant_backend::{MockBackend, MockGuest, Pid};
-use decant_core::Pattern;
-use decant_core::scanner::{scan, scan_with_chunk};
 use proptest::prelude::*;
 
 const PAGE: usize = 0x1000;

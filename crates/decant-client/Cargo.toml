@@ -4,7 +4,16 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Client for the Decant daemon over decant-protocol. Builds for host and windows-gnu."
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
-decant-protocol = { path = "../decant-protocol" }
+decant-protocol.workspace = true
 thiserror.workspace = true

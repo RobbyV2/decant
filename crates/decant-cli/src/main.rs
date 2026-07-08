@@ -316,7 +316,7 @@ fn parse_hex(s: &str) -> Result<Vec<u8>> {
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();
-    if !cleaned.len().is_multiple_of(2) {
+    if cleaned.len() % 2 != 0 {
         bail!("hex string has an odd number of digits");
     }
     (0..cleaned.len())

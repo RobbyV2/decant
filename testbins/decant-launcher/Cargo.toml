@@ -4,10 +4,11 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Launches a target exe SUSPENDED under Wine and injects the carafe via CreateRemoteThread+LoadLibrary (public exports only). Built only for x86_64-pc-windows-gnu."
+publish = false
 
 [[bin]]
 name = "decant-launcher"
 path = "src/main.rs"
 
 [dependencies]
-decant-inject = { path = "../../crates/decant-inject" }
+decant-inject.workspace = true

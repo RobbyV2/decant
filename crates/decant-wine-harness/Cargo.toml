@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Test helper: launch a Windows exe in the isolated Wine prefix with the interposer attached, capture stdout/exit."
+publish = false
 
 [dependencies]
 anyhow.workspace = true

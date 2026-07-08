@@ -1,3 +1,5 @@
+//! memflow-backed Decant memory backend, enabled with the `memflow` feature.
+
 #![allow(dead_code)]
 
 #[cfg(feature = "memflow")]

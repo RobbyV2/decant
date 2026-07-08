@@ -1,3 +1,5 @@
+//! Windows interposer DLL support code and host-testable handle table.
+
 #![allow(clippy::missing_safety_doc)]
 
 pub mod handle_table;

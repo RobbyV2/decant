@@ -4,8 +4,9 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Build/test orchestration: cargo xtask <setup|build-native|build-dll|test|test-live|wine-smoke|inject-test|e2e>."
+publish = false
 
 [dependencies]
 anyhow.workspace = true
-decant-wine-harness = { path = "../crates/decant-wine-harness" }
-decant-client = { path = "../crates/decant-client" }
+decant-wine-harness.workspace = true
+decant-client.workspace = true

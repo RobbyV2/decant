@@ -1,9 +1,9 @@
 [package]
-name = "decant-daemon"
+name = "decant-vmi"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-description = "The cellar: native Linux TCP daemon serving decant-protocol over a MemoryBackend."
+description = "Read and write a Windows VM guest's memory from Linux via memflow. Library facade over the memory backend, the scanner and resolver, and the daemon client."
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
@@ -15,13 +15,7 @@ categories.workspace = true
 features = ["memflow"]
 targets = ["x86_64-unknown-linux-gnu"]
 
-[[bin]]
-name = "decant-daemon"
-path = "src/main.rs"
-
 [features]
-# Enables the VM backend. Off by default so the host offline suite builds
-# hermetically; turn on for the VM: `cargo build -p decant-daemon --features memflow`.
 default = []
 memflow = ["decant-memflow/memflow"]
 
@@ -29,9 +23,8 @@ memflow = ["decant-memflow/memflow"]
 decant-analysis.workspace = true
 decant-protocol.workspace = true
 decant-backend.workspace = true
+decant-client.workspace = true
 decant-memflow.workspace = true
-decant-inject.workspace = true
-anyhow.workspace = true
-clap.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
+
+[dev-dependencies]
+decant-daemon.workspace = true

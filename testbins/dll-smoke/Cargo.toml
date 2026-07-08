@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Cross-compile proof: a tiny exe that LoadLibrary's hello_dll.dll and calls add(2, 3). Built only for x86_64-pc-windows-gnu."
+publish = false
 
 [[bin]]
 name = "dll-smoke"

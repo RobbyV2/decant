@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Cross-compile proof: a minimal Rust cdylib exporting add(a, b). Built only for x86_64-pc-windows-gnu."
+publish = false
 
 [lib]
 name = "hello_dll"

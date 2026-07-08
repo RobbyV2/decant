@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Runs inside the VM: a self-verifying target exe plus a DLL payload for guest injection checks. Built only for x86_64-pc-windows-gnu."
+publish = false
 
 [lib]
 name = "guest_inject_fixture"

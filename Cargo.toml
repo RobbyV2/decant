@@ -13,10 +13,10 @@ members = [
     "xtask",
     "crates/decant-protocol",
     "crates/decant-client",
-    "crates/decant",
+    "crates/decant-vmi",
     "crates/decant-backend",
     "crates/decant-memflow",
-    "crates/decant-core",
+    "crates/decant-analysis",
     "crates/decant-daemon",
     "crates/decant-cli",
     "crates/decant-wine-harness",
@@ -41,10 +41,10 @@ default-members = [
     "xtask",
     "crates/decant-protocol",
     "crates/decant-client",
-    "crates/decant",
+    "crates/decant-vmi",
     "crates/decant-backend",
     "crates/decant-memflow",
-    "crates/decant-core",
+    "crates/decant-analysis",
     "crates/decant-daemon",
     "crates/decant-cli",
     "crates/decant-wine-harness",
@@ -64,14 +64,14 @@ keywords = ["memflow", "wine", "windows", "memory", "vm"]
 categories = ["development-tools", "command-line-utilities", "os"]
 
 [workspace.dependencies]
-decant = { version = "0.1.0", path = "crates/decant" }
+decant-analysis = { version = "0.1.0", path = "crates/decant-analysis" }
 decant-backend = { version = "0.1.0", path = "crates/decant-backend" }
 decant-client = { version = "0.1.0", path = "crates/decant-client" }
-decant-core = { version = "0.1.0", path = "crates/decant-core" }
 decant-daemon = { version = "0.1.0", path = "crates/decant-daemon" }
 decant-inject = { version = "0.1.0", path = "crates/decant-inject" }
 decant-memflow = { version = "0.1.0", path = "crates/decant-memflow" }
 decant-protocol = { version = "0.1.0", path = "crates/decant-protocol" }
+decant-vmi = { version = "0.1.0", path = "crates/decant-vmi" }
 decant-wine-harness = { version = "0.1.0", path = "crates/decant-wine-harness" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

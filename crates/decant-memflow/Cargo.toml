@@ -4,6 +4,16 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "MemflowBackend: the connector over guest physical RAM. Feature-gated (memflow). Connectors load at runtime as plugins, so this compiles without a VM but only runs on the VM host (see docs/DECISIONS.md ADR-0005)."
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.docs.rs]
+features = ["memflow"]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [features]
 # Off by default so the host offline suite builds hermetically. Enabling it
@@ -13,9 +23,9 @@ default = []
 memflow = ["dep:memflow"]
 
 [dependencies]
-decant-protocol = { path = "../decant-protocol" }
-decant-backend = { path = "../decant-backend" }
-decant-inject = { path = "../decant-inject" }
+decant-protocol.workspace = true
+decant-backend.workspace = true
+decant-inject.workspace = true
 anyhow.workspace = true
 
 # memflow core with the `plugins` feature (the runtime Inventory). The win32 OS

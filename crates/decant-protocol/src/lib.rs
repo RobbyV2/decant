@@ -1,3 +1,5 @@
+//! Shared Decant domain types and length-prefixed bincode RPC framing.
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
