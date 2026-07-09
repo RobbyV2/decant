@@ -1,20 +1,28 @@
-use std::ffi::c_void;
-use std::path::Path;
 use std::process::ExitCode;
 
+#[cfg(windows)]
+use std::ffi::c_void;
+#[cfg(windows)]
+use std::path::Path;
+
+#[cfg(windows)]
 use decant_inject::external::read_request;
+#[cfg(windows)]
 use decant_inject::{
     InjectionRequest, Injector, ProcessHandle, ReadyToken, StandardInjector, ThreadHandle,
 };
 
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn OpenProcess(desired_access: u32, inherit: i32, pid: u32) -> *mut c_void;
     fn GetLastError() -> u32;
 }
 
+#[cfg(windows)]
 const PROCESS_ALL_ACCESS: u32 = 0x001F_0FFF;
 
+#[cfg(windows)]
 fn main() -> ExitCode {
     let payload = match read_request(&mut std::io::stdin().lock()) {
         Ok(p) => p,
@@ -50,4 +58,10 @@ fn main() -> ExitCode {
             ExitCode::from(4)
         }
     }
+}
+
+#[cfg(not(windows))]
+fn main() -> ExitCode {
+    eprintln!("decant-external-standard is a Windows/PE-side helper");
+    ExitCode::from(64)
 }

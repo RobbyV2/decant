@@ -4,10 +4,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DECANT_SH="$ROOT/scripts/decant.sh"
 STAGE="${DECANT_STAGE:-$ROOT/target/decant-run}"
+LIVE_DIR="${DECANT_LIVE_DIR:-$HOME/Downloads/decant-live}"
 ENDPOINT="${DECANT_ENDPOINT:-127.0.0.1:7878}"
 
 FIXTURE_PROCESS="guest-inject-target.exe"
-FIXTURE_MAGIC="44 45 43 41 4e 54 3a 3a 47 49 4e 4a 30 30 30 35"
+FIXTURE_MAGIC="44 45 43 41 4e 54 3a 3a 47 49 4e 4a 30 30 30 37"
 STUB_MAGIC="44 45 43 41 4e 54 3a 3a 53 54 55 42 30 30 30 34"
 RESULT_MAGIC="44 45 43 41 4e 54 3a 3a 52 45 53 55 4c 54 30 34"
 MARKER_LE="07 51 0d 60 a7 ec 1d d1"
@@ -44,6 +45,7 @@ Environment:
   DECANT_GUEST_STACK_SHAPING native|spoofed
   DECANT_GUEST_CLEANUP resident|tracked
   DECANT_GUEST_VAD_SPOOF off|vad-image-map
+  DECANT_LIVE_DIR directory for runnable artifacts, default ~/Downloads/decant-live
 EOF
 }
 
@@ -56,7 +58,7 @@ need() {
 
 hex_bytes() {
   local pid="$1" addr="$2" len="$3"
-  "$ROOT/target/release/decant-cli" --endpoint "$ENDPOINT" read "$pid" "$addr" "$len" |
+  "$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" read "$pid" "$addr" "$len" |
     awk '{
       for (i = 2; i <= NF; i++) {
         if ($i == "|" || $i ~ /^\|/) break;
@@ -93,6 +95,21 @@ read_u64_le() {
 
 build_host() {
   cargo build --release -p decant-daemon -p decant-cli --features memflow
+  mkdir -p "$LIVE_DIR"
+  install -m 0755 "$ROOT/target/release/decant-daemon" "$LIVE_DIR/decant-daemon"
+  install -m 0755 "$ROOT/target/release/decant-cli" "$LIVE_DIR/decant-cli"
+}
+
+publish_guest_fixture_artifacts() {
+  local source_dir="$ROOT/target/guest-inject-fixture"
+  if [[ ! -f "$source_dir/guest-inject-target.exe" ]]; then
+    source_dir="$ROOT/target/x86_64-pc-windows-gnu/debug"
+  fi
+  mkdir -p "$LIVE_DIR"
+  local artifact
+  for artifact in guest-inject-target.exe guest_inject_probe.dll guest_inject_imports.dll guest_inject_tls.dll guest_inject_rust.dll; do
+    install -m 0644 "$source_dir/$artifact" "$LIVE_DIR/$artifact"
+  done
 }
 
 qemu_pid_for_guest() {
@@ -141,7 +158,7 @@ cleanup_daemon() {
 
 start_daemon_background() {
   local connector="$1" vm="$2" args="$3" log="$4"
-  if "$ROOT/target/release/decant-cli" --endpoint "$ENDPOINT" diagnostics >/dev/null 2>&1; then
+  if "$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" diagnostics >/dev/null 2>&1; then
     if [[ "${DECANT_REUSE_DAEMON:-}" == "1" ]]; then
       DAEMON_PID=""
       return
@@ -169,7 +186,7 @@ start_daemon_background() {
     "$DECANT_SH" daemon --connector "$connector" --vm "$vm" --args "$args" --endpoint "$ENDPOINT" >"$log" 2>&1 &
   DAEMON_PID=$!
   for _ in $(seq 1 80); do
-    if "$ROOT/target/release/decant-cli" --endpoint "$ENDPOINT" diagnostics >/dev/null 2>&1; then
+    if "$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" diagnostics >/dev/null 2>&1; then
       return
     fi
     sleep 0.25
@@ -219,7 +236,7 @@ fixture_tick_advances() {
 fixture_target() {
   local name="$1" pid marker found_pid="" found_marker="" stale_count=0
   while read -r pid _; do
-    marker="$("$ROOT/target/release/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$FIXTURE_MAGIC" | awk '/^0x/{print $1; exit}')"
+    marker="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$FIXTURE_MAGIC" | awk '/^0x/{print $1; exit}')"
     if [[ -n "$marker" ]]; then
       if ! fixture_tick_advances "$pid" "$marker"; then
         stale_count=$((stale_count + 1))
@@ -233,15 +250,15 @@ fixture_target() {
       found_pid="$pid"
       found_marker="$marker"
     fi
-  done < <("$ROOT/target/release/decant-cli" --endpoint "$ENDPOINT" processes | awk -v n="$name" '$2 == n {print $1, $2}')
+  done < <("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" processes | awk -v n="$name" '$2 == n {print $1, $2}')
   if [[ -z "$found_pid" ]]; then
     if [[ "$stale_count" -gt 0 ]]; then
       echo "$name has $stale_count stale fixture process(es), but none are live" >&2
       echo "stop the stale guest-inject-target.exe process in the VM, start a fresh one, then rerun" >&2
     else
-      echo "$name is not running with fixture marker DECANT::GINJ0005" >&2
+      echo "$name is not running with fixture marker DECANT::GINJ0007" >&2
     fi
-    echo "copy $STAGE/guest-inject-target.exe into the VM, start it, then rerun this command" >&2
+    echo "copy $LIVE_DIR/guest-inject-target.exe into the VM, start it, then rerun this command" >&2
     exit 4
   fi
   printf '%s %s\n' "$found_pid" "$found_marker"
@@ -294,6 +311,7 @@ guest_fixture() {
   mkdir -p "$STAGE"
   cp "$ROOT/target/guest-inject-fixture/guest-inject-target.exe" "$STAGE/"
   cp "$ROOT/target/guest-inject-fixture"/guest_inject_*.dll "$STAGE/"
+  publish_guest_fixture_artifacts
   local log="$STAGE/decant-daemon.log"
   start_daemon_background "$connector" "$vm" "$args" "$log"
   trap cleanup_daemon EXIT
@@ -301,12 +319,12 @@ guest_fixture() {
   local pid fixture stub result bytes marker probe tick_addr count_addr count_before count_after
   if [[ -n "${DECANT_GUEST_PID:-}" ]]; then
     pid="$DECANT_GUEST_PID"
-    fixture="$("$ROOT/target/release/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$FIXTURE_MAGIC" | awk '/^0x/{print $1; exit}')"
+    fixture="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$FIXTURE_MAGIC" | awk '/^0x/{print $1; exit}')"
   else
     read -r pid fixture < <(fixture_target "$FIXTURE_PROCESS")
   fi
-  stub="$("$ROOT/target/release/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$STUB_MAGIC" | awk '/^0x/{print $1; exit}')"
-  result="$("$ROOT/target/release/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$RESULT_MAGIC" | awk '/^0x/{print $1; exit}')"
+  stub="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$STUB_MAGIC" | awk '/^0x/{print $1; exit}')"
+  result="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$RESULT_MAGIC" | awk '/^0x/{print $1; exit}')"
   if [[ -z "$fixture" || -z "$stub" || -z "$result" ]]; then
     echo "fixture markers were not all found in pid $pid" >&2
     exit 4
@@ -398,7 +416,7 @@ guest_fixture() {
       "${extra_args[@]}"
     then
       echo "guest fixture: injection failed for $payload_name" >&2
-      "$ROOT/target/release/decant-cli" --endpoint "$ENDPOINT" processes >&2 || true
+      "$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" processes >&2 || true
       tail -n 260 "$log" >&2 || true
       exit 5
     fi

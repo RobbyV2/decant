@@ -2,7 +2,7 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::thread;
 
-use decant_daemon::{Diag, serve};
+use decant_daemon::{BasicDaemonBackend, Diag, serve};
 use decant_vmi::prelude::*;
 
 fn demo_guest() -> MockGuest {
@@ -32,7 +32,7 @@ fn embedded_backend_scan_and_resolve() {
 fn client_against_in_process_daemon() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let backend: Arc<dyn MemoryBackend> = Arc::new(MockBackend::new(demo_guest()));
+    let backend = Arc::new(BasicDaemonBackend::new(MockBackend::new(demo_guest())));
     thread::spawn(move || {
         let _ = serve(listener, backend, Arc::new(Diag::new("mock")));
     });

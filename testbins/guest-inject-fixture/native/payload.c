@@ -111,6 +111,12 @@ static void attach(void) {
 #endif
     probe->dll_marker = DECANT_DLL_MARKER;
     probe->dll_count++;
+    probe->apc_result = DECANT_DLL_MARKER;
+    probe->hijack_result = DECANT_DLL_MARKER;
+    probe->remote_thread_result = DECANT_DLL_MARKER;
+    probe->unload_marker = 0;
+    probe->vad_probe = DECANT_DLL_MARKER;
+    probe->tls_callback_fired = g_tls_marker;
     const char payload[] = DECANT_PAYLOAD_TEXT;
     for (int i = 0; i < 32; i++) {
         probe->payload[i] = i < (int)(sizeof(payload) - 1) ? (uint8_t)payload[i] : 0;

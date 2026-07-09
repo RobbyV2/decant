@@ -58,6 +58,12 @@ pub struct GuestInjectInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestUnmapInfo {
+    pub pid: Pid,
+    pub modules_unmapped: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProtoError {
     NoSuchProcess {
         pid: Option<u32>,
@@ -146,6 +152,9 @@ pub enum Request {
         config_toml: String,
         payload_image: Vec<u8>,
     },
+    GuestUnmap {
+        config_toml: String,
+    },
     ReportUnsupported {
         op: String,
     },
@@ -187,6 +196,7 @@ pub enum Response {
     ScanHits(Vec<u64>),
     Resolved { address: u64, value: Vec<u8> },
     GuestInjected(GuestInjectInfo),
+    GuestUnmapped(GuestUnmapInfo),
 }
 
 pub const MAX_MSG_LEN: u32 = 64 * 1024 * 1024;
@@ -281,6 +291,9 @@ mod tests {
             config_toml: "[injection]\ndomain = \"guest\"\nmethod = \"manual-map\"\n".into(),
             payload_image: vec![0x4d, 0x5a],
         });
+        roundtrip_req(Request::GuestUnmap {
+            config_toml: "[injection]\ndomain = \"guest\"\nmethod = \"manual-map\"\n".into(),
+        });
         roundtrip_req(Request::ReportUnsupported {
             op: "VirtualAllocEx".into(),
         });
@@ -332,6 +345,10 @@ mod tests {
             remote_base: Some(0x1000),
             notes: vec!["ok".into()],
         }));
+        roundtrip_resp(Response::GuestUnmapped(GuestUnmapInfo {
+            pid: Pid(7),
+            modules_unmapped: 2,
+        }));
     }
 
     #[test]
@@ -378,6 +395,12 @@ mod tests {
             !Request::GuestInject {
                 config_toml: String::new(),
                 payload_image: Vec::new(),
+            }
+            .retry_safe()
+        );
+        assert!(
+            !Request::GuestUnmap {
+                config_toml: String::new(),
             }
             .retry_safe()
         );

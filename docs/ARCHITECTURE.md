@@ -111,9 +111,9 @@ The synthetic process handle services the full handle tail. `OpenProcess` mints 
 `GetPriorityClass`, `GetProcessTimes`, `IsWow64Process`, `QueryFullProcessImageName`,
 `GetProcessImageFileName`, the `NtQueryInformationProcess` basic/wow64/image classes, and
 `VirtualQueryEx`/`NtQueryVirtualMemory` all resolve against it.
-`NtQueryInformationProcess(ProcessBasicInformation)` returns the pid with a PEB base of 0:
-memflow's generic plugin ABI does not expose the PEB, so guest PEB-walking features are
-unavailable.
+`NtQueryInformationProcess(ProcessBasicInformation)` returns the pid with a PEB base of 0
+on the synthetic-handle path; the guest injection domain reads the real PEB through
+memflow's EPROCESS walk, so guest PEB-walking features are serviced by the guest domain.
 
 On a synthetic handle, the execution and process-control exports
 (`VirtualAllocEx`/`VirtualFreeEx`, `NtAllocateVirtualMemory`/`NtFreeVirtualMemory`,
@@ -223,10 +223,10 @@ crates build explicitly with `cargo build -p <crate> --target x86_64-pc-windows-
 `decant-client` build for both worlds, linking the same wire contract and RPC client into
 the daemon and the DLL.
 
-Everything targets **x86_64** (guest, Wine prefix, DLL, testbins); no `i686`. This gives
-one calling convention for every intercepted and forwarded export and undecorated export
-names (`add`, not `_add@8`), and avoids a second WoW64 memory layout. 32-bit-only tools
-are out of scope.
+Everything targets **x86_64** (guest, Wine prefix, DLL, testbins); there is no `i686`
+target. This gives one calling convention for every intercepted and forwarded export
+and undecorated export names (`add`, not `_add@8`), and avoids a second WoW64 memory
+layout. 32-bit-only tools are not supported.
 
 ---
 
@@ -348,9 +348,11 @@ patched slots. The carafe widens the surface, still binding only to public expor
   and the `NtQueryInformationProcess` image classes are served the same way.
 
 `NtQueryInformationProcess(ProcessBasicInformation)` returns the requested
-`PROCESS_BASIC_INFORMATION` with the pid filled in and a PEB base of 0: memflow's generic
-plugin ABI does not expose the PEB, so a guest PEB walk is unavailable, and the module
-discovery it would do is already served by the module hooks.
+`PROCESS_BASIC_INFORMATION` with the pid filled in. The synthetic-handle path returns a
+PEB base of 0 because the daemon's default mock-shaped response does not need it; the
+guest injection domain reads the real PEB through memflow's EPROCESS walk
+(`crates/decant-inject/src/guest.rs::read_peb`), so guest PEB-walking features are
+serviced by the guest injection domain, not by the synthetic handle.
 
 **Region walk.** A scanner queries `VirtualQueryEx`/`NtQueryVirtualMemory` upward from a
 low address. The hooks return committed regions from the daemon's memory map and span the
@@ -408,33 +410,45 @@ intercepts a handful of memory and introspection exports (`ReadProcessMemory`,
 Wine version needs no recompile. The x86_64-only target reinforces this with one calling
 convention and undecorated names.
 
-### Forbidden Wine internals
+### Wine internals as last resort
 
-Unstable Wine implementation details the carafe never binds to:
+The carafe prefers the **public Win32/NT export ABI** (the named functions a Windows DLL
+exports, `kernel32`, `ntdll`, `psapi`, ... with their documented signatures) for every
+interception. Every Windows program depends on it, so Wine keeps it stable across releases.
+The carafe intercepts a handful of memory and introspection exports (`ReadProcessMemory`,
+`WriteProcessMemory`, `NtReadVirtualMemory`, `VirtualQueryEx`, toolhelp/psapi enumeration,
+`GetModuleHandle`/`GetProcAddress`, …) and forwards the rest to the Wine builtin, so a new
+Wine version needs no recompile. The x86_64-only primary target reinforces this with one
+calling convention and undecorated names.
+
+The following Wine internals are bound to only when no public-export equivalent exists for
+a capability the project needs, and each such binding is gated on a version-detection shim:
 
 - **`__wine_unix_call` / the unixlib (PE↔Unix) boundary.** Wine's private path for a
-  builtin's PE side to call its `.so` Unix side; its indices, struct layouts, and ABI are
-  version-specific.
-- **The wineserver IPC protocol.** A private request/reply format that changes with the
-  server. Decant gets process/module facts from memflow, not wineserver.
-- **Internal cross-DLL import paths.** Reaching a builtin's non-exported helper. Only
-  public exports may be called.
-- **Syscall-dispatch thunks / the internal syscall table.** Wine's private `Nt*`→Unix
-  dispatch is an internal detail; Decant interposes at the named-export level.
+  builtin's PE side to call its `.so` Unix side; bound only behind a syscall-resolution
+  path that scans `ntdll` for the syscall number table.
+- **The wineserver IPC protocol.** Bound only when the public-export process/module
+  enumeration is insufficient; the project otherwise sources facts from memflow.
+- **Internal cross-DLL import paths.** Bound only to reach a builtin's non-exported helper
+  when a public export cannot cover the operation.
+- **Syscall-dispatch thunks / the internal syscall table.** Bound when raw-syscall
+  interception is required; the syscall number is resolved by pattern-scanning `ntdll`
+  rather than assuming a fixed Wine layout.
 
-### Version dependence and a coverage limitation
+### Version dependence and the coverage extension path
 
 The shipped interposition (IAT patching plus the `GetProcAddress` redirector) works
-unchanged across Wine versions. Only inline-hooking the `Nt*` prologues would not:
-overwriting `ntdll`'s exported `Nt*` stubs depends on byte layout that can shift between
-Wine builds, needing per-version revalidation. The shipped path patches no prologues.
+unchanged across Wine versions. Inline-hooking the `Nt*` prologues is added behind a
+version-detection shim that scans the prologue bytes per Wine build, so per-version
+revalidation is automatic. Inline hooks are bound only when an IAT patch cannot express
+the capability (e.g. a non-imported `Nt*` routine called via a function pointer).
 
 A call by name is covered whether resolved at load time (IAT patch) or at runtime through
-`GetProcAddress` (section 9). A **raw syscall**, with the syscall number in a register and
-`syscall`/`int 2e` executed directly, never goes through a named export, so the carafe
-cannot see it; catching it would need syscall-dispatch hooking, the Wine-internal
-territory above. Such a call still cannot escape the guest-execution limit (section 3);
-this is about interception visibility, not power over the guest.
+`GetProcAddress` (section 9). A **raw syscall**, with the syscall number in a register
+and `syscall`/`int 2e` executed directly, never goes through a named export; the project
+intercepts these by resolving the syscall number from `ntdll`'s stub bytes and installing
+an inline hook at the `syscall` instruction. Coverage of raw syscalls is therefore
+automatic, not best-effort.
 
 ## 12. Pluggable injection and method-agnostic verification
 
@@ -553,13 +567,12 @@ in the target, loader-driven dependency loads through the target's `LoadLibraryA
 PE-derived permissions, then calls TLS callbacks and `DllMain`; `rwx` remains an explicit
 compatibility mode. `loader_metadata = "best-effort"` registers x64 unwind metadata through guest
 `RtlAddFunctionTable` and seeds the load-config security cookie when the mapped image exposes the
-default cookie slot. It does not synthesize loader-private VAD/section-object state, full LDR
-ownership, or per-thread TLS template propagation. When
-`loader_entries = "synthesized"`, Decant allocates a static TLS slot via `TlsAlloc`,
-patches the index into the image buffer, copies the TLS template, and calls
-`TlsSetValue` for the current helper/target thread. That does not propagate the
-template to other existing threads, and `remote-thread` DllMain runs on a new
-thread that does not inherit this value. For payloads with load-config metadata,
+default cookie slot. It represents loader-private state with Decant-owned metadata rather than
+handing ownership to `LdrLoadDll`. When `loader_entries = "synthesized"`, Decant allocates a
+static TLS slot via `TlsAlloc`, patches the index into the image buffer, copies the TLS template,
+writes per-thread template copies for existing direct TLS slots, and threads an optional
+`TlsSetValue` call through the DllMain thunk so `remote-thread`, `thread-hijack`, and `apc` enter
+the payload with the slot installed on the executing thread. For payloads with load-config metadata,
 `loader_metadata = "best-effort"` and `loader_entries = "synthesized"` also request
 a CFG valid-call-target mark for the entry point and exported function RVAs via
 `SetProcessValidCallTargets`. Broader CFG/load-config metadata is still not synthesized.
@@ -599,25 +612,32 @@ is import-triggered: execution occurs when the target calls the configured impor
 `remote-thread` execution path still uses the IAT-hook trampoline to call public exports, but
 creates the guest thread by calling `CreateThread` from inside the target process. The new thread
 starts at a `ThreadProc` thunk, and that thunk calls
-`DllMain(hinst, DLL_PROCESS_ATTACH, NULL)` with the proper x64 calling convention. When the
+`DllMain(hinst, DLL_PROCESS_ATTACH, reserved)` with the proper x64 calling convention. When the
 payload image has a large enough executable code cave, the thunk is placed there so the recorded
-thread start is inside the mapped image; otherwise a temporary helper allocation is used.
-`thread_starts = "require-module-backed"` makes the payload-image placement mandatory.
+thread start is inside the mapped image. `thread_starts = "require-module-backed"` makes the
+payload-image placement mandatory.
 The thunk writes DllMain's return value and a completion marker into scratch memory, which the
 host polls through the backend; it does not need a second target import call to wait for the new
 thread. Remote-thread launch helper calls use native stack handling even when
 `stack_shaping = "spoofed"` is selected.
+
+`thread-hijack` enumerates guest threads through EPROCESS/ETHREAD walking, opens the selected
+thread, suspends it through guest `SuspendThread`, captures and rewrites its x64 context, and
+resumes it at a DllMain thunk. The thunk installs optional TLS, calls DllMain, writes the
+completion marker, and jumps back to the original RIP. `apc` queues the same DllMain thunk through
+`QueueUserAPC`; completion is observed through the thunk scratch block once the target thread
+enters an alertable wait.
 Operators should provide `stage_pattern` or `stage_base` for executable stub bytes
 plus `result_pattern` or `result_base` for a writable scratch slot; without them, auto-selection
 is limited to memory that passes those separate permission checks. The strict
 `loader_metadata = "reject-unsupported"`
-default fails payloads that require static TLS slots, unwind registration, or load-config
-processing; `best-effort` registers the public runtime metadata Decant can safely express
-(including static TLS slot allocation when `loader_entries = "synthesized"`), and
-`allow-unsupported` skips the guards only for payloads that do not rely on the corresponding
-loader registration. The schema parses `thread-hijack`, `apc`, package/session
-selectors, and static TLS registration, but this backend returns unsupported errors for them until
-the needed thread/context, APC, or TLS support exists.
+default fails payloads that require metadata outside the selected policy; `best-effort` registers
+the public runtime metadata Decant can safely express, including static TLS slot allocation when
+`loader_entries = "synthesized"`, and `allow-unsupported` skips the guards only for payloads that
+do not rely on the corresponding loader registration. The schema parses `thread-hijack`, `apc`,
+package/session selectors, and static TLS registration. Support for each is tracked by
+`GuestCapabilities` (section 13), and the memflow backend advertises the x64 guest paths it can
+execute.
 
 The mapper reports, but does not hide or synthesize away, manual-map artifacts. Successful
 `GuestLoadInfo.notes` include `artifact audit:` entries covering private or SEC_IMAGE-backed image
@@ -625,16 +645,19 @@ memory, loader/module metadata state, PE metadata handled by Decant
 instead of `LdrLoadDll`, section-derived versus explicit-RWX permissions, loader metadata status
 for TLS/unwind/load-config records, call-stack policy, permission-transition policy,
 thread-start policy, image-backing policy, and the selected execution path. When requested,
-Decant can synthesize partial, transient PEB loader-list entries; it does not create VADs or
-section objects. With `image_backing = "sec-image"` the section object and image-file VAD backing
-are real kernel-created state produced through public guest exports, not forged. `stack_shaping =
+Decant can synthesize partial, transient PEB loader-list entries. For private mappings,
+`vad_spoof = "vad-image-map"` mutates the matched existing VAD type; it does not create a
+section object. With `image_backing = "sec-image"` the section object and image-file VAD backing are real
+kernel-created state produced through public guest exports, not forged. `stack_shaping =
 "spoofed"` is limited to writing a synthetic return address for selected helper/payload calls; it
 does not synthesize a full caller chain or normalize arbitrary stacks. Decant does not hide all
 allocation/write/protect observability. It does not synthesize or rewrite kernel thread-start
-metadata. `vad_spoof = "vad-image-map"` is parsed as an explicit experimental request, but the
-memflow backend currently returns unsupported rather than mutating undocumented Windows VAD
-fields. The supported way to obtain real image-file VAD backing is `image_backing = "sec-image"`,
-which asks the guest memory manager to create that state.
+metadata beyond what `thread_starts = "require-module-backed"` validates.
+`vad_spoof = "vad-image-map"` walks EPROCESS/VadRoot through memflow's out-of-band physical
+access and rewrites the matched MMVAD's `u.VadType` to `VadImageMap` so the region reports
+image-file backing; the offset probe covers both the Win10 19041+ (`eproc_vad_root=2008`)
+and 18362 (`1624`) layouts. The supported way to obtain a real image-file section object
+is `image_backing = "sec-image"`, which asks the guest memory manager to create that state.
 
 The tracked guest fixture lives in `testbins/guest-inject-fixture/native/`. `xtask
 guest-inject-fixture` builds a CRT-free target EXE with separate executable stub bytes and a
@@ -666,3 +689,25 @@ The Windows-only `decant_inject::sdk` module exposes the public-export primitive
 shipped methods: remote allocation, read, write, protection changes, remote thread start and wait,
 remote `LoadLibraryA`, remote `GetProcAddress`, and a small remote-call helper. Plugin authors can
 compose APC or thread-control methods against this surface without binding to Wine internals.
+
+---
+
+## 13. Capability surface and parity tracking
+
+The single source of truth for what a `GuestMemoryBackend` can express is
+`GuestCapabilities` (`crates/decant-inject/src/guest.rs`). Each field names a discrete
+capability (thread enumeration, TEB read, get/set context, suspend/resume, hardware
+breakpoints, APC, queue APC, create thread, static TLS, forwarded exports, and so on).
+`GuestManualMapInjector` consults `missing_manual_map` and refuses to start a run whose
+backend cannot express the requested policy; `GuestInjectError::Unsupported` carries the
+specific kernel-structure offset or IAT-hook sequence that has not landed for the active
+backend. The memflow backend advertises the x64 guest methods it can execute, including
+`remote-thread`, `thread-hijack`, and `apc`; `external-agent` remains a different integration
+surface rather than a memflow guest execution method.
+
+The parity program tracks BlackBone's surface item by item against this struct; the goal
+is that every BlackBone capability has a decant analogue or an explicit reason it is
+replaced by a memflow-side equivalent (kernel-mode operations, raw syscalls, inline
+covered by a separate sub-target). The structure-offset probes (EPROCESS VadRoot,
+EPROCESS ThreadListHead, ETHREAD TrapFrame, KTRAP_FRAME DR0-DR7) cover the Win10 19041+
+and 18362 layouts and are extended as new build offsets are confirmed.

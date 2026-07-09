@@ -10,7 +10,7 @@ pub mod scanner;
 
 pub use pattern::Pattern;
 pub use resolver::resolve;
-pub use scanner::{scan, scan_with_chunk};
+pub use scanner::{scan, scan_region, scan_with_chunk, scan_with_handler};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {

@@ -27,6 +27,7 @@ decant-protocol.workspace = true
 decant-backend.workspace = true
 decant-inject.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
 
 # memflow core with the `plugins` feature (the runtime Inventory). The win32 OS
 # layer is loaded as a runtime `.os` plugin via inventory.builder().os("win32"),

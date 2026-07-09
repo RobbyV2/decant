@@ -58,6 +58,9 @@ enum Cmd {
     GuestInject {
         config: PathBuf,
     },
+    GuestUnmap {
+        config: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -132,6 +135,7 @@ fn run() -> Result<()> {
             )
         }
         Cmd::GuestInject { config } => return guest_inject(&mut client, cli.json, &config),
+        Cmd::GuestUnmap { config } => return guest_unmap(&mut client, cli.json, &config),
     };
 
     let resp = client.send(req).context("daemon request")?;
@@ -232,6 +236,43 @@ fn guest_inject(client: &mut Client, json: bool, config_path: &Path) -> Result<(
     Ok(())
 }
 
+fn guest_unmap(client: &mut Client, json: bool, config_path: &Path) -> Result<()> {
+    let config_toml = std::fs::read_to_string(config_path)
+        .with_context(|| format!("reading {}", config_path.display()))?;
+    let config = DecantConfig::from_toml_str(&config_toml)
+        .map_err(|e| anyhow!("{e}"))
+        .with_context(|| format!("loading {}", config_path.display()))?;
+    let plan = GuestInjectionPlan::from_config(&config).map_err(|e| anyhow!("{e}"))?;
+    let request_timeout_ms = u64::from(plan.timeout_ms)
+        .saturating_add(u64::from(plan.execution.timeout_ms))
+        .saturating_add(30_000)
+        .max(300_000);
+    client.set_timeout(Duration::from_millis(request_timeout_ms));
+    let resp = client
+        .send(Request::GuestUnmap { config_toml })
+        .context("guest unmap request")?;
+    let info = match resp {
+        Response::GuestUnmapped(info) => info,
+        Response::Err(e) => bail!("daemon error: {e}"),
+        other => bail!("unexpected response: {other:?}"),
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "target": plan.target.label(),
+                "pid": info.pid.0,
+                "modules_unmapped": info.modules_unmapped,
+            })
+        );
+    } else {
+        println!("target:          {}", plan.target.label());
+        println!("pid:             {}", info.pid);
+        println!("modules unmapped: {}", info.modules_unmapped);
+    }
+    Ok(())
+}
+
 fn emit(resp: Response, json: bool, read_base: Option<u64>) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&resp)?);
@@ -293,6 +334,10 @@ fn emit(resp: Response, json: bool, read_base: Option<u64>) -> Result<()> {
                 print!("  ->  u64={v:#x} ({v})");
             }
             println!();
+        }
+        Response::GuestUnmapped(info) => {
+            println!("pid:             {}", info.pid);
+            println!("modules unmapped: {}", info.modules_unmapped);
         }
         Response::Err(e) => bail!("daemon error: {e}"),
         other => bail!("unexpected response: {other:?}"),

@@ -1,12 +1,16 @@
-use std::ffi::c_void;
 use std::process::ExitCode;
 
+#[cfg(windows)]
+use std::ffi::c_void;
+
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn LoadLibraryA(lp_lib_file_name: *const u8) -> *mut c_void;
     fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const u8) -> *mut c_void;
 }
 
+#[cfg(windows)]
 fn main() -> ExitCode {
     let dll = b"hello_dll.dll\0";
     let sym = b"add\0";
@@ -34,4 +38,10 @@ fn main() -> ExitCode {
             ExitCode::from(4)
         }
     }
+}
+
+#[cfg(not(windows))]
+fn main() -> ExitCode {
+    eprintln!("dll-smoke is a Windows/PE-side test binary");
+    ExitCode::from(64)
 }

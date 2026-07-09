@@ -513,6 +513,7 @@ dependencies = [
  "decant-inject",
  "decant-protocol",
  "memflow",
+ "tracing",
 ]
 
 [[package]]

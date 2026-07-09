@@ -3,8 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use decant_backend::MemoryBackend;
-use decant_daemon::{Diag, serve};
+use decant_daemon::{BasicDaemonBackend, DaemonBackend, Diag, serve};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum BackendKind {
@@ -51,10 +50,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_backend(kind: BackendKind, connector: &str) -> Result<(Arc<dyn MemoryBackend>, String)> {
+fn build_backend(kind: BackendKind, connector: &str) -> Result<(Arc<dyn DaemonBackend>, String)> {
     match kind {
         BackendKind::Mock => Ok((
-            Arc::new(decant_backend::fixtures::demo_backend()),
+            Arc::new(BasicDaemonBackend::new(
+                decant_backend::fixtures::demo_backend(),
+            )),
             "mock".to_string(),
         )),
         BackendKind::Memflow => build_memflow_backend(connector),
@@ -62,14 +63,14 @@ fn build_backend(kind: BackendKind, connector: &str) -> Result<(Arc<dyn MemoryBa
 }
 
 #[cfg(feature = "memflow")]
-fn build_memflow_backend(connector: &str) -> Result<(Arc<dyn MemoryBackend>, String)> {
+fn build_memflow_backend(connector: &str) -> Result<(Arc<dyn DaemonBackend>, String)> {
     let backend = decant_memflow::MemflowBackend::connect(connector)
         .with_context(|| format!("connecting memflow backend (connector: {connector})"))?;
     Ok((Arc::new(backend), format!("memflow:{connector}")))
 }
 
 #[cfg(not(feature = "memflow"))]
-fn build_memflow_backend(_connector: &str) -> Result<(Arc<dyn MemoryBackend>, String)> {
+fn build_memflow_backend(_connector: &str) -> Result<(Arc<dyn DaemonBackend>, String)> {
     anyhow::bail!(
         "this decant-daemon build has no memflow support. Rebuild on the VM host with:\n    \
          cargo build --release -p decant-daemon --features memflow\n\

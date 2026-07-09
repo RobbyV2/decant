@@ -10,11 +10,71 @@ use decant_inject::DecantConfig;
 use decant_inject::guest::{
     GuestCapabilities, GuestInjectError, GuestInjectionPlan, GuestInjectionRequest, GuestInjector,
     GuestManualMapInjector, GuestMemoryBackend, GuestMemoryRegion, GuestModuleInfo,
-    GuestProcessInfo,
+    GuestProcessInfo, unmap_all_tracked_modules,
 };
 use decant_protocol::{
-    Diagnostics, GuestInjectInfo, Pid, ProtoError, Request, Response, read_msg, write_msg,
+    Diagnostics, GuestInjectInfo, GuestUnmapInfo, Pid, ProtoError, Request, Response, read_msg,
+    write_msg,
 };
+
+pub trait DaemonBackend: MemoryBackend + GuestMemoryBackend {}
+
+impl<T> DaemonBackend for T where T: MemoryBackend + GuestMemoryBackend {}
+
+pub struct BasicDaemonBackend<B> {
+    backend: B,
+}
+
+impl<B> BasicDaemonBackend<B> {
+    pub fn new(backend: B) -> Self {
+        Self { backend }
+    }
+}
+
+impl<B> MemoryBackend for BasicDaemonBackend<B>
+where
+    B: MemoryBackend,
+{
+    fn list_processes(&self) -> decant_backend::Result<Vec<decant_protocol::ProcessInfo>> {
+        self.backend.list_processes()
+    }
+
+    fn process_by_pid(&self, pid: Pid) -> decant_backend::Result<decant_protocol::ProcessInfo> {
+        self.backend.process_by_pid(pid)
+    }
+
+    fn process_by_name(&self, name: &str) -> decant_backend::Result<decant_protocol::ProcessInfo> {
+        self.backend.process_by_name(name)
+    }
+
+    fn module_list(&self, pid: Pid) -> decant_backend::Result<Vec<decant_protocol::ModuleInfo>> {
+        self.backend.module_list(pid)
+    }
+
+    fn module_by_name(
+        &self,
+        pid: Pid,
+        name: &str,
+    ) -> decant_backend::Result<decant_protocol::ModuleInfo> {
+        self.backend.module_by_name(pid, name)
+    }
+
+    fn module_exports(&self, pid: Pid, module: &str) -> decant_backend::Result<Vec<(String, u64)>> {
+        self.backend.module_exports(pid, module)
+    }
+
+    fn read(&self, pid: Pid, addr: u64, len: usize) -> decant_backend::Result<Vec<u8>> {
+        self.backend.read(pid, addr, len)
+    }
+
+    fn write(&self, pid: Pid, addr: u64, data: &[u8]) -> decant_backend::Result<usize> {
+        self.backend.write(pid, addr, data)
+    }
+
+    fn memory_map(&self, pid: Pid) -> decant_backend::Result<Vec<decant_protocol::MemRegion>> {
+        self.backend.memory_map(pid)
+    }
+}
 
 #[derive(Debug)]
 pub struct Diag {
@@ -44,7 +104,7 @@ impl Diag {
     }
 }
 
-pub fn dispatch(req: Request, backend: &dyn MemoryBackend, diag: &Diag) -> Response {
+pub fn dispatch(req: Request, backend: &dyn DaemonBackend, diag: &Diag) -> Response {
     fn finish<T>(
         r: decant_backend::Result<T>,
         ok: impl FnOnce(T) -> Response,
@@ -65,33 +125,57 @@ pub fn dispatch(req: Request, backend: &dyn MemoryBackend, diag: &Diag) -> Respo
     match req {
         Request::Ping => Response::Pong,
         Request::Diagnostics => Response::Diagnostics(diag.snapshot()),
-        Request::ListProcesses => finish(backend.list_processes(), Response::Processes, diag),
-        Request::ProcessByPid(pid) => finish(backend.process_by_pid(pid), Response::Process, diag),
-        Request::ProcessByName(name) => {
-            finish(backend.process_by_name(&name), Response::Process, diag)
-        }
-        Request::ModuleList(pid) => finish(backend.module_list(pid), Response::Modules, diag),
-        Request::ModuleByName(pid, name) => {
-            finish(backend.module_by_name(pid, &name), Response::Module, diag)
-        }
+        Request::ListProcesses => finish(
+            MemoryBackend::list_processes(backend),
+            Response::Processes,
+            diag,
+        ),
+        Request::ProcessByPid(pid) => finish(
+            MemoryBackend::process_by_pid(backend, pid),
+            Response::Process,
+            diag,
+        ),
+        Request::ProcessByName(name) => finish(
+            MemoryBackend::process_by_name(backend, &name),
+            Response::Process,
+            diag,
+        ),
+        Request::ModuleList(pid) => finish(
+            MemoryBackend::module_list(backend, pid),
+            Response::Modules,
+            diag,
+        ),
+        Request::ModuleByName(pid, name) => finish(
+            MemoryBackend::module_by_name(backend, pid, &name),
+            Response::Module,
+            diag,
+        ),
         Request::ModuleExports(pid, module) => finish(
-            backend.module_exports(pid, &module),
+            MemoryBackend::module_exports(backend, pid, &module),
             Response::Exports,
             diag,
         ),
         Request::Read { pid, addr, len } => {
             diag.reads.fetch_add(1, Ordering::Relaxed);
-            finish(backend.read(pid, addr, len as usize), Response::Data, diag)
+            finish(
+                MemoryBackend::read(backend, pid, addr, len as usize),
+                Response::Data,
+                diag,
+            )
         }
         Request::Write { pid, addr, data } => {
             diag.writes.fetch_add(1, Ordering::Relaxed);
             finish(
-                backend.write(pid, addr, &data),
+                MemoryBackend::write(backend, pid, addr, &data),
                 |n| Response::Written(n as u64),
                 diag,
             )
         }
-        Request::MemoryMap(pid) => finish(backend.memory_map(pid), Response::MemoryMap, diag),
+        Request::MemoryMap(pid) => finish(
+            MemoryBackend::memory_map(backend, pid),
+            Response::MemoryMap,
+            diag,
+        ),
         Request::Scan { pid, pattern } => {
             match decant_analysis::scanner::scan_str(backend, pid, &pattern) {
                 Ok(hits) => Response::ScanHits(hits),
@@ -102,7 +186,7 @@ pub fn dispatch(req: Request, backend: &dyn MemoryBackend, diag: &Diag) -> Respo
             match decant_analysis::resolve(backend, pid, base, &offsets) {
                 Ok(address) => {
                     diag.reads.fetch_add(1, Ordering::Relaxed);
-                    let value = backend.read(pid, address, 8).unwrap_or_default();
+                    let value = MemoryBackend::read(backend, pid, address, 8).unwrap_or_default();
                     Response::Resolved { address, value }
                 }
                 Err(e) => Response::Err(core_err_to_proto(e)),
@@ -112,6 +196,7 @@ pub fn dispatch(req: Request, backend: &dyn MemoryBackend, diag: &Diag) -> Respo
             config_toml,
             payload_image,
         } => guest_inject(&config_toml, &payload_image, backend, diag),
+        Request::GuestUnmap { config_toml } => guest_unmap(&config_toml, backend, diag),
         Request::ReportUnsupported { op } => {
             diag.unsupported_ops.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(%op, "unsupported operation refused at the interposer");
@@ -120,13 +205,27 @@ pub fn dispatch(req: Request, backend: &dyn MemoryBackend, diag: &Diag) -> Respo
     }
 }
 
-struct BackendGuest<'a> {
-    backend: &'a dyn MemoryBackend,
-}
-
-impl GuestMemoryBackend for BackendGuest<'_> {
+impl<B> GuestMemoryBackend for BasicDaemonBackend<B>
+where
+    B: MemoryBackend,
+{
     fn capabilities(&self) -> GuestCapabilities {
-        GuestCapabilities::memflow_guest_injection()
+        GuestCapabilities {
+            list_processes: true,
+            module_list: true,
+            module_exports: true,
+            read_memory: true,
+            write_memory: true,
+            write_verify: true,
+            memory_map: true,
+            virtual_alloc: true,
+            iat_hook_execution: true,
+            wait_for_result: true,
+            forwarded_exports: true,
+            ordinal_imports: true,
+            delay_imports: true,
+            ..GuestCapabilities::default()
+        }
     }
 
     fn list_processes(&self) -> Result<Vec<GuestProcessInfo>, GuestInjectError> {
@@ -205,7 +304,7 @@ impl GuestMemoryBackend for BackendGuest<'_> {
 fn guest_inject(
     config_toml: &str,
     payload_image: &[u8],
-    backend: &dyn MemoryBackend,
+    backend: &dyn DaemonBackend,
     diag: &Diag,
 ) -> Response {
     let config = match DecantConfig::from_toml_str(config_toml) {
@@ -220,18 +319,41 @@ fn guest_inject(
         Ok(plan) => plan,
         Err(e) => return guest_error(e, diag),
     };
-    let guest = BackendGuest { backend };
     let req = GuestInjectionRequest {
         payload_path: &plan.payload_path,
         payload_image,
         plan: &plan,
     };
-    match GuestManualMapInjector.inject(&guest, &req) {
+    let guest: &dyn GuestMemoryBackend = backend;
+    match GuestManualMapInjector.inject(guest, &req) {
         Ok(info) => Response::GuestInjected(GuestInjectInfo {
             method: info.method,
             pid: Pid(info.pid),
             remote_base: info.remote_base,
             notes: info.notes,
+        }),
+        Err(e) => guest_error(e, diag),
+    }
+}
+
+fn guest_unmap(config_toml: &str, backend: &dyn DaemonBackend, diag: &Diag) -> Response {
+    let config = match DecantConfig::from_toml_str(config_toml) {
+        Ok(config) => config,
+        Err(e) => {
+            return Response::Err(ProtoError::Backend {
+                message: e.to_string(),
+            });
+        }
+    };
+    let plan = match GuestInjectionPlan::from_config(&config) {
+        Ok(plan) => plan,
+        Err(e) => return guest_error(e, diag),
+    };
+    let guest: &dyn GuestMemoryBackend = backend;
+    match unmap_all_tracked_modules(guest, &plan) {
+        Ok((pid, modules_unmapped)) => Response::GuestUnmapped(GuestUnmapInfo {
+            pid: Pid(pid),
+            modules_unmapped: modules_unmapped as u64,
         }),
         Err(e) => guest_error(e, diag),
     }
@@ -259,7 +381,7 @@ fn core_err_to_proto(e: decant_analysis::CoreError) -> ProtoError {
 
 pub fn serve_connection(
     mut stream: TcpStream,
-    backend: &dyn MemoryBackend,
+    backend: &dyn DaemonBackend,
     diag: &Diag,
 ) -> io::Result<()> {
     loop {
@@ -275,7 +397,7 @@ pub fn serve_connection(
 
 pub fn serve(
     listener: TcpListener,
-    backend: Arc<dyn MemoryBackend>,
+    backend: Arc<dyn DaemonBackend>,
     diag: Arc<Diag>,
 ) -> io::Result<()> {
     for stream in listener.incoming() {
@@ -308,7 +430,7 @@ mod tests {
 
     #[test]
     fn dispatch_reads_planted_magic() {
-        let b = demo_backend();
+        let b = BasicDaemonBackend::new(demo_backend());
         let d = diag();
         let resp = dispatch(
             Request::Read {
@@ -328,7 +450,7 @@ mod tests {
 
     #[test]
     fn dispatch_write_then_read_back() {
-        let b = demo_backend();
+        let b = BasicDaemonBackend::new(demo_backend());
         let d = diag();
         let w = dispatch(
             Request::Write {
@@ -355,7 +477,7 @@ mod tests {
 
     #[test]
     fn dispatch_unknown_pid_is_structured_error() {
-        let b = demo_backend();
+        let b = BasicDaemonBackend::new(demo_backend());
         let d = diag();
         let resp = dispatch(Request::ProcessByPid(Pid(9999)), &b, &d);
         assert!(matches!(

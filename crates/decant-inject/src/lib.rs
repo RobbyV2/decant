@@ -614,4 +614,81 @@ mod tests {
         assert_eq!(plan.target.name.as_deref(), Some("notepad.exe"));
         assert_eq!(plan.payload_path, std::path::PathBuf::from("payload.dll"));
     }
+
+    #[test]
+    fn manual_map_flags_parse() {
+        let c = DecantConfig::from_toml_str(
+            "[injection]\ndomain = \"guest\"\nmethod = \"manual-map\"\n\
+             [guest]\nprocess = \"p\"\npayload_path = \"x.dll\"\n\
+             delay_loads = \"skip\"\nsxs = \"probe\"\nforce_remap = true\n\
+             high_memory = true\nis_dependency = true\nmanual_module_registry = \"track\"\n\
+             dll_main_reserved_arg = [1, 2, 3, 4]\n",
+        )
+        .unwrap();
+        let plan = guest::GuestInjectionPlan::from_config(&c).unwrap();
+        assert_eq!(plan.delay_loads, guest::GuestDelayLoads::Skip);
+        assert_eq!(plan.sxs, guest::GuestSxS::Probe);
+        assert!(plan.force_remap);
+        assert!(plan.high_memory);
+        assert!(plan.is_dependency);
+        assert_eq!(
+            plan.manual_module_registry,
+            guest::GuestManualModuleRegistry::Track
+        );
+        assert_eq!(
+            plan.dll_main_reserved_arg.as_deref(),
+            Some(&[1u8, 2, 3, 4][..])
+        );
+    }
+
+    #[test]
+    fn manual_map_flags_default() {
+        let c = DecantConfig::from_toml_str(
+            "[injection]\ndomain = \"guest\"\nmethod = \"manual-map\"\n\
+             [guest]\nprocess = \"p\"\npayload_path = \"x.dll\"\n",
+        )
+        .unwrap();
+        let plan = guest::GuestInjectionPlan::from_config(&c).unwrap();
+        assert_eq!(plan.delay_loads, guest::GuestDelayLoads::Resolve);
+        assert_eq!(plan.sxs, guest::GuestSxS::Skip);
+        assert!(!plan.force_remap);
+        assert!(!plan.high_memory);
+        assert!(!plan.is_dependency);
+        assert_eq!(
+            plan.manual_module_registry,
+            guest::GuestManualModuleRegistry::Off
+        );
+        assert!(plan.dll_main_reserved_arg.is_none());
+        assert!(plan.map_callback_path.is_none());
+    }
+
+    #[test]
+    fn map_callback_parses() {
+        let c = DecantConfig::from_toml_str(
+            "[injection]\ndomain = \"guest\"\nmethod = \"manual-map\"\n\
+             [guest]\nprocess = \"p\"\npayload_path = \"x.dll\"\n\
+             map_callback_path = \"callback.dll\"\n",
+        )
+        .unwrap();
+        let plan = guest::GuestInjectionPlan::from_config(&c).unwrap();
+        assert_eq!(
+            plan.map_callback_path.as_deref(),
+            Some(std::path::Path::new("callback.dll"))
+        );
+    }
+
+    #[test]
+    fn execution_methods_parse() {
+        let methods = ["iat-hook", "remote-thread", "thread-hijack", "apc"];
+        for m in &methods {
+            let c = DecantConfig::from_toml_str(&format!(
+                "[injection]\ndomain = \"guest\"\nmethod = \"manual-map\"\n\
+                 [guest]\nprocess = \"p\"\npayload_path = \"x.dll\"\n\
+                 [guest.execution]\nmethod = \"{m}\"\n"
+            ))
+            .unwrap();
+            let plan = guest::GuestInjectionPlan::from_config(&c).unwrap();
+            assert_eq!(plan.execution.method.label(), *m);
+        }
+    }
 }

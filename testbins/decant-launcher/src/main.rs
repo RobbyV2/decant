@@ -1,16 +1,21 @@
 #![allow(clippy::manual_c_str_literals)]
 
+#[cfg(windows)]
 use std::ffi::c_void;
+#[cfg(windows)]
 use std::path::Path;
 use std::process::ExitCode;
 
+#[cfg(windows)]
 use decant_inject::{
     InjectError, InjectionConfig, InjectionRequest, Method, ProcessHandle, ReadyToken,
     ThreadHandle, thread_hijack_release_event_name,
 };
 
+#[cfg(windows)]
 type Handle = *mut c_void;
 
+#[cfg(windows)]
 #[repr(C)]
 struct ProcessInformation {
     h_process: Handle,
@@ -19,6 +24,7 @@ struct ProcessInformation {
     dw_thread_id: u32,
 }
 
+#[cfg(windows)]
 #[repr(C)]
 struct StartupInfoW {
     cb: u32,
@@ -42,6 +48,7 @@ struct StartupInfoW {
     h_std_error: Handle,
 }
 
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn CreateProcessW(
@@ -73,18 +80,27 @@ unsafe extern "system" {
     fn TerminateProcess(process: Handle, exit_code: u32) -> i32;
 }
 
+#[cfg(windows)]
 const CREATE_SUSPENDED: u32 = 0x0000_0004;
+#[cfg(windows)]
 const WAIT_OBJECT_0: u32 = 0;
+#[cfg(windows)]
 const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
+#[cfg(windows)]
 const STD_INPUT: i32 = -10;
+#[cfg(windows)]
 const STD_OUTPUT: i32 = -11;
+#[cfg(windows)]
 const STD_ERROR: i32 = -12;
+#[cfg(windows)]
 const INFINITE: u32 = 0xFFFF_FFFF;
 
+#[cfg(windows)]
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+#[cfg(windows)]
 fn exit_code_for(e: &InjectError) -> u8 {
     match e {
         InjectError::RemoteAlloc(_) => 3,
@@ -103,6 +119,7 @@ fn exit_code_for(e: &InjectError) -> u8 {
     }
 }
 
+#[cfg(windows)]
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let target = match args.next() {
@@ -304,4 +321,10 @@ fn main() -> ExitCode {
 
         ExitCode::from(code as u8)
     }
+}
+
+#[cfg(not(windows))]
+fn main() -> ExitCode {
+    eprintln!("decant-launcher is a Windows/PE-side helper");
+    ExitCode::from(64)
 }

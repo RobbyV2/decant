@@ -4,7 +4,7 @@
 //! this Rust cdylib payload for `x86_64-pc-windows-gnu`.
 
 pub const MAGIC_AOB: &str = "44 45 43 41 4E 54 3A 3A 47 55 45 53 54 49 4E 4A";
-pub const FIXTURE_VERSION_AOB: &str = "44 45 43 41 4E 54 3A 3A 47 49 4E 4A 30 30 30 35";
+pub const FIXTURE_VERSION_AOB: &str = "44 45 43 41 4E 54 3A 3A 47 49 4E 4A 30 30 30 37";
 pub const STUB_AOB: &str = "44 45 43 41 4E 54 3A 3A 53 54 55 42 30 30 30 34";
 pub const RESULT_AOB: &str = "44 45 43 41 4E 54 3A 3A 52 45 53 55 4C 54 30 34";
 pub const DLL_MARKER: u64 = 0xD11D_ECA7_600D_5107;

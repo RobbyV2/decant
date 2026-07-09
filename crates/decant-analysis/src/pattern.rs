@@ -40,14 +40,60 @@ impl Pattern {
         })
     }
 
-    pub fn find_all(&self, hay: &[u8]) -> Vec<usize> {
+    fn has_wildcards(&self) -> bool {
+        self.bytes.iter().any(|b| b.is_none())
+    }
+
+    fn bmh_shift_table(&self) -> [usize; 256] {
         let plen = self.bytes.len();
-        if hay.len() < plen {
-            return Vec::new();
+        let mut table = [plen; 256];
+        for (i, b) in self.bytes.iter().enumerate() {
+            if let Some(v) = b {
+                table[*v as usize] = plen - 1 - i;
+            }
         }
-        (0..=hay.len() - plen)
-            .filter(|&i| self.matches_at_start(&hay[i..i + plen]))
-            .collect()
+        table
+    }
+
+    pub fn find_all(&self, hay: &[u8]) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.find_all_with_handler(hay, |off| {
+            out.push(off);
+            true
+        });
+        out
+    }
+
+    pub fn find_all_with_handler<F: FnMut(usize) -> bool>(&self, hay: &[u8], mut handler: F) {
+        let plen = self.bytes.len();
+        if plen == 0 || hay.len() < plen {
+            return;
+        }
+        if self.has_wildcards() {
+            for i in 0..=hay.len() - plen {
+                if self.matches_at_start(&hay[i..i + plen]) && !handler(i) {
+                    return;
+                }
+            }
+            return;
+        }
+        let table = self.bmh_shift_table();
+        let mut i = 0usize;
+        while i + plen <= hay.len() {
+            let mut j = plen;
+            while j > 0 && self.bytes[j - 1] == Some(hay[i + j - 1]) {
+                j -= 1;
+            }
+            if j == 0 {
+                if !handler(i) {
+                    return;
+                }
+                i += 1;
+            } else {
+                let shift = table[hay[i + plen - 1] as usize];
+                i += shift.max(1);
+            }
+        }
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Pattern {
@@ -111,5 +157,47 @@ mod tests {
                 .find_all(&[0x00, 0x01])
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn bmh_exact_pattern_matches_naive() {
+        let mut hay = vec![0u8; 4096];
+        for (i, b) in hay.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        hay[100..104].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        hay[2000..2004].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let pat = Pattern::parse("DE AD BE EF").unwrap();
+        let naive: Vec<usize> = (0..=hay.len() - 4)
+            .filter(|&i| pat.matches_at_start(&hay[i..i + 4]))
+            .collect();
+        assert_eq!(pat.find_all(&hay), naive);
+        assert_eq!(pat.find_all(&hay), vec![100, 2000]);
+    }
+
+    #[test]
+    fn handler_early_stop() {
+        let hay = [0xAA, 0xBB, 0xCC, 0xAA, 0xBB, 0xCC, 0xAA, 0xBB, 0xCC];
+        let pat = Pattern::parse("AA BB").unwrap();
+        let mut hits = Vec::new();
+        let mut count = 0;
+        pat.find_all_with_handler(&hay, |off| {
+            count += 1;
+            hits.push(off);
+            count < 2
+        });
+        assert_eq!(hits, vec![0, 3]);
+    }
+
+    #[test]
+    fn handler_wildcard_early_stop() {
+        let hay = [0xAA, 0x01, 0xBB, 0xAA, 0x02, 0xBB, 0xAA, 0x03, 0xBB];
+        let pat = Pattern::parse("AA ?? BB").unwrap();
+        let mut hits = Vec::new();
+        pat.find_all_with_handler(&hay, |off| {
+            hits.push(off);
+            false
+        });
+        assert_eq!(hits, vec![0]);
     }
 }

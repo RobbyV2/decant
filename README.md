@@ -326,17 +326,16 @@ mapped image, then applies PE-derived permissions before payload code runs; `rwx
 an explicit compatibility mode. `dependency_policy = "require-loaded"` means every imported
 module must already be present in the target process;
 `load-with-guest-loader` calls the target's `LoadLibraryA` and `GetProcAddress` for missing
-dependencies. Full loader-managed static TLS registration remains unsupported. By default,
-`loader_metadata = "reject-unsupported"` rejects payloads that need static TLS slots, unwind
-registration, or load-config processing. `loader_metadata = "best-effort"` registers x64 unwind
-metadata through guest `RtlAddFunctionTable` and seeds the load-config security cookie when the
-mapped image exposes the default cookie slot; loader-private state such as VAD/section-object
-state, full LDR ownership, and per-thread TLS template propagation is still not
-synthesized. When `loader_entries = "synthesized"`, Decant allocates a static TLS
-slot via `TlsAlloc`, patches the index into the image buffer, copies the TLS
-template, and calls `TlsSetValue` for the current helper/target thread. That is
-only valid for code running on the same thread; other existing threads are not
-covered, and the `remote-thread` DllMain thread does not inherit that template.
+dependencies. By default, `loader_metadata = "reject-unsupported"` rejects payloads that need
+loader metadata Decant has not been asked to model. `loader_metadata = "best-effort"` registers
+x64 unwind metadata through guest `RtlAddFunctionTable` and seeds the load-config security cookie
+when the mapped image exposes the default cookie slot; loader-private state such as full LDR
+ownership is represented through Decant's synthesized metadata rather than by `LdrLoadDll`.
+When `loader_entries = "synthesized"`, Decant allocates a static TLS slot via `TlsAlloc`, patches
+the index into the image buffer, copies the TLS template, writes per-thread template copies for
+existing direct TLS slots, and threads an optional `TlsSetValue` call through the DllMain thunk so
+`remote-thread`, `thread-hijack`, and `apc` enter the payload with the slot installed on the
+executing thread.
 For payloads with load-config metadata, `loader_metadata = "best-effort"`
 and `loader_entries = "synthesized"` also request a CFG valid-call-target mark
 for the entry point and exported function RVAs via `SetProcessValidCallTargets`;
@@ -380,34 +379,36 @@ otherwise Decant only auto-selects memory that passes those permission checks.
 `guest.execution.method = "remote-thread"` creates a kernel-tracked guest thread by first
 entering the target through the IAT-hook trampoline, then calling `CreateThread` from inside the
 target process. The thread starts at a `ThreadProc` thunk that calls
-`DllMain(hinst, DLL_PROCESS_ATTACH, NULL)` with the proper x64 calling convention. If the mapped
+`DllMain(hinst, DLL_PROCESS_ATTACH, reserved)` with the proper x64 calling convention. If the mapped
 payload image has a large enough executable code cave, Decant places that thunk there so the
-kernel-recorded start address is inside the mapped image; otherwise it uses a temporary helper
-allocation. `thread_starts = "require-module-backed"` makes the payload-image code cave
-mandatory and fails rather than using the temporary fallback. The ThreadProc thunk stores
-DllMain's return value and a completion marker in its scratch block; the host polls those bytes
-through the backend instead of requiring another target import call after `CreateThread`.
-Remote-thread launch helpers use native helper-call stack handling even when
-`stack_shaping = "spoofed"` is selected; DllMain itself runs on the new thread through the thunk.
+kernel-recorded start address is inside the mapped image; `thread_starts =
+"require-module-backed"` makes that placement mandatory. The ThreadProc thunk stores DllMain's
+return value and a completion marker in its scratch block; the host polls those bytes through the
+backend instead of requiring another target import call after `CreateThread`. Remote-thread
+launch helpers use native helper-call stack handling even when `stack_shaping = "spoofed"` is
+selected; DllMain itself runs on the new thread through the thunk.
 
-`thread-hijack`,
-`apc`, and package/session selectors are parsed but not implemented by this backend.
+`guest.execution.method = "thread-hijack"` enumerates guest threads, opens the selected thread,
+suspends it through guest `SuspendThread`, captures and rewrites its x64 context, and resumes it
+at a DllMain thunk. The thunk installs optional TLS, calls DllMain, writes the completion marker,
+and jumps back to the original RIP. `guest.execution.method = "apc"` queues the same DllMain
+thunk through `QueueUserAPC`; completion is observed through the thunk scratch block once the
+target thread enters an alertable wait.
 
 Guest injection results include `artifact audit:` notes for the observable properties of the
 selected path: private or SEC_IMAGE-backed image memory, loader/module metadata state,
 section-derived versus explicit-RWX permissions, registered or unregistered unwind/load-config
 metadata, call-stack policy, permission-transition policy, thread-start policy, image-backing
 policy, and the selected execution path. When requested, Decant can synthesize partial,
-transient PEB loader-list entries; it does not create VADs or section objects. With
-`image_backing = "sec-image"` the section object and image-file VAD backing are real
-kernel-created state produced through public guest exports, not forged. `stack_shaping =
+transient PEB loader-list entries. With `image_backing = "sec-image"` the section object and
+image-file VAD backing are real kernel-created state produced through public guest exports, not
+forged. `stack_shaping =
 "spoofed"` is limited to writing a synthetic return address for selected helper/payload calls; it
 does not synthesize a full caller chain or normalize arbitrary stacks. Decant does not hide all
 allocation/write/protect observability. It does not synthesize or rewrite kernel thread-start
-metadata. `vad_spoof = "vad-image-map"` is parsed as an explicit experimental request, but the
-memflow backend currently returns unsupported rather than mutating undocumented Windows VAD
-fields. Use `image_backing = "sec-image"` for the supported path that obtains real image-file VAD
-backing from the guest memory manager.
+metadata. `vad_spoof = "vad-image-map"` walks EPROCESS/VadRoot through memflow and rewrites the
+matched MMVAD's `u.VadType` to `VadImageMap` for private mappings; `image_backing = "sec-image"`
+remains the path that obtains a real section object from the guest memory manager.
 
 For UWP/AppContainer loader-style injection, the relevant extra requirement is DLL file access:
 the AppContainer SID such as `S-1-15-2-1` must be granted read/execute access before
@@ -440,7 +441,7 @@ Notes:
 - A paged-out guest page reads as not-present (a `ReadFailed`, not truncated bytes).
 - Freezing a fast-changing or per-frame value is racy by construction. Decant reads and writes guest memory out of band; it cannot install a hook in the guest or perform an atomic read-modify-write across the boundary, so a freeze loop can lose races against the game's own writes. Slow-changing values freeze reliably.
 - Cheat Engine and any other tool that resolves the memory APIs at runtime route the same as one that imports them. Such a tool does not import `ReadProcessMemory`; it looks the address up with `GetProcAddress` at runtime, and it lists processes through `NtQuerySystemInformation` rather than toolhelp. The carafe patches `GetProcAddress`'s own import slot, so every runtime lookup of an interposed memory API returns the carafe's hook, and it synthesizes `NtQuerySystemInformation` for the process list, along with `NtOpenProcess`, `NtGetNextProcess`, `Toolhelp32ReadProcessMemory`, and the `NtQueryInformationProcess` image classes. A tool that imports the APIs directly (the bundled `sample-tool`) routes through the import-table patch instead. This is general, not a Cheat-Engine special case; either way the binding stays on public Win32/NT exports. `cargo xtask dynamic` exercises the runtime-resolution path with a tool that resolves every memory API only through `GetProcAddress` and enumerates only through `NtQuerySystemInformation`. What stays unsupported through the hooked tool API is arbitrary guest code execution (see the table above); explicit guest DLL injection goes through `decant-cli guest-inject`.
-- The synthetic process handle services the full handle tail: `OpenProcess`, `ReadProcessMemory`, `WriteProcessMemory`, `CloseHandle` and `NtClose`, `DuplicateHandle`, `WaitForSingleObject`/`WaitForSingleObjectEx`/`NtWaitForSingleObject`, `GetHandleInformation`/`SetHandleInformation`, `GetProcessId`, `GetExitCodeProcess`, `GetPriorityClass`, `GetProcessTimes`, `IsWow64Process`, `QueryFullProcessImageName`, `GetProcessImageFileName`, the `NtQueryInformationProcess` basic, wow64, and image classes, `VirtualQueryEx` and `NtQueryVirtualMemory`, and `VirtualProtectEx` and `NtProtectVirtualMemory`. The protection-change pair returns success and reports the page's prior protection without altering it: memflow writes guest physical memory and is not bound by virtual page protection, so a write to a page the tool sees as read-only lands without a real protection change. `NtQueryInformationProcess(ProcessBasicInformation)` returns the pid with a PEB base of 0, since memflow's generic ABI does not expose it, so guest PEB-walking features are unavailable. The execution and process-control exports (memory allocation, remote threads, `TerminateProcess`, `NtSuspendProcess`/`NtResumeProcess`) refuse.
+- The synthetic process handle services the full handle tail: `OpenProcess`, `ReadProcessMemory`, `WriteProcessMemory`, `CloseHandle` and `NtClose`, `DuplicateHandle`, `WaitForSingleObject`/`WaitForSingleObjectEx`/`NtWaitForSingleObject`, `GetHandleInformation`/`SetHandleInformation`, `GetProcessId`, `GetExitCodeProcess`, `GetPriorityClass`, `GetProcessTimes`, `IsWow64Process`, `QueryFullProcessImageName`, `GetProcessImageFileName`, the `NtQueryInformationProcess` basic and image classes, `VirtualQueryEx` and `NtQueryVirtualMemory`, and `VirtualProtectEx` and `NtProtectVirtualMemory`. The protection-change pair returns success and reports the page's prior protection without altering it: memflow writes guest physical memory and is not bound by virtual page protection, so a write to a page the tool sees as read-only lands without a real protection change. `NtQueryInformationProcess(ProcessBasicInformation)` returns the pid with a PEB base of 0, since memflow's generic ABI does not expose it, so guest PEB-walking features are unavailable. The execution and process-control exports (memory allocation, remote threads, `TerminateProcess`, `NtSuspendProcess`/`NtResumeProcess`) refuse.
 - `VirtualQueryEx` and `NtQueryVirtualMemory` report `State`, `Type`, and `Protect` derived from the guest page tables and module list: a region overlapping a loaded module reports `MEM_IMAGE`, others `MEM_PRIVATE`. `MEM_MAPPED` is not distinguished, reserved uncommitted memory is not enumerated, and copy-on-write and guard sub-flags are not reported. Default scans over all types are unaffected; a `Type`-filtered or `Protect`-filtered scan may differ from native.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) section 3.

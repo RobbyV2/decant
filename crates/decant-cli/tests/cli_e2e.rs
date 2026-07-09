@@ -3,17 +3,16 @@ use std::process::{self, Command, Output};
 use std::sync::Arc;
 use std::{env, fs};
 
-use decant_backend::MemoryBackend;
 use decant_backend::fixtures::{
     DEMO_CHAIN_HEAD, DEMO_CHAIN_NODE, DEMO_CHAIN_OFFSET, DEMO_MAGIC, DEMO_MAGIC_ADDR,
     DEMO_SLOT_ADDR, demo_backend,
 };
-use decant_daemon::{Diag, serve};
+use decant_daemon::{BasicDaemonBackend, Diag, serve};
 
 fn start_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
     let port = listener.local_addr().unwrap().port();
-    let backend: Arc<dyn MemoryBackend> = Arc::new(demo_backend());
+    let backend = Arc::new(BasicDaemonBackend::new(demo_backend()));
     let diag = Arc::new(Diag::new("mock"));
     std::thread::spawn(move || {
         let _ = serve(listener, backend, diag);
@@ -148,6 +147,29 @@ fn guest_inject_reaches_daemon_mapper() {
     .unwrap();
 
     let out = cli(port, &["guest-inject", config.to_str().unwrap()]);
+    let _ = fs::remove_dir_all(&root);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("guest IAT-hook execution needs guest.stage_base"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn guest_unmap_reaches_daemon_mapper() {
+    let port = start_server();
+    let root = env::temp_dir().join(format!("decant_guest_unmap_{}_{}", process::id(), port));
+    fs::create_dir_all(&root).unwrap();
+    let config = root.join("guest.toml");
+    fs::write(
+        &config,
+        "[injection]\ndomain = \"guest\"\nmethod = \"manual-map\"\n\
+         [guest]\nprocess = \"decant-target.exe\"\npayload_path = \"unused.dll\"\n",
+    )
+    .unwrap();
+
+    let out = cli(port, &["guest-unmap", config.to_str().unwrap()]);
     let _ = fs::remove_dir_all(&root);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);

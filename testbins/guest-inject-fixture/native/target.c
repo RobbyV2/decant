@@ -20,6 +20,8 @@ extern uint8_t decant_guest_inject_stage;
 typedef void(WINAPI *sleep_fn_t)(DWORD);
 
 static volatile sleep_fn_t g_cached_sleep = 0;
+static HANDLE g_hijack_worker_event = 0;
+static volatile DWORD g_hijack_worker_tid = 0;
 
 __attribute__((used)) static volatile decant_probe_t g_probe = {
     .magic = DECANT_GUEST_MAGIC_BYTES,
@@ -27,6 +29,13 @@ __attribute__((used)) static volatile decant_probe_t g_probe = {
     .dll_marker = 0,
     .dll_count = 0,
     .payload = {0},
+    .apc_result = 0,
+    .hijack_result = 0,
+    .remote_thread_result = 0,
+    .unload_marker = 0,
+    .vad_probe = 0,
+    .vtable = {0, 0, 0, 0},
+    .tls_callback_fired = 0,
 };
 
 __attribute__((used)) static volatile uint8_t g_fixture_version[16] =
@@ -70,6 +79,37 @@ static void write_hex_line(const char *label, uint64_t value) {
     write_all("\r\n");
 }
 
+static DWORD WINAPI hijack_worker(LPVOID param) {
+    HANDLE event = (HANDLE)param;
+    for (;;) {
+        // An alertable wait gives the APC fixture a deterministic target thread. The same
+        // worker remains safe for the thread-hijack fixture path.
+        WaitForSingleObjectEx(event, 1000, TRUE);
+    }
+    return 0;
+}
+
+static void start_hijack_worker(void) {
+    if (g_hijack_worker_tid != 0) {
+        return;
+    }
+    g_hijack_worker_event = CreateEventA(0, TRUE, FALSE, 0);
+    if (g_hijack_worker_event == 0) {
+        write_all("guest-inject-target: CreateEventA for hijack worker failed\r\n");
+        return;
+    }
+    DWORD tid = 0;
+    HANDLE thread = CreateThread(0, 0, hijack_worker, g_hijack_worker_event, 0, &tid);
+    if (thread == 0) {
+        write_all("guest-inject-target: CreateThread for hijack worker failed\r\n");
+        CloseHandle(g_hijack_worker_event);
+        g_hijack_worker_event = 0;
+        return;
+    }
+    g_hijack_worker_tid = tid;
+    CloseHandle(thread);
+}
+
 __attribute__((noinline)) static void sleep_ms(DWORD milliseconds) {
     Sleep(milliseconds);
 }
@@ -104,12 +144,20 @@ static void print_status(void) {
     write_hex_line("  dll_marker @  : ", (uint64_t)(uintptr_t)&g_probe.dll_marker);
     write_hex_line("  stub @        : ", (uint64_t)(uintptr_t)&decant_guest_inject_stage);
     write_hex_line("  result @      : ", (uint64_t)(uintptr_t)&g_iat_result);
+    write_hex_line("  apc_result @  : ", (uint64_t)(uintptr_t)&g_probe.apc_result);
+    write_hex_line("  hijack_result @: ", (uint64_t)(uintptr_t)&g_probe.hijack_result);
+    write_hex_line("  rt_result @   : ", (uint64_t)(uintptr_t)&g_probe.remote_thread_result);
+    write_hex_line("  unload_marker @: ", (uint64_t)(uintptr_t)&g_probe.unload_marker);
+    write_hex_line("  vad_probe @   : ", (uint64_t)(uintptr_t)&g_probe.vad_probe);
+    write_hex_line("  vtable @      : ", (uint64_t)(uintptr_t)&g_probe.vtable);
+    write_hex_line("  tls_cb @      : ", (uint64_t)(uintptr_t)&g_probe.tls_callback_fired);
+    write_hex_line("  hijack_tid    : ", (uint64_t)g_hijack_worker_tid);
     write_hex_line("  tick          : ", g_probe.tick);
     write_hex_line("  dll_marker    : ", g_probe.dll_marker);
     write_hex_line("  dll_count     : ", g_probe.dll_count);
     write_hex_line("  expected mark : ", DECANT_DLL_MARKER);
     write_all("  magic AOB     : 44 45 43 41 4E 54 3A 3A 47 55 45 53 54 49 4E 4A\r\n");
-    write_all("  fixture AOB   : 44 45 43 41 4E 54 3A 3A 47 49 4E 4A 30 30 30 35\r\n");
+    write_all("  fixture AOB   : 44 45 43 41 4E 54 3A 3A 47 49 4E 4A 30 30 30 37\r\n");
     write_all("  stub AOB      : 44 45 43 41 4E 54 3A 3A 53 54 55 42 30 30 30 34\r\n");
     write_all("  result AOB    : 44 45 43 41 4E 54 3A 3A 52 45 53 55 4C 54 30 34\r\n");
 }
@@ -134,6 +182,7 @@ static UINT self_load(void) {
 
 static void resident(void) {
     int observed = 0;
+    start_hijack_worker();
     print_status();
     for (;;) {
         g_probe.tick++;
@@ -147,6 +196,7 @@ static void resident(void) {
 
 static void resident_cached_sleep(void) {
     int observed = 0;
+    start_hijack_worker();
     g_cached_sleep = Sleep;
     print_status();
     write_all("guest-inject-target: cached Sleep pointer\r\n");

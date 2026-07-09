@@ -7,12 +7,15 @@ const IMAGE_DIRECTORY_ENTRY_BASERELOC: usize = 5;
 const IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG: usize = 10;
 const IMAGE_DIRECTORY_ENTRY_TLS: usize = 9;
 const IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT: usize = 13;
+const IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR: usize = 14;
 const IMAGE_REL_BASED_ABSOLUTE: u16 = 0;
 const IMAGE_REL_BASED_DIR64: u16 = 10;
 const IMAGE_ORDINAL_FLAG64: u64 = 0x8000_0000_0000_0000;
 const DLATTR_RVA: u32 = 1;
 const IMAGE_LOAD_CONFIG_SECURITY_COOKIE_OFFSET64: usize = 0x58;
 const DEFAULT_SECURITY_COOKIE_X64: u64 = 0x0000_2B99_2DDF_A232;
+const IMAGE_SUBSYSTEM_UNKNOWN: u16 = 0;
+const IMAGE_FILE_DLL: u32 = 0x2000;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Dir {
@@ -48,7 +51,11 @@ pub(crate) struct Pe {
     pub load_config: Dir,
     pub delay_import: Dir,
     pub export_dir: Dir,
+    pub com_descriptor: Dir,
     pub sections: Vec<Section>,
+    pub characteristics: u32,
+    pub subsystem: u16,
+    pub dll_characteristics: u16,
 }
 
 impl Pe {
@@ -68,6 +75,7 @@ impl Pe {
             _ => return mm("only x86_64 PE images are supported"),
         }
         let section_count = u16_at(bytes, file + 2)? as usize;
+        let characteristics = u32_at(bytes, file + 18)?;
         let optional_size = u16_at(bytes, file + 16)? as usize;
         let opt = file + 20;
         match u16_at(bytes, opt)? {
@@ -78,6 +86,8 @@ impl Pe {
         let image_base = u64_at(bytes, opt + 24)?;
         let size_of_image = u32_at(bytes, opt + 56)? as usize;
         let size_of_headers = u32_at(bytes, opt + 60)? as usize;
+        let subsystem = u16_at(bytes, opt + 68)?;
+        let dll_characteristics = u16_at(bytes, opt + 70)?;
         let dir_count = u32_at(bytes, opt + 108)? as usize;
         let dir = |idx| -> Result<Dir, InjectError> {
             match idx < dir_count {
@@ -115,8 +125,88 @@ impl Pe {
             load_config: dir(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG)?,
             delay_import: dir(IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT)?,
             export_dir: dir(0)?,
+            com_descriptor: dir(IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR)?,
             sections,
+            characteristics,
+            subsystem,
+            dll_characteristics,
         })
+    }
+
+    pub(crate) fn is_dll(&self) -> bool {
+        self.characteristics & IMAGE_FILE_DLL != 0
+    }
+
+    pub(crate) fn is_exe(&self) -> bool {
+        !self.is_dll() && self.subsystem != IMAGE_SUBSYSTEM_UNKNOWN
+    }
+
+    pub(crate) fn is_pure_il(&self) -> bool {
+        self.com_descriptor.rva != 0 && self.com_descriptor.size != 0
+    }
+
+    pub(crate) fn manifest_id(&self, bytes: &[u8]) -> Result<Option<u32>, InjectError> {
+        const IMAGE_DIRECTORY_ENTRY_RESOURCE: usize = 2;
+        if IMAGE_DIRECTORY_ENTRY_RESOURCE >= 16 {
+            return Ok(None);
+        }
+        let rsrc_dir = Dir { rva: 0, size: 0 };
+        let nt = u32_at(bytes, 0x3C)? as usize;
+        let file = nt + 4;
+        let opt = file + 20;
+        let dir_count = u32_at(bytes, opt + 108)? as usize;
+        if dir_count <= IMAGE_DIRECTORY_ENTRY_RESOURCE {
+            return Ok(None);
+        }
+        let rsrc_off = opt + 112 + IMAGE_DIRECTORY_ENTRY_RESOURCE * 8;
+        let rsrc = Dir {
+            rva: u32_at(bytes, rsrc_off)?,
+            size: u32_at(bytes, rsrc_off + 4)?,
+        };
+        if rsrc.rva == 0 || rsrc.size == 0 {
+            let _ = rsrc_dir;
+            return Ok(None);
+        }
+        let rsrc_va = rsrc.rva as usize;
+        if rsrc_va + 16 > bytes.len() {
+            return Ok(None);
+        }
+        let manifest_type = 4u32;
+        let manifest_id = 1u32;
+        let type_count = u32_at(bytes, rsrc_va + 12)? as usize;
+        let type_entries_off = rsrc_va + 16;
+        for i in 0..type_count {
+            let entry_off = type_entries_off + i * 8;
+            if entry_off + 8 > bytes.len() {
+                break;
+            }
+            let type_id = u32_at(bytes, entry_off)?;
+            let data_dir_off = u32_at(bytes, entry_off + 4)? as usize;
+            if type_id != manifest_type {
+                continue;
+            }
+            let name_count = u32_at(bytes, rsrc_va + data_dir_off + 12)? as usize;
+            let name_entries_off = rsrc_va + data_dir_off + 16;
+            for j in 0..name_count {
+                let name_entry_off = name_entries_off + j * 8;
+                if name_entry_off + 8 > bytes.len() {
+                    break;
+                }
+                let id = u32_at(bytes, name_entry_off)?;
+                let lang_dir_off = u32_at(bytes, name_entry_off + 4)? as usize;
+                if id != manifest_id {
+                    continue;
+                }
+                let lang_count = u32_at(bytes, rsrc_va + lang_dir_off + 12)? as usize;
+                let lang_entries_off = rsrc_va + lang_dir_off + 16;
+                if lang_count == 0 || lang_entries_off + 16 > bytes.len() {
+                    continue;
+                }
+                let data_rva = u32_at(bytes, lang_entries_off)?;
+                return Ok(Some(data_rva));
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) fn mapped_image(&self, bytes: &[u8]) -> Result<Vec<u8>, InjectError> {
@@ -536,7 +626,11 @@ mod tests {
             load_config: Dir { rva: 0, size: 0 },
             delay_import: Dir { rva: 0, size: 0 },
             export_dir: Dir { rva: 0, size: 0 },
+            com_descriptor: Dir { rva: 0, size: 0 },
             sections: Vec::new(),
+            characteristics: 0,
+            subsystem: 0,
+            dll_characteristics: 0,
         }
     }
 
