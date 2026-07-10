@@ -40,6 +40,8 @@ const MAX_EXPORT_FORWARD_DEPTH: usize = 8;
 const EXPORT_HEADER_RETRIES: usize = 20;
 const EXPORT_HEADER_RETRY_DELAY: Duration = Duration::from_millis(25);
 const FRAMED_STUB_STACK_ALLOC: u8 = 0x68;
+const FRAMED_SAVED_REG_OFFSET: u8 = 0x48;
+const FRAMED_MAX_STACK_ARGS: usize = (FRAMED_SAVED_REG_OFFSET - 0x20) as usize / 8;
 const SYSCALL_STUB_LEN: usize = 8;
 const SYSCALL_STUB_PREFIX: [u8; 3] = [0x4C, 0x8B, 0xD1];
 const SYSCALL_STUB_OPCODE: u8 = 0xB8;
@@ -60,7 +62,17 @@ struct ModuleRecord {
     tls_callbacks: Vec<u64>,
     function_tables: Vec<(u64, u32)>,
     actctx_handle: Option<u64>,
+    actctx_cookie: Option<u64>,
+    tls_slot: Option<u32>,
+    tls_template_bufs: Vec<u64>,
+    tls_slot_bindings: Vec<TlsSlotBinding>,
     peb_loader_entry: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TlsSlotBinding {
+    slot_addr: u64,
+    value: u64,
 }
 
 fn update_module_record(pid: u32, base: u64, f: impl FnOnce(&mut ModuleRecord)) {
@@ -560,6 +572,8 @@ pub struct GuestClrConfig {
     pub assembly_path: PathBuf,
     pub class_name: String,
     pub method_name: String,
+    #[serde(default)]
+    pub argument: Option<String>,
     #[serde(default)]
     pub net_version: Option<String>,
 }
@@ -1180,7 +1194,7 @@ pub trait GuestMemoryBackend {
         pid: u32,
         hook: &GuestIatHook,
         function: u64,
-        args: [u64; 4],
+        args: &[u64],
         timeout_ms: u32,
     ) -> Result<u64, GuestInjectError> {
         memory_iat_call(self, pid, hook, function, args, timeout_ms)
@@ -1825,50 +1839,48 @@ impl GuestInjector for GuestManualMapInjector {
                     backend.write(process.pid, buf, &bytes)?;
                     Ok(buf)
                 };
-                let assembly_path_remote = alloc_wide(&clr.assembly_path.to_string_lossy())?;
-                let class_name_remote = alloc_wide(&clr.class_name)?;
-                let method_name_remote = alloc_wide(&clr.method_name)?;
-                let net_version = clr.net_version.as_deref().unwrap_or("v4.0.30319");
-                let _exit_code = guest_inject_pure_il(
-                    backend,
-                    process.pid,
-                    &hook,
-                    net_version,
-                    assembly_path_remote,
-                    class_name_remote,
-                    method_name_remote,
-                    0,
-                    req.plan.execution.timeout_ms,
-                )?;
-                best_effort_virtual_free(
-                    backend,
-                    process.pid,
-                    &hook,
-                    virtual_free,
-                    assembly_path_remote,
-                    req.plan.execution.timeout_ms,
-                );
-                best_effort_virtual_free(
-                    backend,
-                    process.pid,
-                    &hook,
-                    virtual_free,
-                    class_name_remote,
-                    req.plan.execution.timeout_ms,
-                );
-                best_effort_virtual_free(
-                    backend,
-                    process.pid,
-                    &hook,
-                    virtual_free,
-                    method_name_remote,
-                    req.plan.execution.timeout_ms,
-                );
+                let mut remote_strings = Vec::with_capacity(4);
+                let hosted_result = (|| -> Result<u32, GuestInjectError> {
+                    let assembly_path_remote = alloc_wide(&clr.assembly_path.to_string_lossy())?;
+                    remote_strings.push(assembly_path_remote);
+                    let class_name_remote = alloc_wide(&clr.class_name)?;
+                    remote_strings.push(class_name_remote);
+                    let method_name_remote = alloc_wide(&clr.method_name)?;
+                    remote_strings.push(method_name_remote);
+                    let argument_remote = alloc_wide(clr.argument.as_deref().unwrap_or(""))?;
+                    remote_strings.push(argument_remote);
+                    let net_version = clr.net_version.as_deref().unwrap_or("v4.0.30319");
+                    guest_inject_pure_il(
+                        backend,
+                        process.pid,
+                        &hook,
+                        stage,
+                        net_version,
+                        assembly_path_remote,
+                        class_name_remote,
+                        method_name_remote,
+                        argument_remote,
+                        req.plan.execution.timeout_ms,
+                    )
+                })();
+                for remote in remote_strings {
+                    best_effort_virtual_free(
+                        backend,
+                        process.pid,
+                        &hook,
+                        virtual_free,
+                        remote,
+                        req.plan.execution.timeout_ms,
+                    );
+                }
+                let exit_code = hosted_result?;
                 return Ok(GuestLoadInfo {
                     method: self.name().to_string(),
                     pid: process.pid,
                     remote_base: None,
-                    notes: vec!["CLR hosted .NET assembly executed".into()],
+                    notes: vec![format!(
+                        "CLR hosted .NET assembly executed with return value {exit_code}"
+                    )],
                 });
             }
 
@@ -2073,6 +2085,7 @@ impl GuestInjector for GuestManualMapInjector {
             }
 
             let dependency_scratch = stage + STAGE_SCRATCH_OFFSET;
+            let mut loaded_dependencies = Vec::new();
             let mut resolve_payload_import = |module: &[u8],
                                               symbol: ImportSymbol<'_>|
              -> Result<usize, GuestInjectError> {
@@ -2091,7 +2104,7 @@ impl GuestInjector for GuestManualMapInjector {
                             STAGE_SCRATCH_SIZE,
                             req.plan.execution.timeout_ms,
                             req.plan.dependency_policy,
-                            Some(remote_base),
+                            &mut loaded_dependencies,
                             module,
                             ImportSymbol::Name(name.as_bytes()),
                         )?;
@@ -2114,7 +2127,7 @@ impl GuestInjector for GuestManualMapInjector {
                             STAGE_SCRATCH_SIZE,
                             req.plan.execution.timeout_ms,
                             req.plan.dependency_policy,
-                            Some(remote_base),
+                            &mut loaded_dependencies,
                             module,
                             ImportSymbol::Ordinal(ordinal),
                         )?;
@@ -2142,6 +2155,8 @@ impl GuestInjector for GuestManualMapInjector {
             }
             let has_static_tls = pe.has_static_tls(&image)?;
             let mut tls_slot_index: Option<u32> = None;
+            let mut tls_template_bufs: Vec<u64> = Vec::new();
+            let mut tls_slot_bindings: Vec<TlsSlotBinding> = Vec::new();
             let mut dllmain_tls: Option<DllMainThreadTls> = None;
             match (req.plan.tls, has_static_tls) {
                 (GuestTlsMode::RequireStatic, _) => {
@@ -2170,7 +2185,7 @@ impl GuestInjector for GuestManualMapInjector {
                         process.pid,
                         &hook,
                         tls_alloc,
-                        [0, 0, 0, 0],
+                        &[0, 0, 0, 0],
                         req.plan.execution.timeout_ms,
                     )?;
                     let slot = raw_slot as u32;
@@ -2193,10 +2208,11 @@ impl GuestInjector for GuestManualMapInjector {
                                 process.pid,
                                 &hook,
                                 virtual_alloc,
-                                [0, template.len() as u64, MEM_COMMIT_RESERVE, PAGE_READWRITE],
+                                &[0, template.len() as u64, MEM_COMMIT_RESERVE, PAGE_READWRITE],
                                 req.plan.execution.timeout_ms,
                             )?;
                             if template_buf != 0 {
+                                tls_template_bufs.push(template_buf);
                                 backend.touch_iat_hook(
                                     process.pid,
                                     &hook,
@@ -2215,7 +2231,7 @@ impl GuestInjector for GuestManualMapInjector {
                                     process.pid,
                                     &hook,
                                     tls_set_value,
-                                    [slot as u64, template_buf, 0, 0],
+                                    &[slot as u64, template_buf, 0, 0],
                                     req.plan.execution.timeout_ms,
                                 )?;
                                 if set_ok == 0 {
@@ -2241,6 +2257,7 @@ impl GuestInjector for GuestManualMapInjector {
                                         req.plan.execution.timeout_ms,
                                         "DllMain-thread TLS template copy",
                                     )?;
+                                    tls_template_bufs.push(dllmain_template_buf);
                                     dllmain_tls = Some(DllMainThreadTls {
                                         tls_set_value,
                                         slot,
@@ -2291,14 +2308,40 @@ impl GuestInjector for GuestManualMapInjector {
                                                     slot_addr,
                                                     &thread_template_buf.to_le_bytes(),
                                                 ) {
-                                                    Ok(()) => propagated += 1,
-                                                    Err(e) => tracing::warn!(
-                                                        pid = process.pid,
-                                                        tid = t.tid,
-                                                        teb = format_args!("{:#x}", t.teb),
-                                                        error = %e,
-                                                        "failed to propagate TLS slot to thread"
-                                                    ),
+                                                    Ok(()) => {
+                                                        tls_template_bufs.push(thread_template_buf);
+                                                        tls_slot_bindings.push(TlsSlotBinding {
+                                                            slot_addr,
+                                                            value: thread_template_buf,
+                                                        });
+                                                        propagated += 1;
+                                                    }
+                                                    Err(e) => {
+                                                        if let Ok(virtual_free) =
+                                                            resolve_import_symbol(
+                                                                backend,
+                                                                process.pid,
+                                                                "kernel32.dll",
+                                                                "VirtualFree",
+                                                            )
+                                                        {
+                                                            best_effort_virtual_free(
+                                                                backend,
+                                                                process.pid,
+                                                                &hook,
+                                                                virtual_free,
+                                                                thread_template_buf,
+                                                                req.plan.execution.timeout_ms,
+                                                            );
+                                                        }
+                                                        tracing::warn!(
+                                                            pid = process.pid,
+                                                            tid = t.tid,
+                                                            teb = format_args!("{:#x}", t.teb),
+                                                            error = %e,
+                                                            "failed to propagate TLS slot to thread"
+                                                        );
+                                                    }
                                                 }
                                             }
                                             tracing::info!(
@@ -2429,11 +2472,15 @@ impl GuestInjector for GuestManualMapInjector {
                         base: remote_base,
                         size: pe.size_of_image as u64,
                         refcount: 1,
-                        dependencies: Vec::new(),
+                        dependencies: loaded_dependencies,
                         entry_point: record_entry_point,
                         tls_callbacks: record_tls_callbacks.clone(),
                         function_tables: Vec::new(),
                         actctx_handle: None,
+                        actctx_cookie: None,
+                        tls_slot: None,
+                        tls_template_bufs: Vec::new(),
+                        tls_slot_bindings: Vec::new(),
                         peb_loader_entry: None,
                     },
                 );
@@ -2442,6 +2489,20 @@ impl GuestInjector for GuestManualMapInjector {
                     remote_base = format_args!("{remote_base:#x}"),
                     "module registered in manual module registry for unmap-all"
                 );
+                if let Some(slot) = tls_slot_index {
+                    let bufs = std::mem::take(&mut tls_template_bufs);
+                    tracing::info!(
+                        pid = process.pid,
+                        slot,
+                        template_count = bufs.len(),
+                        "static TLS cleanup metadata recorded for tracked unload"
+                    );
+                    update_module_record(process.pid, remote_base, |r| {
+                        r.tls_slot = Some(slot);
+                        r.tls_template_bufs = bufs;
+                        r.tls_slot_bindings = std::mem::take(&mut tls_slot_bindings);
+                    });
+                }
             }
 
             if pe.has_exception_directory() {
@@ -2537,7 +2598,7 @@ impl GuestInjector for GuestManualMapInjector {
                         process.pid,
                         &hook,
                         callback as u64,
-                        [remote_base, DLL_PROCESS_ATTACH as u64, 0, 0],
+                        &[remote_base, DLL_PROCESS_ATTACH as u64, 0, 0],
                         req.plan.execution.timeout_ms,
                     )?;
                 }
@@ -2564,7 +2625,7 @@ impl GuestInjector for GuestManualMapInjector {
                             process.pid,
                             &hook,
                             virtual_alloc,
-                            [0, info_bytes as u64, MEM_COMMIT_RESERVE, PAGE_READWRITE],
+                            &[0, info_bytes as u64, MEM_COMMIT_RESERVE, PAGE_READWRITE],
                             req.plan.execution.timeout_ms,
                         )?;
                         if cfg_info != 0 {
@@ -2615,7 +2676,7 @@ impl GuestInjector for GuestManualMapInjector {
                                     process.pid,
                                     &hook,
                                     virtual_free,
-                                    [cfg_info, 0, MEM_RELEASE, 0],
+                                    &[cfg_info, 0, MEM_RELEASE, 0],
                                     req.plan.execution.timeout_ms,
                                 );
                             }
@@ -2684,7 +2745,7 @@ impl GuestInjector for GuestManualMapInjector {
                 );
             }
 
-            let mut sxs_actctx: Option<(u64, u64)> = None;
+            let mut sxs_actctx: Option<(DllMainActCtx, u64)> = None;
             if req.plan.sxs == GuestSxS::Probe {
                 let has_manifest = pe.manifest_id(&image)?.is_some();
                 if has_manifest {
@@ -2704,20 +2765,33 @@ impl GuestInjector for GuestManualMapInjector {
                         8,
                         req.plan.execution.timeout_ms,
                     )?;
-                    guest_activate_actctx(
+                    let activate = resolve_import_symbol(
                         backend,
                         process.pid,
-                        &hook,
-                        actctx_handle,
-                        cookie_buf,
-                        req.plan.execution.timeout_ms,
+                        "kernel32.dll",
+                        "ActivateActCtx",
                     )?;
-                    sxs_actctx = Some((actctx_handle, cookie_buf));
-                    if req.plan.manual_module_registry == GuestManualModuleRegistry::Track {
-                        update_module_record(process.pid, remote_base, |r| {
-                            r.actctx_handle = Some(actctx_handle);
-                        });
-                    }
+                    let deactivate = resolve_import_symbol(
+                        backend,
+                        process.pid,
+                        "kernel32.dll",
+                        "DeactivateActCtx",
+                    )?;
+                    tracing::info!(
+                        pid = process.pid,
+                        handle = format_args!("{actctx_handle:#x}"),
+                        cookie_addr = format_args!("{cookie_buf:#x}"),
+                        "activation context prepared for DllMain execution thread"
+                    );
+                    sxs_actctx = Some((
+                        DllMainActCtx {
+                            activate,
+                            deactivate,
+                            handle: actctx_handle,
+                            cookie_addr: cookie_buf,
+                        },
+                        cookie_buf,
+                    ));
                 } else {
                     tracing::info!(
                         pid = process.pid,
@@ -2767,6 +2841,7 @@ impl GuestInjector for GuestManualMapInjector {
                         &pe,
                         reserved_arg_remote,
                         dllmain_tls,
+                        sxs_actctx.map(|(actctx, _)| actctx),
                         req.plan.thread_starts,
                         req.plan.execution.timeout_ms,
                     )?,
@@ -2782,7 +2857,7 @@ impl GuestInjector for GuestManualMapInjector {
                                 process.pid,
                                 &hook,
                                 get_current_thread_id,
-                                [0, 0, 0, 0],
+                                &[0, 0, 0, 0],
                                 req.plan.execution.timeout_ms,
                             )
                         }) {
@@ -2871,6 +2946,7 @@ impl GuestInjector for GuestManualMapInjector {
                                 reserved_arg_remote,
                                 Some(ctx),
                                 dllmain_tls,
+                                sxs_actctx.map(|(actctx, _)| actctx),
                                 req.plan.execution.timeout_ms,
                             )?;
 
@@ -2941,12 +3017,13 @@ impl GuestInjector for GuestManualMapInjector {
                                     &hook,
                                     req.plan.execution.timeout_ms,
                                 );
-                                if let Some((_, cookie_addr)) = sxs_actctx {
-                                    let _ = guest_deactivate_actctx(
+                                if let Some((actctx, cookie_buf)) = sxs_actctx {
+                                    guest_release_module_actctx(
                                         backend,
                                         process.pid,
                                         &hook,
-                                        cookie_addr,
+                                        actctx.handle,
+                                        cookie_buf,
                                         req.plan.execution.timeout_ms,
                                     );
                                 }
@@ -2966,7 +3043,7 @@ impl GuestInjector for GuestManualMapInjector {
                                 process.pid,
                                 &hook,
                                 get_current_thread_id,
-                                [0, 0, 0, 0],
+                                &[0, 0, 0, 0],
                                 req.plan.execution.timeout_ms,
                             )
                         }) {
@@ -3006,6 +3083,7 @@ impl GuestInjector for GuestManualMapInjector {
                                 reserved_arg_remote,
                                 None,
                                 dllmain_tls,
+                                sxs_actctx.map(|(actctx, _)| actctx),
                                 req.plan.execution.timeout_ms,
                             )?;
 
@@ -3040,7 +3118,7 @@ impl GuestInjector for GuestManualMapInjector {
                                 process.pid,
                                 &hook,
                                 queue_apc,
-                                [thunk_addr, thread_handle, param_addr, 0],
+                                &[thunk_addr, thread_handle, param_addr, 0],
                                 req.plan.execution.timeout_ms,
                             );
                             guest_close_handle(
@@ -3098,12 +3176,13 @@ impl GuestInjector for GuestManualMapInjector {
                                     error = %e,
                                     "APC: DllMain did not complete within timeout; target thread may not have entered an alertable wait state"
                                 );
-                                if let Some((_, cookie_addr)) = sxs_actctx {
-                                    let _ = guest_deactivate_actctx(
+                                if let Some((actctx, cookie_buf)) = sxs_actctx {
+                                    guest_release_module_actctx(
                                         backend,
                                         process.pid,
                                         &hook,
-                                        cookie_addr,
+                                        actctx.handle,
+                                        cookie_buf,
                                         req.plan.execution.timeout_ms,
                                     );
                                 }
@@ -3111,39 +3190,74 @@ impl GuestInjector for GuestManualMapInjector {
                             }
                         }
                     }
-                    _ => match backend.call_iat_hook(
-                        process.pid,
-                        &hook,
-                        entry as u64,
-                        [
-                            remote_base,
-                            DLL_PROCESS_ATTACH as u64,
-                            reserved_arg_remote,
-                            0,
-                        ],
-                        req.plan.execution.timeout_ms,
-                    ) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            if let Some((_, cookie_addr)) = sxs_actctx {
-                                let _ = guest_deactivate_actctx(
+                    _ => {
+                        if let Some((actctx, _)) = sxs_actctx {
+                            let (thunk_addr, param_addr, exit_code_addr, status_addr) =
+                                prepare_dllmain_scratch(
                                     backend,
                                     process.pid,
                                     &hook,
-                                    cookie_addr,
+                                    virtual_alloc,
+                                    entry as u64,
+                                    remote_base,
+                                    reserved_arg_remote,
+                                    None,
+                                    dllmain_tls,
+                                    Some(actctx),
                                     req.plan.execution.timeout_ms,
-                                );
+                                )?;
+                            if let Err(e) = backend.call_iat_hook(
+                                process.pid,
+                                &hook,
+                                thunk_addr,
+                                &[param_addr, 0, 0, 0],
+                                req.plan.execution.timeout_ms,
+                            ) {
+                                if let Some((actctx, cookie_buf)) = sxs_actctx {
+                                    guest_release_module_actctx(
+                                        backend,
+                                        process.pid,
+                                        &hook,
+                                        actctx.handle,
+                                        cookie_buf,
+                                        req.plan.execution.timeout_ms,
+                                    );
+                                }
+                                return Err(e);
                             }
-                            return Err(e);
+                            poll_remote_thread_exit(
+                                backend,
+                                process.pid,
+                                status_addr,
+                                exit_code_addr,
+                                req.plan.execution.timeout_ms,
+                            )?
+                        } else {
+                            match backend.call_iat_hook(
+                                process.pid,
+                                &hook,
+                                entry as u64,
+                                &[
+                                    remote_base,
+                                    DLL_PROCESS_ATTACH as u64,
+                                    reserved_arg_remote,
+                                    0,
+                                ],
+                                req.plan.execution.timeout_ms,
+                            ) {
+                                Ok(r) => r,
+                                Err(e) => return Err(e),
+                            }
                         }
-                    },
+                    }
                 };
-                if let Some((_, cookie_addr)) = sxs_actctx {
-                    let _ = guest_deactivate_actctx(
+                if let Some((actctx, cookie_buf)) = sxs_actctx {
+                    guest_release_module_actctx(
                         backend,
                         process.pid,
                         &hook,
-                        cookie_addr,
+                        actctx.handle,
+                        cookie_buf,
                         req.plan.execution.timeout_ms,
                     );
                 }
@@ -3156,12 +3270,13 @@ impl GuestInjector for GuestManualMapInjector {
                     return Err(GuestInjectError::Image("DllMain returned FALSE".into()));
                 }
             } else {
-                if let Some((_, cookie_addr)) = sxs_actctx {
-                    let _ = guest_deactivate_actctx(
+                if let Some((actctx, cookie_buf)) = sxs_actctx {
+                    guest_release_module_actctx(
                         backend,
                         process.pid,
                         &hook,
-                        cookie_addr,
+                        actctx.handle,
+                        cookie_buf,
                         req.plan.execution.timeout_ms,
                     );
                 }
@@ -3293,6 +3408,9 @@ impl GuestInjector for GuestManualMapInjector {
                 notes.push(format!(
                     "static TLS: allocated slot {slot} via TlsAlloc, patched index into image, copied TLS template, and called TlsSetValue for {thread_scope}"
                 ));
+                notes.push(format!(
+                    "static TLS post-mapping: threads created after mapping start with NULL in slot {slot}; the payload must guard against NULL or lazily construct the template. Unload frees the slot and all template buffers via TlsFree/VirtualFree"
+                ));
             }
             if cfg_marked {
                 notes.push(format!(
@@ -3415,7 +3533,7 @@ fn memory_iat_call<B: GuestMemoryBackend + ?Sized>(
     pid: u32,
     hook: &GuestIatHook,
     function: u64,
-    args: [u64; 4],
+    args: &[u64],
     timeout_ms: u32,
 ) -> Result<u64, GuestInjectError> {
     let zero_result = vec![0u8; RESULT_BLOCK_SIZE];
@@ -3428,10 +3546,7 @@ fn memory_iat_call<B: GuestMemoryBackend + ?Sized>(
         original_target = format_args!("{:#x}", hook.original_target),
         stub_addr = format_args!("{:#x}", hook.stub_addr),
         result_addr = format_args!("{:#x}", hook.result_addr),
-        arg0 = format_args!("{:#x}", args[0]),
-        arg1 = format_args!("{:#x}", args[1]),
-        arg2 = format_args!("{:#x}", args[2]),
-        arg3 = format_args!("{:#x}", args[3]),
+        nargs = args.len(),
         timeout_ms,
         "guest IAT-hook call installing stub"
     );
@@ -4223,6 +4338,14 @@ struct DllMainThreadTls {
     value: u64,
 }
 
+#[derive(Clone, Copy)]
+struct DllMainActCtx {
+    activate: u64,
+    deactivate: u64,
+    handle: u64,
+    cookie_addr: u64,
+}
+
 fn remote_thread_param_block(
     entry_point: u64,
     remote_base: u64,
@@ -4230,6 +4353,7 @@ fn remote_thread_param_block(
     exit_code: u64,
     status: u64,
     tls: Option<DllMainThreadTls>,
+    actctx: Option<DllMainActCtx>,
 ) -> [u8; REMOTE_THREAD_PARAM_SIZE] {
     let mut block = [0u8; REMOTE_THREAD_PARAM_SIZE];
     let values = [
@@ -4248,6 +4372,12 @@ fn remote_thread_param_block(
         block[0x38..0x40].copy_from_slice(&(tls.slot as u64).to_le_bytes());
         block[0x40..0x48].copy_from_slice(&tls.value.to_le_bytes());
     }
+    if let Some(actctx) = actctx {
+        block[0x48..0x50].copy_from_slice(&actctx.activate.to_le_bytes());
+        block[0x50..0x58].copy_from_slice(&actctx.deactivate.to_le_bytes());
+        block[0x58..0x60].copy_from_slice(&actctx.handle.to_le_bytes());
+        block[0x60..0x68].copy_from_slice(&actctx.cookie_addr.to_le_bytes());
+    }
     block
 }
 
@@ -4262,7 +4392,17 @@ fn poll_remote_thread_exit(
     loop {
         let status = read_remote_u32(backend, pid, status_addr)?;
         if status != 0 {
-            return read_remote_u32(backend, pid, exit_code_addr).map(u64::from);
+            return match status {
+                DLLMAIN_STATUS_COMPLETE => {
+                    read_remote_u32(backend, pid, exit_code_addr).map(u64::from)
+                }
+                DLLMAIN_STATUS_ACTCTX_ACTIVATION_FAILED => Err(GuestInjectError::Backend(
+                    "ActivateActCtx returned FALSE on the DllMain execution thread".into(),
+                )),
+                unexpected => Err(GuestInjectError::Backend(format!(
+                    "DllMain thunk returned unexpected completion status {unexpected}"
+                ))),
+            };
         }
         if Instant::now() >= deadline {
             return Err(GuestInjectError::Backend(format!(
@@ -4286,7 +4426,7 @@ fn best_effort_virtual_free(
             pid,
             hook,
             virtual_free,
-            [addr, 0, MEM_RELEASE, 0],
+            &[addr, 0, MEM_RELEASE, 0],
             timeout_ms,
         );
     }
@@ -4325,7 +4465,7 @@ fn allocate_helper_buffer_with_protect(
         pid,
         hook,
         virtual_alloc,
-        [0, aligned as u64, MEM_COMMIT_RESERVE, protect],
+        &[0, aligned as u64, MEM_COMMIT_RESERVE, protect],
         timeout_ms,
     )?;
     if remote == 0 {
@@ -4407,7 +4547,7 @@ pub fn guest_open_thread(
         pid,
         hook,
         open_thread,
-        [access, 0, tid as u64, 0],
+        &[access, 0, tid as u64, 0],
         timeout_ms,
     )?;
     if handle == 0 {
@@ -4427,7 +4567,7 @@ pub fn guest_close_handle(
 ) {
     let close = resolve_import_symbol(backend, pid, "kernel32.dll", "CloseHandle").ok();
     if let Some(close_addr) = close {
-        let _ = backend.call_iat_hook(pid, hook, close_addr, [handle, 0, 0, 0], timeout_ms);
+        let _ = backend.call_iat_hook(pid, hook, close_addr, &[handle, 0, 0, 0], timeout_ms);
     }
 }
 
@@ -4440,7 +4580,7 @@ pub fn guest_suspend_thread(
 ) -> Result<(), GuestInjectError> {
     let handle = guest_open_thread(backend, pid, tid, THREAD_SUSPEND_RESUME, hook, timeout_ms)?;
     let suspend = resolve_import_symbol(backend, pid, "kernel32.dll", "SuspendThread")?;
-    let _ = backend.call_iat_hook(pid, hook, suspend, [handle, 0, 0, 0], timeout_ms)?;
+    let _ = backend.call_iat_hook(pid, hook, suspend, &[handle, 0, 0, 0], timeout_ms)?;
     guest_close_handle(backend, pid, handle, hook, timeout_ms);
     Ok(())
 }
@@ -4454,7 +4594,7 @@ pub fn guest_resume_thread(
 ) -> Result<(), GuestInjectError> {
     let handle = guest_open_thread(backend, pid, tid, THREAD_SUSPEND_RESUME, hook, timeout_ms)?;
     let resume = resolve_import_symbol(backend, pid, "kernel32.dll", "ResumeThread")?;
-    let _ = backend.call_iat_hook(pid, hook, resume, [handle, 0, 0, 0], timeout_ms)?;
+    let _ = backend.call_iat_hook(pid, hook, resume, &[handle, 0, 0, 0], timeout_ms)?;
     guest_close_handle(backend, pid, handle, hook, timeout_ms);
     Ok(())
 }
@@ -4473,7 +4613,7 @@ pub fn guest_terminate_thread(
         pid,
         hook,
         terminate,
-        [handle, exit_code as u64, 0, 0],
+        &[handle, exit_code as u64, 0, 0],
         timeout_ms,
     )?;
     guest_close_handle(backend, pid, handle, hook, timeout_ms);
@@ -4606,7 +4746,7 @@ fn guest_get_thread_context_with_flags(
         timeout_ms,
     )?;
     let suspend = resolve_import_symbol(backend, pid, "kernel32.dll", "SuspendThread")?;
-    if let Err(e) = backend.call_iat_hook(pid, hook, suspend, [handle, 0, 0, 0], timeout_ms) {
+    if let Err(e) = backend.call_iat_hook(pid, hook, suspend, &[handle, 0, 0, 0], timeout_ms) {
         guest_close_handle(backend, pid, handle, hook, timeout_ms);
         return Err(e);
     }
@@ -4621,7 +4761,8 @@ fn guest_get_thread_context_with_flags(
         backend.write(pid, buf_addr, &ctx_buf)?;
 
         let get_ctx = resolve_import_symbol(backend, pid, "kernel32.dll", "GetThreadContext")?;
-        let ok = backend.call_iat_hook(pid, hook, get_ctx, [handle, buf_addr, 0, 0], timeout_ms)?;
+        let ok =
+            backend.call_iat_hook(pid, hook, get_ctx, &[handle, buf_addr, 0, 0], timeout_ms)?;
 
         let ctx = if ok == 0 {
             Err(GuestInjectError::Backend(format!(
@@ -4640,7 +4781,7 @@ fn guest_get_thread_context_with_flags(
     let resume_result = resolve_import_symbol(backend, pid, "kernel32.dll", "ResumeThread")
         .and_then(|resume| {
             backend
-                .call_iat_hook(pid, hook, resume, [handle, 0, 0, 0], timeout_ms)
+                .call_iat_hook(pid, hook, resume, &[handle, 0, 0, 0], timeout_ms)
                 .map(|_| ())
         });
     if let Err(e) = &resume_result {
@@ -4690,7 +4831,7 @@ fn guest_set_thread_context_with_flags(
         timeout_ms,
     )?;
     let suspend = resolve_import_symbol(backend, pid, "kernel32.dll", "SuspendThread")?;
-    if let Err(e) = backend.call_iat_hook(pid, hook, suspend, [handle, 0, 0, 0], timeout_ms) {
+    if let Err(e) = backend.call_iat_hook(pid, hook, suspend, &[handle, 0, 0, 0], timeout_ms) {
         guest_close_handle(backend, pid, handle, hook, timeout_ms);
         return Err(e);
     }
@@ -4705,7 +4846,8 @@ fn guest_set_thread_context_with_flags(
         backend.write(pid, buf_addr, &ctx_buf)?;
 
         let set_ctx = resolve_import_symbol(backend, pid, "kernel32.dll", "SetThreadContext")?;
-        let ok = backend.call_iat_hook(pid, hook, set_ctx, [handle, buf_addr, 0, 0], timeout_ms)?;
+        let ok =
+            backend.call_iat_hook(pid, hook, set_ctx, &[handle, buf_addr, 0, 0], timeout_ms)?;
 
         let virtual_free = resolve_import_symbol(backend, pid, "kernel32.dll", "VirtualFree")?;
         best_effort_virtual_free(backend, pid, hook, virtual_free, buf_addr, timeout_ms);
@@ -4721,7 +4863,7 @@ fn guest_set_thread_context_with_flags(
     let resume_result = resolve_import_symbol(backend, pid, "kernel32.dll", "ResumeThread")
         .and_then(|resume| {
             backend
-                .call_iat_hook(pid, hook, resume, [handle, 0, 0, 0], timeout_ms)
+                .call_iat_hook(pid, hook, resume, &[handle, 0, 0, 0], timeout_ms)
                 .map(|_| ())
         });
     if let Err(e) = &resume_result {
@@ -4846,7 +4988,7 @@ pub fn guest_unload_module(
     timeout_ms: u32,
 ) -> Result<(), GuestInjectError> {
     let free_library = resolve_import_symbol(backend, pid, "kernel32.dll", "FreeLibrary")?;
-    let ok = backend.call_iat_hook(pid, hook, free_library, [module_base, 0, 0, 0], timeout_ms)?;
+    let ok = backend.call_iat_hook(pid, hook, free_library, &[module_base, 0, 0, 0], timeout_ms)?;
     if ok == 0 {
         return Err(GuestInjectError::Backend(format!(
             "FreeLibrary({module_base:#x}) returned FALSE"
@@ -4876,7 +5018,7 @@ fn guest_unload_module_full(
             base = format_args!("{base:#x}"),
             "calling TLS callback with DLL_PROCESS_DETACH"
         );
-        let _ = backend.call_iat_hook(pid, hook, *callback, [base, 0, 0, 0], timeout_ms)?;
+        let _ = backend.call_iat_hook(pid, hook, *callback, &[base, 0, 0, 0], timeout_ms)?;
     }
 
     if record.entry_point != 0 {
@@ -4887,12 +5029,12 @@ fn guest_unload_module_full(
             "calling DllMain with DLL_PROCESS_DETACH"
         );
         let ok =
-            backend.call_iat_hook(pid, hook, record.entry_point, [base, 0, 0, 0], timeout_ms)?;
+            backend.call_iat_hook(pid, hook, record.entry_point, &[base, 0, 0, 0], timeout_ms)?;
         if ok == 0 {
             tracing::warn!(
                 pid,
                 base = format_args!("{base:#x}"),
-                "DllMain(DETACH) returned FALSE"
+                "DllMain(DETACH) returned FALSE; proceeding with cleanup"
             );
         }
     }
@@ -4901,37 +5043,54 @@ fn guest_unload_module_full(
         let rtl_delete_function_table =
             resolve_import_symbol(backend, pid, "kernel32.dll", "RtlDeleteFunctionTable").or_else(
                 |_| resolve_import_symbol(backend, pid, "ntdll.dll", "RtlDeleteFunctionTable"),
-            )?;
-        let ok = backend.call_iat_hook(
-            pid,
-            hook,
-            rtl_delete_function_table,
-            [ft_addr, ft_count as u64, 0, 0],
-            timeout_ms,
-        )?;
-        if ok == 0 {
-            tracing::warn!(
-                pid,
-                ft_addr = format_args!("{ft_addr:#x}"),
-                "RtlDeleteFunctionTable returned FALSE"
             );
-        } else {
-            tracing::info!(
-                pid,
-                ft_addr = format_args!("{ft_addr:#x}"),
-                "function table deleted"
-            );
+        match rtl_delete_function_table {
+            Ok(f) => {
+                let ok = backend.call_iat_hook(
+                    pid,
+                    hook,
+                    f,
+                    &[ft_addr, ft_count as u64, 0, 0],
+                    timeout_ms,
+                )?;
+                if ok == 0 {
+                    tracing::warn!(
+                        pid,
+                        ft_addr = format_args!("{ft_addr:#x}"),
+                        "RtlDeleteFunctionTable returned FALSE"
+                    );
+                } else {
+                    tracing::info!(
+                        pid,
+                        ft_addr = format_args!("{ft_addr:#x}"),
+                        "function table deleted"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(pid, ft_addr = format_args!("{ft_addr:#x}"), error = %e, "could not resolve RtlDeleteFunctionTable")
+            }
         }
     }
 
     if let Some(actctx) = record.actctx_handle {
-        let deactivate = resolve_import_symbol(backend, pid, "kernel32.dll", "DeactivateActCtx")?;
-        let _ = backend.call_iat_hook(pid, hook, deactivate, [0, actctx, 0, 0], timeout_ms)?;
-        let release = resolve_import_symbol(backend, pid, "kernel32.dll", "ReleaseActCtx")?;
-        let _ = backend.call_iat_hook(pid, hook, release, [actctx, 0, 0, 0], timeout_ms)?;
+        let cookie = record.actctx_cookie.unwrap_or(0);
+        match resolve_import_symbol(backend, pid, "kernel32.dll", "DeactivateActCtx")
+            .and_then(|f| backend.call_iat_hook(pid, hook, f, &[0, cookie, 0, 0], timeout_ms))
+        {
+            Ok(_) => {}
+            Err(e) => tracing::warn!(pid, error = %e, "DeactivateActCtx failed during cleanup"),
+        }
+        match resolve_import_symbol(backend, pid, "kernel32.dll", "ReleaseActCtx")
+            .and_then(|f| backend.call_iat_hook(pid, hook, f, &[actctx, 0, 0, 0], timeout_ms))
+        {
+            Ok(_) => {}
+            Err(e) => tracing::warn!(pid, error = %e, "ReleaseActCtx failed during cleanup"),
+        }
         tracing::info!(
             pid,
             actctx = format_args!("{actctx:#x}"),
+            cookie = format_args!("{cookie:#x}"),
             "activation context deactivated and released"
         );
     }
@@ -4948,38 +5107,113 @@ fn guest_unload_module_full(
         }
     }
 
-    let free_library = resolve_import_symbol(backend, pid, "kernel32.dll", "FreeLibrary")?;
-    for dep_base in record.dependencies.iter().rev() {
-        let ok =
-            backend.call_iat_hook(pid, hook, free_library, [*dep_base, 0, 0, 0], timeout_ms)?;
-        if ok == 0 {
-            tracing::warn!(
-                pid,
-                dep_base = format_args!("{dep_base:#x}"),
-                "FreeLibrary(dependency) returned FALSE"
-            );
-        } else {
-            tracing::info!(
-                pid,
-                dep_base = format_args!("{dep_base:#x}"),
-                "dependency freed"
-            );
+    match resolve_import_symbol(backend, pid, "kernel32.dll", "FreeLibrary") {
+        Ok(free_library) => {
+            for dep_base in record.dependencies.iter().rev() {
+                match backend.call_iat_hook(
+                    pid,
+                    hook,
+                    free_library,
+                    &[*dep_base, 0, 0, 0],
+                    timeout_ms,
+                ) {
+                    Ok(ok) if ok != 0 => tracing::info!(
+                        pid,
+                        dep_base = format_args!("{dep_base:#x}"),
+                        "dependency freed"
+                    ),
+                    _ => tracing::warn!(
+                        pid,
+                        dep_base = format_args!("{dep_base:#x}"),
+                        "FreeLibrary(dependency) returned FALSE"
+                    ),
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(pid, error = %e, "could not resolve FreeLibrary; skipping dependency free")
         }
     }
 
-    let virtual_free = resolve_import_symbol(backend, pid, "kernel32.dll", "VirtualFree")?;
-    let _ = backend.call_iat_hook(
-        pid,
-        hook,
-        virtual_free,
-        [base, 0, MEM_RELEASE, 0],
-        timeout_ms,
-    );
-    tracing::info!(
-        pid,
-        base = format_args!("{base:#x}"),
-        "module memory released"
-    );
+    for binding in &record.tls_slot_bindings {
+        let current = read_remote_u64(backend, pid, binding.slot_addr)?;
+        if current == 0 {
+            continue;
+        }
+        if current == binding.value || record.tls_template_bufs.contains(&current) {
+            backend.write(pid, binding.slot_addr, &0u64.to_le_bytes())?;
+        } else {
+            tracing::warn!(
+                pid,
+                slot_addr = format_args!("{:#x}", binding.slot_addr),
+                current = format_args!("{current:#x}"),
+                "tracked TLS slot no longer references a Decant allocation; leaving it untouched"
+            );
+        }
+    }
+    if !record.tls_slot_bindings.is_empty() {
+        tracing::info!(
+            pid,
+            count = record.tls_slot_bindings.len(),
+            "tracked TLS slot pointers cleared before template cleanup"
+        );
+    }
+
+    match resolve_import_symbol(backend, pid, "kernel32.dll", "VirtualFree") {
+        Ok(virtual_free) => {
+            for buf in &record.tls_template_bufs {
+                let _ = backend.call_iat_hook(
+                    pid,
+                    hook,
+                    virtual_free,
+                    &[*buf, 0, MEM_RELEASE, 0],
+                    timeout_ms,
+                );
+            }
+            if !record.tls_template_bufs.is_empty() {
+                tracing::info!(
+                    pid,
+                    count = record.tls_template_bufs.len(),
+                    "TLS template buffers freed"
+                );
+            }
+            if let Some(slot) = record.tls_slot {
+                match resolve_import_symbol(backend, pid, "kernel32.dll", "TlsFree") {
+                    Ok(tls_free) => {
+                        let _ = backend.call_iat_hook(
+                            pid,
+                            hook,
+                            tls_free,
+                            &[slot as u64, 0, 0, 0],
+                            timeout_ms,
+                        );
+                        tracing::info!(pid, slot, "TLS slot freed via TlsFree");
+                    }
+                    Err(e) => tracing::warn!(pid, slot, error = %e, "could not resolve TlsFree"),
+                }
+            }
+            let released = backend.call_iat_hook(
+                pid,
+                hook,
+                virtual_free,
+                &[base, 0, MEM_RELEASE, 0],
+                timeout_ms,
+            )?;
+            if released == 0 {
+                return Err(GuestInjectError::Backend(format!(
+                    "VirtualFree({base:#x}, MEM_RELEASE) returned FALSE during tracked unload"
+                )));
+            }
+            tracing::info!(
+                pid,
+                base = format_args!("{base:#x}"),
+                "module memory released"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(pid, error = %e, "could not resolve VirtualFree; module memory not freed")
+        }
+    }
     Ok(())
 }
 
@@ -4990,15 +5224,35 @@ pub fn unmap_all_modules(
     timeout_ms: u32,
 ) -> Result<usize, GuestInjectError> {
     let registry = MANUAL_MODULE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-    let entries: Vec<ModuleRecord> = {
-        let mut reg = registry.lock().unwrap();
-        let keys: Vec<(u32, u64)> = reg.keys().filter(|(p, _)| *p == pid).copied().collect();
-        keys.into_iter().filter_map(|k| reg.remove(&k)).collect()
+    let keys: Vec<(u32, u64)> = {
+        let reg = registry.lock().unwrap();
+        reg.keys().filter(|(p, _)| *p == pid).copied().collect()
     };
     let mut count = 0;
-    for entry in entries {
-        guest_unload_module_full(backend, pid, &entry, hook, timeout_ms)?;
-        count += 1;
+    for key in keys {
+        let record = {
+            let reg = registry.lock().unwrap();
+            reg.get(&key).cloned()
+        };
+        let Some(record) = record else { continue };
+        match guest_unload_module_full(backend, pid, &record, hook, timeout_ms) {
+            Ok(()) => {
+                if let Some(reg) = MANUAL_MODULE_REGISTRY.get() {
+                    if let Ok(mut reg) = reg.lock() {
+                        reg.remove(&key);
+                    }
+                }
+                count += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    pid,
+                    base = format_args!("{:#x}", key.1),
+                    error = %e,
+                    "unload failed; module remains in registry for retry"
+                );
+            }
+        }
     }
     tracing::info!(pid, modules_unmapped = count, "unmap_all_modules complete");
     Ok(count)
@@ -5221,7 +5475,7 @@ pub fn guest_terminate_process(
         pid,
         hook,
         open_process,
-        [PROCESS_TERMINATE_ACCESS, 0, pid as u64, 0],
+        &[PROCESS_TERMINATE_ACCESS, 0, pid as u64, 0],
         timeout_ms,
     )?;
     if handle == 0 {
@@ -5234,7 +5488,7 @@ pub fn guest_terminate_process(
         pid,
         hook,
         terminate,
-        [handle, exit_code as u64, 0, 0],
+        &[handle, exit_code as u64, 0, 0],
         timeout_ms,
     )?;
     guest_close_handle(backend, pid, handle, hook, timeout_ms);
@@ -5258,7 +5512,7 @@ pub fn guest_ensure_init(
     let buf = allocate_helper_buffer(backend, pid, hook, virtual_alloc, 1, timeout_ms)?;
     let null_byte = [0u8];
     backend.write(pid, buf, &null_byte)?;
-    let result = backend.call_iat_hook(pid, hook, load_library, [buf, 0, 0, 0], timeout_ms)?;
+    let result = backend.call_iat_hook(pid, hook, load_library, &[buf, 0, 0, 0], timeout_ms)?;
     let virtual_free = resolve_import_symbol(backend, pid, "kernel32.dll", "VirtualFree")?;
     best_effort_virtual_free(backend, pid, hook, virtual_free, buf, timeout_ms);
     tracing::info!(
@@ -5288,7 +5542,7 @@ pub fn guest_create_actctx(
     actctx[16..24].copy_from_slice(&manifest_path_remote.to_le_bytes());
     backend.write(pid, actctx_buf, &actctx)?;
     let handle =
-        backend.call_iat_hook(pid, hook, create_actctx, [actctx_buf, 0, 0, 0], timeout_ms)?;
+        backend.call_iat_hook(pid, hook, create_actctx, &[actctx_buf, 0, 0, 0], timeout_ms)?;
     let virtual_free = resolve_import_symbol(backend, pid, "kernel32.dll", "VirtualFree")?;
     best_effort_virtual_free(backend, pid, hook, virtual_free, actctx_buf, timeout_ms);
     if handle == u64::MAX {
@@ -5331,7 +5585,7 @@ fn guest_create_module_actctx(
     actctx[48..56].copy_from_slice(&module_base.to_le_bytes());
     backend.write(pid, actctx_buf, &actctx)?;
     let handle =
-        backend.call_iat_hook(pid, hook, create_actctx, [actctx_buf, 0, 0, 0], timeout_ms)?;
+        backend.call_iat_hook(pid, hook, create_actctx, &[actctx_buf, 0, 0, 0], timeout_ms)?;
     let virtual_free = resolve_import_symbol(backend, pid, "kernel32.dll", "VirtualFree")?;
     best_effort_virtual_free(backend, pid, hook, virtual_free, actctx_buf, timeout_ms);
     if handle == u64::MAX {
@@ -5349,44 +5603,37 @@ fn guest_create_module_actctx(
     Ok(handle)
 }
 
-fn guest_activate_actctx(
+fn guest_release_actctx(
     backend: &dyn GuestMemoryBackend,
     pid: u32,
     hook: &GuestIatHook,
     handle: u64,
-    cookie_addr: u64,
     timeout_ms: u32,
 ) -> Result<(), GuestInjectError> {
-    let activate = resolve_import_symbol(backend, pid, "kernel32.dll", "ActivateActCtx")?;
-    let ok = backend.call_iat_hook(pid, hook, activate, [handle, cookie_addr, 0, 0], timeout_ms)?;
-    if ok == 0 {
-        return Err(GuestInjectError::Backend(
-            "ActivateActCtx returned FALSE".into(),
-        ));
-    }
+    let release = resolve_import_symbol(backend, pid, "kernel32.dll", "ReleaseActCtx")?;
+    let _ = backend.call_iat_hook(pid, hook, release, &[handle, 0, 0, 0], timeout_ms)?;
     tracing::info!(
         pid,
         handle = format_args!("{handle:#x}"),
-        cookie_addr = format_args!("{cookie_addr:#x}"),
-        "activation context activated"
+        "activation context released"
     );
     Ok(())
 }
 
-fn guest_deactivate_actctx(
+fn guest_release_module_actctx(
     backend: &dyn GuestMemoryBackend,
     pid: u32,
     hook: &GuestIatHook,
-    cookie_addr: u64,
+    handle: u64,
+    cookie_buf: u64,
     timeout_ms: u32,
-) -> Result<(), GuestInjectError> {
-    let deactivate = resolve_import_symbol(backend, pid, "kernel32.dll", "DeactivateActCtx")?;
-    let ok = backend.call_iat_hook(pid, hook, deactivate, [0, cookie_addr, 0, 0], timeout_ms)?;
-    if ok == 0 {
-        tracing::warn!(pid, "DeactivateActCtx returned FALSE");
-    }
-    tracing::info!(pid, "activation context deactivated");
-    Ok(())
+) {
+    let _ = guest_release_actctx(backend, pid, hook, handle, timeout_ms);
+    let virtual_free = match resolve_import_symbol(backend, pid, "kernel32.dll", "VirtualFree") {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    best_effort_virtual_free(backend, pid, hook, virtual_free, cookie_buf, timeout_ms);
 }
 
 pub fn guest_call_remote(
@@ -5397,50 +5644,17 @@ pub fn guest_call_remote(
     args: &[u64],
     timeout_ms: u32,
 ) -> Result<u64, GuestInjectError> {
-    match args.len() {
-        0 => backend.call_iat_hook(pid, hook, func_addr, [0, 0, 0, 0], timeout_ms),
-        1 => backend.call_iat_hook(pid, hook, func_addr, [args[0], 0, 0, 0], timeout_ms),
-        2 => backend.call_iat_hook(pid, hook, func_addr, [args[0], args[1], 0, 0], timeout_ms),
-        3 => backend.call_iat_hook(
-            pid,
-            hook,
-            func_addr,
-            [args[0], args[1], args[2], 0],
-            timeout_ms,
-        ),
-        4..=16 => {
-            let virtual_alloc =
-                resolve_import_symbol(backend, pid, "kernel32.dll", "VirtualAlloc")?;
-            let stack_size = (args.len() - 4) * 8;
-            let stack_buf = allocate_helper_buffer(
-                backend,
-                pid,
-                hook,
-                virtual_alloc,
-                stack_size.max(32),
-                timeout_ms,
-            )?;
-            let mut stack_bytes = Vec::with_capacity(stack_size);
-            for arg in &args[4..] {
-                stack_bytes.extend_from_slice(&arg.to_le_bytes());
-            }
-            backend.write(pid, stack_buf, &stack_bytes)?;
-            let result = backend.call_iat_hook(
-                pid,
-                hook,
-                func_addr,
-                [args[0], args[1], args[2], args[3]],
-                timeout_ms,
-            )?;
-            let virtual_free = resolve_import_symbol(backend, pid, "kernel32.dll", "VirtualFree")?;
-            best_effort_virtual_free(backend, pid, hook, virtual_free, stack_buf, timeout_ms);
-            Ok(result)
-        }
-        _ => Err(GuestInjectError::Unsupported {
+    if args.len() > 16 {
+        return Err(GuestInjectError::Unsupported {
             operation: "remote call",
             reason: format!("{} args exceeds the 16-arg limit", args.len()),
-        }),
+        });
     }
+    let mut padded: Vec<u64> = args.to_vec();
+    while padded.len() < 4 {
+        padded.push(0);
+    }
+    backend.call_iat_hook(pid, hook, func_addr, &padded, timeout_ms)
 }
 
 const PROCESS_TERMINATE_ACCESS: u64 = 0x0001;
@@ -5637,6 +5851,7 @@ pub fn guest_inject_pure_il(
     backend: &dyn GuestMemoryBackend,
     pid: u32,
     hook: &GuestIatHook,
+    stage: u64,
     net_version: &str,
     assembly_path_remote: u64,
     class_name_remote: u64,
@@ -5649,137 +5864,280 @@ pub fn guest_inject_pure_il(
     let load_library = resolve_import_symbol(backend, pid, "kernel32.dll", "LoadLibraryA")?;
     let get_proc_address = resolve_import_symbol(backend, pid, "kernel32.dll", "GetProcAddress")?;
 
-    let alloc_string = |s: &[u8]| -> Result<u64, GuestInjectError> {
-        let buf = allocate_helper_buffer(backend, pid, hook, virtual_alloc, s.len(), timeout_ms)?;
-        backend.write(pid, buf, s)?;
-        Ok(buf)
-    };
+    let mut bufs: Vec<u64> = Vec::new();
+    let mut interfaces: Vec<(u64, u64)> = Vec::new();
 
-    let mscoree = b"mscoree.dll\0";
-    let mscoree_name = alloc_string(mscoree)?;
-    let mscoree_handle =
-        backend.call_iat_hook(pid, hook, load_library, [mscoree_name, 0, 0, 0], timeout_ms)?;
-    best_effort_virtual_free(backend, pid, hook, virtual_free, mscoree_name, timeout_ms);
-    if mscoree_handle == 0 {
-        return Err(GuestInjectError::Backend(
-            "LoadLibraryA(\"mscoree.dll\") returned null; .NET runtime may not be installed".into(),
-        ));
+    let result = (|| -> Result<u32, GuestInjectError> {
+        let mscoree_name =
+            allocate_helper_buffer(backend, pid, hook, virtual_alloc, 12, timeout_ms)?;
+        bufs.push(mscoree_name);
+        backend.write(pid, mscoree_name, b"mscoree.dll\0")?;
+        let mscoree_handle = backend.call_iat_hook(
+            pid,
+            hook,
+            load_library,
+            &[mscoree_name, 0, 0, 0],
+            timeout_ms,
+        )?;
+        if mscoree_handle == 0 {
+            return Err(GuestInjectError::Backend(
+                "LoadLibraryA(\"mscoree.dll\") returned null; .NET runtime may not be installed"
+                    .into(),
+            ));
+        }
+
+        let clr_create_name =
+            allocate_helper_buffer(backend, pid, hook, virtual_alloc, 18, timeout_ms)?;
+        bufs.push(clr_create_name);
+        backend.write(pid, clr_create_name, b"CLRCreateInstance\0")?;
+        let clr_create = backend.call_iat_hook(
+            pid,
+            hook,
+            get_proc_address,
+            &[mscoree_handle, clr_create_name, 0, 0],
+            timeout_ms,
+        )?;
+        if clr_create == 0 {
+            return Err(GuestInjectError::Backend(
+                "GetProcAddress(mscoree.dll, \"CLRCreateInstance\") returned null".into(),
+            ));
+        }
+
+        let clsid_meta_host = GUID {
+            data1: 0x9280188D,
+            data2: 0x0E8E,
+            data3: 0x4867,
+            data4: [0xB3, 0x0C, 0x7F, 0xA8, 0x38, 0x84, 0xE8, 0xDE],
+        };
+        let iid_meta_host = GUID {
+            data1: 0xD332DB9E,
+            data2: 0xB9B3,
+            data3: 0x4125,
+            data4: [0x82, 0x07, 0xA1, 0x48, 0x84, 0xF5, 0x32, 0x16],
+        };
+        let iid_runtime_info = GUID {
+            data1: 0xBD39D1D2,
+            data2: 0xBA2F,
+            data3: 0x486A,
+            data4: [0x89, 0xB0, 0xB4, 0xB0, 0xCB, 0x46, 0x68, 0x91],
+        };
+        let clsid_runtime_host = GUID {
+            data1: 0x90F1A06E,
+            data2: 0x7712,
+            data3: 0x4762,
+            data4: [0x86, 0xB5, 0x7A, 0x5E, 0xBA, 0x6B, 0xDB, 0x02],
+        };
+        let iid_runtime_host = GUID {
+            data1: 0x90F1A06C,
+            data2: 0x7712,
+            data3: 0x4762,
+            data4: [0x86, 0xB5, 0x7A, 0x5E, 0xBA, 0x6B, 0xDB, 0x02],
+        };
+
+        let clsid_meta_host_buf =
+            allocate_helper_buffer(backend, pid, hook, virtual_alloc, 16, timeout_ms)?;
+        bufs.push(clsid_meta_host_buf);
+        backend.write(pid, clsid_meta_host_buf, &clsid_meta_host.to_bytes())?;
+        let iid_meta_host_buf =
+            allocate_helper_buffer(backend, pid, hook, virtual_alloc, 16, timeout_ms)?;
+        bufs.push(iid_meta_host_buf);
+        backend.write(pid, iid_meta_host_buf, &iid_meta_host.to_bytes())?;
+        let iid_runtime_info_buf =
+            allocate_helper_buffer(backend, pid, hook, virtual_alloc, 16, timeout_ms)?;
+        bufs.push(iid_runtime_info_buf);
+        backend.write(pid, iid_runtime_info_buf, &iid_runtime_info.to_bytes())?;
+        let clsid_runtime_host_buf =
+            allocate_helper_buffer(backend, pid, hook, virtual_alloc, 16, timeout_ms)?;
+        bufs.push(clsid_runtime_host_buf);
+        backend.write(pid, clsid_runtime_host_buf, &clsid_runtime_host.to_bytes())?;
+        let iid_runtime_host_buf =
+            allocate_helper_buffer(backend, pid, hook, virtual_alloc, 16, timeout_ms)?;
+        bufs.push(iid_runtime_host_buf);
+        backend.write(pid, iid_runtime_host_buf, &iid_runtime_host.to_bytes())?;
+
+        let meta_host_ppv =
+            allocate_helper_buffer(backend, pid, hook, virtual_alloc, 8, timeout_ms)?;
+        bufs.push(meta_host_ppv);
+        let runtime_info_ppv =
+            allocate_helper_buffer(backend, pid, hook, virtual_alloc, 8, timeout_ms)?;
+        bufs.push(runtime_info_ppv);
+        let runtime_host_ppv =
+            allocate_helper_buffer(backend, pid, hook, virtual_alloc, 8, timeout_ms)?;
+        bufs.push(runtime_host_ppv);
+        let retval_buf = allocate_helper_buffer(backend, pid, hook, virtual_alloc, 4, timeout_ms)?;
+        bufs.push(retval_buf);
+
+        let mut version_wide: Vec<u16> = net_version.encode_utf16().collect();
+        version_wide.push(0);
+        let version_bytes: Vec<u8> = version_wide.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let version_remote = allocate_helper_buffer(
+            backend,
+            pid,
+            hook,
+            virtual_alloc,
+            version_bytes.len(),
+            timeout_ms,
+        )?;
+        bufs.push(version_remote);
+        backend.write(pid, version_remote, &version_bytes)?;
+
+        let hr = backend.call_iat_hook(
+            pid,
+            hook,
+            clr_create,
+            &[clsid_meta_host_buf, iid_meta_host_buf, meta_host_ppv, 0],
+            timeout_ms,
+        )?;
+        if hr as i32 != S_OK {
+            return Err(GuestInjectError::Backend(format!(
+                "CLRCreateInstance returned HRESULT {:#x}",
+                hr as i32
+            )));
+        }
+        let meta_host = read_remote_u64(backend, pid, meta_host_ppv)?;
+        if meta_host == 0 {
+            return Err(GuestInjectError::Backend(
+                "CLRCreateInstance set *ppv = NULL".into(),
+            ));
+        }
+        let meta_vtable = read_remote_u64(backend, pid, meta_host)?;
+        interfaces.push((meta_host, meta_vtable));
+
+        let get_runtime = read_remote_u64(backend, pid, meta_vtable + 3 * 8)?;
+        let hr = backend.call_iat_hook(
+            pid,
+            hook,
+            get_runtime,
+            &[
+                meta_host,
+                version_remote,
+                iid_runtime_info_buf,
+                runtime_info_ppv,
+            ],
+            timeout_ms,
+        )?;
+        if hr as i32 != S_OK {
+            return Err(GuestInjectError::Backend(format!(
+                "ICLRMetaHost::GetRuntime returned HRESULT {:#x}",
+                hr as i32
+            )));
+        }
+        let runtime_info = read_remote_u64(backend, pid, runtime_info_ppv)?;
+        if runtime_info == 0 {
+            return Err(GuestInjectError::Backend(
+                "ICLRMetaHost::GetRuntime set *ppv = NULL".into(),
+            ));
+        }
+        let runtime_info_vtable = read_remote_u64(backend, pid, runtime_info)?;
+        interfaces.push((runtime_info, runtime_info_vtable));
+
+        let get_interface = read_remote_u64(backend, pid, runtime_info_vtable + 9 * 8)?;
+        let hr = backend.call_iat_hook(
+            pid,
+            hook,
+            get_interface,
+            &[
+                runtime_info,
+                clsid_runtime_host_buf,
+                iid_runtime_host_buf,
+                runtime_host_ppv,
+            ],
+            timeout_ms,
+        )?;
+        if hr as i32 != S_OK {
+            return Err(GuestInjectError::Backend(format!(
+                "ICLRRuntimeInfo::GetInterface returned HRESULT {:#x}",
+                hr as i32
+            )));
+        }
+        let runtime_host = read_remote_u64(backend, pid, runtime_host_ppv)?;
+        if runtime_host == 0 {
+            return Err(GuestInjectError::Backend(
+                "ICLRRuntimeInfo::GetInterface set *ppv = NULL".into(),
+            ));
+        }
+        let runtime_host_vtable = read_remote_u64(backend, pid, runtime_host)?;
+        interfaces.push((runtime_host, runtime_host_vtable));
+
+        let start_method = read_remote_u64(backend, pid, runtime_host_vtable + 3 * 8)?;
+        let start_hr = backend.call_iat_hook(
+            pid,
+            hook,
+            start_method,
+            &[runtime_host, 0, 0, 0],
+            timeout_ms,
+        )?;
+        if start_hr as i32 != S_OK {
+            return Err(GuestInjectError::Backend(format!(
+                "ICLRRuntimeHost::Start returned HRESULT {:#x}",
+                start_hr as i32
+            )));
+        }
+
+        let execute_method = read_remote_u64(backend, pid, runtime_host_vtable + 11 * 8)?;
+        let trampoline = stage + STAGE_TRAMPOLINE_OFFSET;
+        let param_block = stage + STAGE_PARAM_OFFSET;
+        let saved_trampoline = backend.read(pid, trampoline, GUEST_PROC_TRAMPOLINE.len())?;
+        write_verified(
+            backend,
+            pid,
+            trampoline,
+            GUEST_PROC_TRAMPOLINE,
+            "CLR ExecuteInDefaultAppDomain trampoline",
+        )?;
+        let execute_result = call_guest_proc(
+            backend,
+            pid,
+            hook,
+            trampoline,
+            param_block,
+            execute_method,
+            &[
+                runtime_host,
+                assembly_path_remote,
+                class_name_remote,
+                method_name_remote,
+                args_remote,
+                retval_buf,
+            ],
+            timeout_ms,
+            "ICLRRuntimeHost::ExecuteInDefaultAppDomain",
+        );
+        if let Err(error) = backend.write(pid, trampoline, &saved_trampoline) {
+            return Err(GuestInjectError::Backend(format!(
+                "failed restoring CLR execution trampoline: {error}"
+            )));
+        }
+        let execute_hr = execute_result?;
+        if execute_hr as i32 != S_OK {
+            return Err(GuestInjectError::Backend(format!(
+                "ICLRRuntimeHost::ExecuteInDefaultAppDomain returned HRESULT {:#x}",
+                execute_hr as i32
+            )));
+        }
+
+        let retval = read_remote_u32(backend, pid, retval_buf)?;
+        tracing::info!(
+            pid,
+            net_version,
+            runtime_host = format_args!("{runtime_host:#x}"),
+            assembly = format_args!("{assembly_path_remote:#x}"),
+            retval,
+            "CLR hosted assembly executed"
+        );
+        Ok(retval)
+    })();
+
+    for &(ptr, vtable) in interfaces.iter().rev() {
+        if let Ok(release_fn) = read_remote_u64(backend, pid, vtable + 2 * 8) {
+            let _ = backend.call_iat_hook(pid, hook, release_fn, &[ptr, 0, 0, 0], timeout_ms);
+        }
+    }
+    for &buf in &bufs {
+        best_effort_virtual_free(backend, pid, hook, virtual_free, buf, timeout_ms);
     }
 
-    let clr_create_name = b"CLRCreateInstance\0";
-    let clr_create_name_buf = alloc_string(clr_create_name)?;
-    let clr_create = backend.call_iat_hook(
-        pid,
-        hook,
-        get_proc_address,
-        [mscoree_handle, clr_create_name_buf, 0, 0],
-        timeout_ms,
-    )?;
-    best_effort_virtual_free(
-        backend,
-        pid,
-        hook,
-        virtual_free,
-        clr_create_name_buf,
-        timeout_ms,
-    );
-    if clr_create == 0 {
-        return Err(GuestInjectError::Backend(
-            "GetProcAddress(mscoree.dll, \"CLRCreateInstance\") returned null".into(),
-        ));
-    }
-
-    let clsid_mscorruntime: GUID = GUID {
-        data1: 0xE7199F45,
-        data2: 0x0614,
-        data3: 0x4892,
-        data4: [0xA1, 0xC9, 0x9F, 0x8C, 0xC4, 0xBE, 0x8B, 0xC5],
-    };
-    let iid_iclrruntimehost: GUID = GUID {
-        data1: 0x90F1A06E,
-        data2: 0x7712,
-        data3: 0x4762,
-        data4: [0x86, 0x45, 0x2A, 0x69, 0xC3, 0x99, 0xBA, 0x45],
-    };
-
-    let clsid_buf = allocate_helper_buffer(backend, pid, hook, virtual_alloc, 16, timeout_ms)?;
-    backend.write(pid, clsid_buf, &clsid_mscorruntime.to_bytes())?;
-    let iid_buf = allocate_helper_buffer(backend, pid, hook, virtual_alloc, 16, timeout_ms)?;
-    backend.write(pid, iid_buf, &iid_iclrruntimehost.to_bytes())?;
-    let ppv_buf = allocate_helper_buffer(backend, pid, hook, virtual_alloc, 8, timeout_ms)?;
-
-    let hr = backend.call_iat_hook(
-        pid,
-        hook,
-        clr_create,
-        [clsid_buf, iid_buf, ppv_buf, 0],
-        timeout_ms,
-    )?;
-    best_effort_virtual_free(backend, pid, hook, virtual_free, clsid_buf, timeout_ms);
-    best_effort_virtual_free(backend, pid, hook, virtual_free, iid_buf, timeout_ms);
-    if hr as i32 != S_OK {
-        best_effort_virtual_free(backend, pid, hook, virtual_free, ppv_buf, timeout_ms);
-        return Err(GuestInjectError::Backend(format!(
-            "CLRCreateInstance returned HRESULT {:#x}",
-            hr as i32
-        )));
-    }
-
-    let ppv_bytes = backend.read(pid, ppv_buf, 8)?;
-    let runtime_host = u64::from_le_bytes(ppv_bytes[0..8].try_into().unwrap());
-    best_effort_virtual_free(backend, pid, hook, virtual_free, ppv_buf, timeout_ms);
-    if runtime_host == 0 {
-        return Err(GuestInjectError::Backend(
-            "CLRCreateInstance set *ppv = NULL".into(),
-        ));
-    }
-
-    let vtable_bytes = backend.read(pid, runtime_host, 8)?;
-    let vtable = u64::from_le_bytes(vtable_bytes[0..8].try_into().unwrap());
-
-    let start_method = read_remote_u64(backend, pid, vtable + 3 * 8)?;
-    let start_hr =
-        backend.call_iat_hook(pid, hook, start_method, [runtime_host, 0, 0, 0], timeout_ms)?;
-    if start_hr as i32 != S_OK {
-        return Err(GuestInjectError::Backend(format!(
-            "ICLRRuntimeHost::Start returned HRESULT {:#x}",
-            start_hr as i32
-        )));
-    }
-
-    let execute_method = read_remote_u64(backend, pid, vtable + 20 * 8)?;
-    let execute_hr = backend.call_iat_hook(
-        pid,
-        hook,
-        execute_method,
-        [
-            runtime_host,
-            assembly_path_remote,
-            class_name_remote,
-            method_name_remote,
-        ],
-        timeout_ms,
-    )?;
-    if execute_hr as i32 != S_OK {
-        return Err(GuestInjectError::Backend(format!(
-            "ICLRRuntimeHost::ExecuteInDefaultAppDomain returned HRESULT {:#x}",
-            execute_hr as i32
-        )));
-    }
-
-    let stop_method = read_remote_u64(backend, pid, vtable + 4 * 8)?;
-    let _ = backend.call_iat_hook(pid, hook, stop_method, [runtime_host, 0, 0, 0], timeout_ms);
-
-    tracing::info!(
-        pid,
-        net_version,
-        runtime_host = format_args!("{runtime_host:#x}"),
-        assembly = format_args!("{assembly_path_remote:#x}"),
-        "CLR hosted assembly executed"
-    );
-
-    let _ = args_remote;
-    Ok(0)
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5795,6 +6153,7 @@ fn invoke_dllmain_remote_thread(
     pe: &Pe,
     reserved_arg_remote: u64,
     dllmain_tls: Option<DllMainThreadTls>,
+    dllmain_actctx: Option<DllMainActCtx>,
     thread_starts: GuestThreadStartPolicy,
     timeout_ms: u32,
 ) -> Result<u64, GuestInjectError> {
@@ -5815,7 +6174,7 @@ fn invoke_dllmain_remote_thread(
         pid,
         hook,
         virtual_alloc,
-        [
+        &[
             0,
             REMOTE_THREAD_THUNK_ALLOCATION_SIZE,
             MEM_COMMIT_RESERVE,
@@ -5853,6 +6212,7 @@ fn invoke_dllmain_remote_thread(
             exit_code_slot,
             status_slot,
             dllmain_tls,
+            dllmain_actctx,
         ));
 
     let (thunk_addr, thread_start_location) = match find_in_image_code_cave(
@@ -6018,7 +6378,7 @@ fn invoke_dllmain_remote_thread(
                     pid,
                     hook,
                     close_handle,
-                    [thread_handle, 0, 0, 0],
+                    &[thread_handle, 0, 0, 0],
                     timeout_ms,
                 );
                 best_effort_virtual_free(backend, pid, hook, virtual_free, scratch, timeout_ms);
@@ -6029,7 +6389,7 @@ fn invoke_dllmain_remote_thread(
         pid,
         hook,
         close_handle,
-        [thread_handle, 0, 0, 0],
+        &[thread_handle, 0, 0, 0],
         timeout_ms,
     );
     best_effort_virtual_free(backend, pid, hook, virtual_free, scratch, timeout_ms);
@@ -6077,7 +6437,7 @@ fn allocate_virtual(
             pid,
             hook,
             virtual_alloc,
-            [addr, size, MEM_COMMIT_RESERVE, allocation_protection],
+            &[addr, size, MEM_COMMIT_RESERVE, allocation_protection],
             timeout_ms,
         )
     };
@@ -6300,7 +6660,7 @@ fn register_guest_stub_unwind(
         pid,
         hook,
         rtl_add_function_table,
-        [metadata_addr, 1, stage, 0],
+        &[metadata_addr, 1, stage, 0],
         timeout_ms,
     )?;
     if ok == 0 {
@@ -6367,7 +6727,7 @@ fn register_guest_exception_table(
         pid,
         hook,
         rtl_add_function_table,
-        [function_table, u64::from(entry_count), remote_base, 0],
+        &[function_table, u64::from(entry_count), remote_base, 0],
         timeout_ms,
     )?;
     if ok == 0 {
@@ -6406,11 +6766,13 @@ const STAGE_PARAM_OFFSET: u64 = STAGE_SCRATCH_OFFSET + 0x60;
 const GUEST_PARAM_BLOCK_SIZE: usize = 0x58;
 
 const REMOTE_THREAD_THUNK_ALLOCATION_SIZE: u64 = 0x1000;
-const REMOTE_THREAD_PARAM_OFFSET: u64 = 0x80;
-const REMOTE_THREAD_PARAM_SIZE: usize = 0x50;
-const REMOTE_THREAD_EXIT_CODE_OFFSET: u64 = 0x100;
-const REMOTE_THREAD_STATUS_OFFSET: u64 = 0x108;
-const REMOTE_THREAD_THREAD_ID_OFFSET: u64 = 0x110;
+const REMOTE_THREAD_PARAM_OFFSET: u64 = 0x100;
+const REMOTE_THREAD_PARAM_SIZE: usize = 0x68;
+const DLLMAIN_STATUS_COMPLETE: u32 = 1;
+const DLLMAIN_STATUS_ACTCTX_ACTIVATION_FAILED: u32 = 2;
+const REMOTE_THREAD_EXIT_CODE_OFFSET: u64 = 0x180;
+const REMOTE_THREAD_STATUS_OFFSET: u64 = 0x188;
+const REMOTE_THREAD_THREAD_ID_OFFSET: u64 = 0x190;
 
 const _: () = {
     assert!(
@@ -6444,6 +6806,21 @@ const REMOTE_THREAD_DLLMAIN_THUNK: &[u8] = &[
     0x8B, 0x4B, 0x38, // mov ecx, [rbx+0x38] (TLS slot)
     0x48, 0x8B, 0x53, 0x40, // mov rdx, [rbx+0x40] (TLS value)
     0xFF, 0xD0, // call rax
+    0x48, 0x8B, 0x43, 0x48, // mov rax, [rbx+0x48] (optional ActivateActCtx)
+    0x48, 0x85, 0xC0, // test rax, rax
+    0x74, 0x2A, // je DllMain
+    0x48, 0x8B, 0x4B, 0x58, // mov rcx, [rbx+0x58] (ACTCTX handle)
+    0x48, 0x8B, 0x53, 0x60, // mov rdx, [rbx+0x60] (cookie address)
+    0xFF, 0xD0, // call rax
+    0x85, 0xC0, // test eax, eax
+    0x75, 0x1C, // jne DllMain
+    0x4C, 0x8B, 0x53, 0x20, // mov r10, [rbx+0x20]
+    0x41, 0xC7, 0x02, 0x00, 0x00, 0x00, 0x00, // mov dword ptr [r10], 0
+    0x4C, 0x8B, 0x53, 0x28, // mov r10, [rbx+0x28]
+    0x41, 0xC7, 0x02, 0x02, 0x00, 0x00, 0x00, // mov dword ptr [r10], 2
+    0x48, 0x83, 0xC4, 0x20, // add rsp, 0x20
+    0x5B, // pop rbx
+    0xC3, // ret
     0x48, 0x8B, 0x03, // mov rax, [rbx]
     0x48, 0x8B, 0x4B, 0x08, // mov rcx, [rbx+8]
     0x48, 0x8B, 0x53, 0x10, // mov rdx, [rbx+0x10]
@@ -6451,6 +6828,13 @@ const REMOTE_THREAD_DLLMAIN_THUNK: &[u8] = &[
     0xFF, 0xD0, // call rax
     0x4C, 0x8B, 0x53, 0x20, // mov r10, [rbx+0x20]
     0x41, 0x89, 0x02, // mov [r10], eax
+    0x48, 0x8B, 0x43, 0x50, // mov rax, [rbx+0x50] (optional DeactivateActCtx)
+    0x48, 0x85, 0xC0, // test rax, rax
+    0x74, 0x0B, // je completion
+    0x31, 0xC9, // xor ecx, ecx
+    0x48, 0x8B, 0x53, 0x60, // mov rdx, [rbx+0x60] (cookie address)
+    0x48, 0x8B, 0x12, // mov rdx, [rdx] (activation cookie)
+    0xFF, 0xD0, // call rax
     0x4C, 0x8B, 0x53, 0x28, // mov r10, [rbx+0x28]
     0x41, 0xC7, 0x02, 0x01, 0x00, 0x00, 0x00, // mov dword ptr [r10], 1
     0x48, 0x83, 0xC4, 0x20, // add rsp, 0x20
@@ -6469,6 +6853,19 @@ const THREAD_HIJACK_THUNK: &[u8] = &[
     0x8B, 0x4B, 0x38, // mov ecx, [rbx+0x38] (TLS slot)
     0x48, 0x8B, 0x53, 0x40, // mov rdx, [rbx+0x40] (TLS value)
     0xFF, 0xD0, // call rax
+    0x48, 0x8B, 0x83, 0xD8, 0x00, 0x00, 0x00, // mov rax, [rbx+0xd8] (ActivateActCtx)
+    0x48, 0x85, 0xC0, // test rax, rax
+    0x74, 0x2F, // je DllMain
+    0x48, 0x8B, 0x8B, 0xE8, 0x00, 0x00, 0x00, // mov rcx, [rbx+0xe8] (ACTCTX handle)
+    0x48, 0x8B, 0x93, 0xF0, 0x00, 0x00, 0x00, // mov rdx, [rbx+0xf0] (cookie address)
+    0xFF, 0xD0, // call rax
+    0x85, 0xC0, // test eax, eax
+    0x75, 0x1B, // jne DllMain
+    0x4C, 0x8B, 0x53, 0x20, // mov r10, [rbx+0x20]
+    0x41, 0xC7, 0x02, 0x00, 0x00, 0x00, 0x00, // mov dword ptr [r10], 0
+    0x4C, 0x8B, 0x53, 0x28, // mov r10, [rbx+0x28]
+    0x41, 0xC7, 0x02, 0x02, 0x00, 0x00, 0x00, // mov dword ptr [r10], 2
+    0xE9, 0x3D, 0x00, 0x00, 0x00, // jmp to the interrupted-context restore path
     0x48, 0x8B, 0x03, // mov rax, [rbx]
     0x48, 0x8B, 0x4B, 0x08, // mov rcx, [rbx+8]
     0x48, 0x8B, 0x53, 0x10, // mov rdx, [rbx+0x10]
@@ -6476,6 +6873,13 @@ const THREAD_HIJACK_THUNK: &[u8] = &[
     0xFF, 0xD0, // call rax
     0x4C, 0x8B, 0x53, 0x20, // mov r10, [rbx+0x20]
     0x41, 0x89, 0x02, // mov [r10], eax
+    0x48, 0x8B, 0x83, 0xE0, 0x00, 0x00, 0x00, // mov rax, [rbx+0xe0] (DeactivateActCtx)
+    0x48, 0x85, 0xC0, // test rax, rax
+    0x74, 0x0E, // je completion
+    0x31, 0xC9, // xor ecx, ecx
+    0x48, 0x8B, 0x93, 0xF0, 0x00, 0x00, 0x00, // mov rdx, [rbx+0xf0] (cookie address)
+    0x48, 0x8B, 0x12, // mov rdx, [rdx] (activation cookie)
+    0xFF, 0xD0, // call rax
     0x4C, 0x8B, 0x53, 0x28, // mov r10, [rbx+0x28]
     0x41, 0xC7, 0x02, 0x01, 0x00, 0x00, 0x00, // mov dword ptr [r10], 1
     // Restore the exact interrupted integer/control context. Push the saved RIP on the
@@ -6502,7 +6906,7 @@ const THREAD_HIJACK_THUNK: &[u8] = &[
     0xC3, // ret
 ];
 
-const HIJACK_PARAM_SIZE: usize = 0xD8;
+const HIJACK_PARAM_SIZE: usize = 0x100;
 const HIJACK_SCRATCH_SIZE: usize = 0x400;
 const HIJACK_PARAM_OFFSET: u64 = 0x200;
 const HIJACK_EXIT_CODE_OFFSET: u64 = 0x300;
@@ -6526,6 +6930,7 @@ fn prepare_dllmain_scratch(
     reserved: u64,
     original_context: Option<GuestThreadContext>,
     tls: Option<DllMainThreadTls>,
+    actctx: Option<DllMainActCtx>,
     timeout_ms: u32,
 ) -> Result<(u64, u64, u64, u64), GuestInjectError> {
     let scratch = allocate_helper_buffer_with_protect(
@@ -6559,6 +6964,22 @@ fn prepare_dllmain_scratch(
         param[0x30..0x38].copy_from_slice(&tls.tls_set_value.to_le_bytes());
         param[0x38..0x40].copy_from_slice(&(tls.slot as u64).to_le_bytes());
         param[0x40..0x48].copy_from_slice(&tls.value.to_le_bytes());
+    }
+    let actctx_offset = if original_context.is_some() {
+        0xD8
+    } else {
+        0x48
+    };
+    if let Some(actctx) = actctx {
+        let values = [
+            (actctx_offset, actctx.activate),
+            (actctx_offset + 8, actctx.deactivate),
+            (actctx_offset + 16, actctx.handle),
+            (actctx_offset + 24, actctx.cookie_addr),
+        ];
+        for (offset, value) in values {
+            param[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
     }
     if let Some(ctx) = original_context {
         let values = [
@@ -6621,7 +7042,7 @@ impl Drop for SecImageCleanup<'_> {
                 self.pid,
                 self.hook,
                 self.unmap_view,
-                [self.view_base, 0, 0, 0],
+                &[self.view_base, 0, 0, 0],
                 self.timeout_ms,
             );
         }
@@ -6630,7 +7051,7 @@ impl Drop for SecImageCleanup<'_> {
                 self.pid,
                 self.hook,
                 self.close_handle,
-                [self.mapping_handle, 0, 0, 0],
+                &[self.mapping_handle, 0, 0, 0],
                 self.timeout_ms,
             );
         }
@@ -6639,7 +7060,7 @@ impl Drop for SecImageCleanup<'_> {
                 self.pid,
                 self.hook,
                 self.close_handle,
-                [self.file_handle, 0, 0, 0],
+                &[self.file_handle, 0, 0, 0],
                 self.timeout_ms,
             );
         }
@@ -6648,7 +7069,7 @@ impl Drop for SecImageCleanup<'_> {
                 self.pid,
                 self.hook,
                 self.virtual_free,
-                [self.payload_buf, 0, MEM_RELEASE, 0],
+                &[self.payload_buf, 0, MEM_RELEASE, 0],
                 self.timeout_ms,
             );
         }
@@ -6657,7 +7078,7 @@ impl Drop for SecImageCleanup<'_> {
                 self.pid,
                 self.hook,
                 self.virtual_free,
-                [self.path_buf, 0, MEM_RELEASE, 0],
+                &[self.path_buf, 0, MEM_RELEASE, 0],
                 self.timeout_ms,
             );
         }
@@ -6731,7 +7152,7 @@ fn call_guest_proc(
         arg_count = args.len(),
         "guest proc call armed"
     );
-    backend.call_iat_hook(pid, hook, trampoline, [param_block, 0, 0, 0], timeout_ms)
+    backend.call_iat_hook(pid, hook, trampoline, &[param_block, 0, 0, 0], timeout_ms)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6786,7 +7207,7 @@ fn allocate_sec_image(
         pid,
         hook,
         virtual_alloc,
-        [0, SEC_IMAGE_PATH_BYTES, MEM_COMMIT_RESERVE, PAGE_READWRITE],
+        &[0, SEC_IMAGE_PATH_BYTES, MEM_COMMIT_RESERVE, PAGE_READWRITE],
         timeout_ms,
     )?;
     if cleanup.path_buf == 0 {
@@ -6796,7 +7217,7 @@ fn allocate_sec_image(
         pid,
         hook,
         virtual_alloc,
-        [
+        &[
             0,
             payload_image.len() as u64,
             MEM_COMMIT_RESERVE,
@@ -6829,7 +7250,7 @@ fn allocate_sec_image(
         pid,
         hook,
         get_temp_path,
-        [SEC_IMAGE_PATH_CHARS, cleanup.path_buf, 0, 0],
+        &[SEC_IMAGE_PATH_CHARS, cleanup.path_buf, 0, 0],
         timeout_ms,
     )?;
     if temp_len == 0 || temp_len >= SEC_IMAGE_PATH_CHARS {
@@ -6933,7 +7354,7 @@ fn allocate_sec_image(
         pid,
         hook,
         virtual_free,
-        [cleanup.payload_buf, 0, MEM_RELEASE, 0],
+        &[cleanup.payload_buf, 0, MEM_RELEASE, 0],
         timeout_ms,
     );
     cleanup.payload_buf = 0;
@@ -6970,7 +7391,7 @@ fn allocate_sec_image(
         pid,
         hook,
         close_handle,
-        [cleanup.mapping_handle, 0, 0, 0],
+        &[cleanup.mapping_handle, 0, 0, 0],
         timeout_ms,
     );
     cleanup.mapping_handle = 0;
@@ -6978,7 +7399,7 @@ fn allocate_sec_image(
         pid,
         hook,
         close_handle,
-        [cleanup.file_handle, 0, 0, 0],
+        &[cleanup.file_handle, 0, 0, 0],
         timeout_ms,
     );
     cleanup.file_handle = 0;
@@ -6986,7 +7407,7 @@ fn allocate_sec_image(
         pid,
         hook,
         virtual_free,
-        [cleanup.path_buf, 0, MEM_RELEASE, 0],
+        &[cleanup.path_buf, 0, MEM_RELEASE, 0],
         timeout_ms,
     );
     cleanup.path_buf = 0;
@@ -7028,7 +7449,7 @@ fn synthesize_peb_loader_entry(
         GUEST_GET_PEB_TRAMPOLINE,
         "PEB lookup trampoline",
     )?;
-    let peb = backend.call_iat_hook(pid, hook, trampoline, [0, 0, 0, 0], timeout_ms)?;
+    let peb = backend.call_iat_hook(pid, hook, trampoline, &[0, 0, 0, 0], timeout_ms)?;
     if peb == 0 {
         let _ = backend.write(pid, trampoline, &saved);
         return Err(GuestInjectError::Backend("PEB lookup returned null".into()));
@@ -7313,7 +7734,7 @@ fn guest_virtual_protect(
         pid,
         hook,
         virtual_protect,
-        [addr, size, protect, old_protect],
+        &[addr, size, protect, old_protect],
         timeout_ms,
     )?;
     if ok == 0 {
@@ -7396,7 +7817,7 @@ fn sec_image_patched_ranges(image: &[u8], snapshot: &[u8]) -> Vec<(usize, usize)
     ranges
 }
 
-fn call_stub(hook: &GuestIatHook, function: u64, args: [u64; 4]) -> Vec<u8> {
+fn call_stub(hook: &GuestIatHook, function: u64, args: &[u64]) -> Vec<u8> {
     if hook.call_stack == GuestCallStackPolicy::RegisteredUnwind {
         return framed_call_stub(hook, function, args);
     }
@@ -7408,16 +7829,16 @@ fn call_stub(hook: &GuestIatHook, function: u64, args: [u64; 4]) -> Vec<u8> {
     code.lock_cmpxchg_rax_at_r10_with_r11();
     let skip_call = code.jne_rel32_placeholder();
 
-    code.mov_abs(Reg64::Rcx, args[0]);
-    code.mov_abs(Reg64::Rdx, args[1]);
-    code.mov_abs(Reg64::R8, args[2]);
-    code.mov_abs(Reg64::R9, args[3]);
-    match hook.spoofed_return {
+    stage_register_args(&mut code, args);
+    let n_stack = args.len().saturating_sub(4);
+    let spoofed = if n_stack > 0 {
+        None
+    } else {
+        hook.spoofed_return
+    };
+    match spoofed {
         Some(gadget) => emit_spoofed_call(&mut code, hook, function, gadget, 0),
-        None => {
-            code.mov_abs(Reg64::Rax, function);
-            code.call_rax_windows_x64();
-        }
+        None => emit_direct_call(&mut code, function, &args[4.min(args.len())..]),
     }
     code.mov_abs(Reg64::R10, hook.result_addr + 8);
     code.store_rax_at_r10();
@@ -7431,7 +7852,13 @@ fn call_stub(hook: &GuestIatHook, function: u64, args: [u64; 4]) -> Vec<u8> {
     code.finish()
 }
 
-fn framed_call_stub(hook: &GuestIatHook, function: u64, args: [u64; 4]) -> Vec<u8> {
+fn framed_call_stub(hook: &GuestIatHook, function: u64, args: &[u64]) -> Vec<u8> {
+    let n_stack = args.len().saturating_sub(4);
+    assert!(
+        n_stack <= FRAMED_MAX_STACK_ARGS,
+        "framed_call_stub supports at most {FRAMED_MAX_STACK_ARGS} stack args (frame {FRAMED_STUB_STACK_ALLOC:#x}); got {n_stack} stack args ({} total)",
+        args.len()
+    );
     let mut code = X64Stub::new();
     framed_prologue(&mut code);
     code.mov_abs(Reg64::R10, hook.result_addr);
@@ -7440,11 +7867,15 @@ fn framed_call_stub(hook: &GuestIatHook, function: u64, args: [u64; 4]) -> Vec<u
     code.lock_cmpxchg_rax_at_r10_with_r11();
     let skip_call = code.jne_rel32_placeholder();
 
-    code.mov_abs(Reg64::Rcx, args[0]);
-    code.mov_abs(Reg64::Rdx, args[1]);
-    code.mov_abs(Reg64::R8, args[2]);
-    code.mov_abs(Reg64::R9, args[3]);
-    match hook.spoofed_return {
+    stage_register_args(&mut code, args);
+    let n_stack = args.len().saturating_sub(4);
+    let spoofed = if n_stack > 0 {
+        None
+    } else {
+        hook.spoofed_return
+    };
+    stage_stack_args(&mut code, &args[4.min(args.len())..]);
+    match spoofed {
         Some(gadget) => emit_spoofed_call(&mut code, hook, function, gadget, 8),
         None => {
             code.mov_abs(Reg64::Rax, function);
@@ -7630,19 +8061,50 @@ fn tail_jump_original_import(code: &mut X64Stub, original_target: u64) {
     code.jmp_rax();
 }
 
+fn stage_register_args(code: &mut X64Stub, args: &[u64]) {
+    const REGS: [Reg64; 4] = [Reg64::Rcx, Reg64::Rdx, Reg64::R8, Reg64::R9];
+    for (idx, reg) in REGS.iter().enumerate() {
+        if let Some(&v) = args.get(idx) {
+            code.mov_abs(*reg, v);
+        }
+    }
+}
+
+fn stage_stack_args(code: &mut X64Stub, stack_args: &[u64]) {
+    for (i, &v) in stack_args.iter().enumerate() {
+        let disp = 0x20u8 + (i as u8) * 8;
+        code.mov_abs(Reg64::Rax, v);
+        code.store_reg_at_rsp_disp(Reg64::Rax, disp);
+    }
+}
+
+fn emit_direct_call(code: &mut X64Stub, function: u64, stack_args: &[u64]) {
+    let n = stack_args.len() as u32;
+    let mut frame = 0x28u32 + n * 8;
+    if frame % 16 != 8 {
+        frame += 8;
+    }
+    let frame8 = u8::try_from(frame).expect("direct call frame fits in imm8");
+    code.sub_rsp(frame8);
+    stage_stack_args(code, stack_args);
+    code.mov_abs(Reg64::Rax, function);
+    code.call_rax_with_current_frame();
+    code.add_rsp(frame8);
+}
+
 fn framed_prologue(code: &mut X64Stub) {
     code.sub_rsp(FRAMED_STUB_STACK_ALLOC);
-    code.store_reg_at_rsp_disp(Reg64::Rcx, 0x28);
-    code.store_reg_at_rsp_disp(Reg64::Rdx, 0x30);
-    code.store_reg_at_rsp_disp(Reg64::R8, 0x38);
-    code.store_reg_at_rsp_disp(Reg64::R9, 0x40);
+    code.store_reg_at_rsp_disp(Reg64::Rcx, 0x48);
+    code.store_reg_at_rsp_disp(Reg64::Rdx, 0x50);
+    code.store_reg_at_rsp_disp(Reg64::R8, 0x58);
+    code.store_reg_at_rsp_disp(Reg64::R9, 0x60);
 }
 
 fn framed_tail_jump_original_import(code: &mut X64Stub, original_target: u64) {
-    code.load_reg_from_rsp_disp(Reg64::Rcx, 0x28);
-    code.load_reg_from_rsp_disp(Reg64::Rdx, 0x30);
-    code.load_reg_from_rsp_disp(Reg64::R8, 0x38);
-    code.load_reg_from_rsp_disp(Reg64::R9, 0x40);
+    code.load_reg_from_rsp_disp(Reg64::Rcx, 0x48);
+    code.load_reg_from_rsp_disp(Reg64::Rdx, 0x50);
+    code.load_reg_from_rsp_disp(Reg64::R8, 0x58);
+    code.load_reg_from_rsp_disp(Reg64::R9, 0x60);
     code.add_rsp(FRAMED_STUB_STACK_ALLOC);
     code.mov_abs(Reg64::Rax, original_target);
     code.jmp_rax();
@@ -7754,12 +8216,6 @@ impl X64Stub {
         self.bytes[imm_offset..imm_offset + 4].copy_from_slice(&rel.to_le_bytes());
     }
 
-    fn call_rax_windows_x64(&mut self) {
-        self.sub_rsp(0x28);
-        self.bytes.extend_from_slice(&[0xFF, 0xD0]);
-        self.add_rsp(0x28);
-    }
-
     fn call_rax_with_current_frame(&mut self) {
         self.bytes.extend_from_slice(&[0xFF, 0xD0]);
     }
@@ -7826,13 +8282,6 @@ impl X64Stub {
             _ => unreachable!("unsupported stack reload register"),
         }
     }
-}
-
-#[cfg(test)]
-fn windows_x64_call_sequence_offset(bytes: &[u8]) -> Option<usize> {
-    bytes
-        .windows(10)
-        .position(|w| w == [0x48, 0x83, 0xEC, 0x28, 0xFF, 0xD0, 0x48, 0x83, 0xC4, 0x28])
 }
 
 fn find_stage(
@@ -8346,7 +8795,7 @@ fn resolve_import_symbol_with_dependency_policy(
     scratch_len: usize,
     timeout_ms: u32,
     policy: GuestDependencyPolicy,
-    parent_base: Option<u64>,
+    loaded_dependencies: &mut Vec<u64>,
     module: &str,
     symbol: ImportSymbol<'_>,
 ) -> Result<u64, GuestInjectError> {
@@ -8389,12 +8838,8 @@ fn resolve_import_symbol_with_dependency_policy(
         timeout_ms,
         &load_name,
     )?;
-    if let Some(parent) = parent_base {
-        update_module_record(pid, parent, |r| {
-            if !r.dependencies.contains(&loaded_base) {
-                r.dependencies.push(loaded_base);
-            }
-        });
+    if !loaded_dependencies.contains(&loaded_base) {
+        loaded_dependencies.push(loaded_base);
     }
     match resolve(backend) {
         Ok(addr) => Ok(addr),
@@ -8471,8 +8916,13 @@ fn load_guest_dependency(
         &bytes,
         "guest dependency module name",
     )?;
-    let call_result =
-        backend.call_iat_hook(pid, hook, load_library, [scratch_addr, 0, 0, 0], timeout_ms);
+    let call_result = backend.call_iat_hook(
+        pid,
+        hook,
+        load_library,
+        &[scratch_addr, 0, 0, 0],
+        timeout_ms,
+    );
     let restore_result = backend.write(pid, scratch_addr, &original);
     if let Err(err) = restore_result {
         tracing::warn!(
@@ -8531,7 +8981,7 @@ fn resolve_loaded_import_symbol(
             pid,
             hook,
             get_proc_address,
-            [module_base, u64::from(ordinal), 0, 0],
+            &[module_base, u64::from(ordinal), 0, 0],
             timeout_ms,
         )?,
     };
@@ -8588,7 +9038,7 @@ fn guest_get_proc_address(
         pid,
         hook,
         get_proc_address,
-        [module_base, scratch_addr, 0, 0],
+        &[module_base, scratch_addr, 0, 0],
         timeout_ms,
     );
     let restore_result = backend.write(pid, scratch_addr, &original);
@@ -9175,10 +9625,18 @@ mod tests {
             call_stack: GuestCallStackPolicy::Native,
             spoofed_return: None,
         };
-        let stub = call_stub(&hook, 0x5000, [1, 2, 3, 4]);
+        let stub = call_stub(&hook, 0x5000, &[1, 2, 3, 4]);
         assert!(
-            windows_x64_call_sequence_offset(&stub).is_some(),
-            "stub must reserve 32 bytes of Windows x64 shadow space and keep stack alignment"
+            stub.windows(4).any(|w| w == [0x48, 0x83, 0xEC, 0x28]),
+            "stub must reserve 32 bytes of Windows x64 shadow space plus an alignment qword"
+        );
+        assert!(
+            stub.windows(4).any(|w| w == [0x48, 0x83, 0xC4, 0x28]),
+            "stub must release the shadow space frame after the injected call"
+        );
+        assert!(
+            stub.windows(2).any(|w| w == [0xFF, 0xD0]),
+            "stub must invoke the target function via call rax"
         );
         assert!(
             stub.windows(5).any(|w| w == [0xF0, 0x4D, 0x0F, 0xB1, 0x1A]),
@@ -9223,7 +9681,7 @@ mod tests {
                 stack_adjust: 0x20,
             }),
         };
-        let stub = call_stub(&hook, 0x5000, [1, 2, 3, 4]);
+        let stub = call_stub(&hook, 0x5000, &[1, 2, 3, 4]);
         assert!(
             stub.windows(4).any(|w| w == [0x48, 0x83, 0xEC, 0x30]),
             "native spoofed call must reserve return, shadow space, and continuation"
@@ -9423,7 +9881,7 @@ mod tests {
             call_stack: GuestCallStackPolicy::RegisteredUnwind,
             spoofed_return: None,
         };
-        let stub = call_stub(&hook, 0x5000, [1, 2, 3, 4]);
+        let stub = call_stub(&hook, 0x5000, &[1, 2, 3, 4]);
         assert!(
             stub.starts_with(&[0x48, 0x83, 0xEC, FRAMED_STUB_STACK_ALLOC]),
             "registered-unwind stub must use one unwindable stack allocation"
@@ -9695,6 +10153,32 @@ mod tests {
         );
         assert_eq!(GUEST_PARAM_BLOCK_SIZE, 0x58);
         assert!(STAGE_PARAM_OFFSET + GUEST_PARAM_BLOCK_SIZE as u64 <= STAGE_UNWIND_OFFSET);
+        assert!(
+            GUEST_PROC_TRAMPOLINE
+                .windows(5)
+                .any(|w| w == [0x48, 0x89, 0x44, 0x24, 0x20])
+        );
+        assert!(
+            GUEST_PROC_TRAMPOLINE
+                .windows(5)
+                .any(|w| w == [0x48, 0x89, 0x44, 0x24, 0x28])
+        );
+    }
+
+    #[test]
+    fn direct_iat_call_stages_six_arguments_with_x64_stack_alignment() {
+        let hook = GuestIatHook {
+            iat_slot: 0x1000,
+            original_target: 0x2000,
+            stub_addr: 0x3000,
+            result_addr: 0x4000,
+            call_stack: GuestCallStackPolicy::Native,
+            spoofed_return: None,
+        };
+        let stub = call_stub(&hook, 0x5000, &[1, 2, 3, 4, 5, 6]);
+        assert!(stub.windows(4).any(|w| w == [0x48, 0x83, 0xEC, 0x38]));
+        assert!(stub.windows(5).any(|w| w == [0x48, 0x89, 0x44, 0x24, 0x20]));
+        assert!(stub.windows(5).any(|w| w == [0x48, 0x89, 0x44, 0x24, 0x28]));
     }
 
     #[test]
@@ -9722,6 +10206,73 @@ mod tests {
         );
         assert_eq!(*REMOTE_THREAD_DLLMAIN_THUNK.last().unwrap(), 0xC3);
         assert!(REMOTE_THREAD_DLLMAIN_THUNK.len() < REMOTE_THREAD_PARAM_OFFSET as usize);
+    }
+
+    #[test]
+    fn dllmain_thunks_activate_and_deactivate_actctx_on_execution_thread() {
+        fn find_bytes(haystack: &[u8], needle: &[u8]) -> usize {
+            haystack
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .expect("instruction sequence must be present")
+        }
+        fn short_jump_target(code: &[u8], opcode_offset: usize) -> usize {
+            assert!(matches!(code[opcode_offset], 0x74 | 0x75));
+            (opcode_offset + 2) + (code[opcode_offset + 1] as i8 as isize) as usize
+        }
+
+        let remote_activate = find_bytes(
+            REMOTE_THREAD_DLLMAIN_THUNK,
+            &[0x48, 0x8B, 0x43, 0x48, 0x48, 0x85, 0xC0, 0x74],
+        );
+        let remote_dllmain = short_jump_target(REMOTE_THREAD_DLLMAIN_THUNK, remote_activate + 7);
+        assert_eq!(
+            &REMOTE_THREAD_DLLMAIN_THUNK[remote_dllmain..remote_dllmain + 3],
+            &[0x48, 0x8B, 0x03]
+        );
+        assert_eq!(
+            short_jump_target(REMOTE_THREAD_DLLMAIN_THUNK, remote_activate + 21),
+            remote_dllmain
+        );
+        let remote_deactivate = find_bytes(
+            REMOTE_THREAD_DLLMAIN_THUNK,
+            &[0x48, 0x8B, 0x43, 0x50, 0x48, 0x85, 0xC0, 0x74],
+        );
+        let remote_completion =
+            short_jump_target(REMOTE_THREAD_DLLMAIN_THUNK, remote_deactivate + 7);
+        assert_eq!(
+            &REMOTE_THREAD_DLLMAIN_THUNK[remote_completion..remote_completion + 4],
+            &[0x4C, 0x8B, 0x53, 0x28]
+        );
+
+        let hijack_activate = find_bytes(
+            THREAD_HIJACK_THUNK,
+            &[0x48, 0x8B, 0x83, 0xD8, 0, 0, 0, 0x48, 0x85, 0xC0, 0x74],
+        );
+        let hijack_dllmain = short_jump_target(THREAD_HIJACK_THUNK, hijack_activate + 10);
+        assert_eq!(
+            &THREAD_HIJACK_THUNK[hijack_dllmain..hijack_dllmain + 3],
+            &[0x48, 0x8B, 0x03]
+        );
+        assert_eq!(
+            short_jump_target(THREAD_HIJACK_THUNK, hijack_activate + 30),
+            hijack_dllmain
+        );
+        let activation_failure_restore = find_bytes(THREAD_HIJACK_THUNK, &[0xE9, 0x3D, 0, 0, 0]);
+        let restore_start = activation_failure_restore + 5 + 0x3D;
+        assert_eq!(
+            &THREAD_HIJACK_THUNK[restore_start..restore_start + 2],
+            &[0xFF, 0xB3]
+        );
+        let hijack_deactivate = find_bytes(
+            THREAD_HIJACK_THUNK,
+            &[0x48, 0x8B, 0x83, 0xE0, 0, 0, 0, 0x48, 0x85, 0xC0, 0x74],
+        );
+        let hijack_completion = short_jump_target(THREAD_HIJACK_THUNK, hijack_deactivate + 10);
+        assert_eq!(
+            &THREAD_HIJACK_THUNK[hijack_completion..hijack_completion + 4],
+            &[0x4C, 0x8B, 0x53, 0x28]
+        );
     }
 
     #[test]

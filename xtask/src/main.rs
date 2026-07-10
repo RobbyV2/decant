@@ -264,7 +264,14 @@ fn build_guest_inject_fixture_artifacts(root: &Path) -> Result<GuestInjectFixtur
     run("build guest-inject-target.exe", &mut target)?;
 
     let payloads = vec![
-        build_guest_payload(root, &native, &out_dir, "guest_inject_probe.dll", &[])?,
+        build_guest_payload(
+            root,
+            &native,
+            &out_dir,
+            "guest_inject_probe.dll",
+            &[],
+            false,
+        )?,
         build_guest_payload(
             root,
             &native,
@@ -274,6 +281,7 @@ fn build_guest_inject_fixture_artifacts(root: &Path) -> Result<GuestInjectFixtur
                 ("DECANT_PAYLOAD_TEXT", "\"decant imports ok\""),
                 ("DECANT_PAYLOAD_IMPORT_STRESS", "1"),
             ],
+            false,
         )?,
         build_guest_payload(
             root,
@@ -284,11 +292,24 @@ fn build_guest_inject_fixture_artifacts(root: &Path) -> Result<GuestInjectFixtur
                 ("DECANT_PAYLOAD_TEXT", "\"decant tls ok\""),
                 ("DECANT_PAYLOAD_TLS_CALLBACK", "1"),
             ],
+            false,
+        )?,
+        build_guest_payload(
+            root,
+            &native,
+            &out_dir,
+            "guest_inject_sxs.dll",
+            &[
+                ("DECANT_PAYLOAD_TEXT", "\"decant sxs ok\""),
+                ("DECANT_PAYLOAD_REQUIRE_ACTCTX", "1"),
+            ],
+            true,
         )?,
         build_guest_rust_payload(root, &out_dir)?,
     ];
 
     assert_pe_has_data_directory(&payloads[2], 9, "TLS")?;
+    assert_pe_has_data_directory(&payloads[3], 2, "resource")?;
 
     Ok(GuestInjectFixtureArtifacts { exe, payloads })
 }
@@ -299,8 +320,23 @@ fn build_guest_payload(
     out_dir: &Path,
     name: &str,
     defines: &[(&str, &str)],
+    with_manifest: bool,
 ) -> Result<PathBuf> {
     let dll = out_dir.join(name);
+    let manifest_resource = if with_manifest {
+        let resource = out_dir.join(format!("{name}.res"));
+        let mut windres = Command::new("x86_64-w64-mingw32-windres");
+        windres
+            .current_dir(root)
+            .args(["-O", "coff", "-I"])
+            .arg(native)
+            .arg(native.join("guest_sxs.rc"))
+            .arg(&resource);
+        run(&format!("build {name} manifest resource"), &mut windres)?;
+        Some(resource)
+    } else {
+        None
+    };
     let mut payload = Command::new("x86_64-w64-mingw32-gcc");
     payload
         .current_dir(root)
@@ -320,6 +356,9 @@ fn build_guest_payload(
         .arg(&dll)
         .arg(native.join("payload.c"))
         .arg("-lkernel32");
+    if let Some(resource) = &manifest_resource {
+        payload.arg(resource);
+    }
     for (key, value) in defines {
         payload.arg(format!("-D{key}={value}"));
     }

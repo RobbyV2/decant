@@ -147,10 +147,9 @@ impl Pe {
 
     pub(crate) fn manifest_id(&self, bytes: &[u8]) -> Result<Option<u32>, InjectError> {
         const IMAGE_DIRECTORY_ENTRY_RESOURCE: usize = 2;
-        if IMAGE_DIRECTORY_ENTRY_RESOURCE >= 16 {
-            return Ok(None);
-        }
-        let rsrc_dir = Dir { rva: 0, size: 0 };
+        const RT_MANIFEST: u32 = 24;
+        const RESOURCE_DIRECTORY_FLAG: u32 = 0x8000_0000;
+        const MANIFEST_RESOURCE_ID: u32 = 1;
         let nt = u32_at(bytes, 0x3C)? as usize;
         let file = nt + 4;
         let opt = file + 20;
@@ -164,49 +163,88 @@ impl Pe {
             size: u32_at(bytes, rsrc_off + 4)?,
         };
         if rsrc.rva == 0 || rsrc.size == 0 {
-            let _ = rsrc_dir;
             return Ok(None);
         }
-        let rsrc_va = rsrc.rva as usize;
-        if rsrc_va + 16 > bytes.len() {
+        let Some(rsrc_file) = self.rva_to_file_offset(rsrc.rva) else {
+            return Ok(None);
+        };
+        let rsrc_size = rsrc.size as usize;
+
+        let Some(type_entry) = resource_directory_entries(bytes, rsrc_file, rsrc_size, 0)
+            .and_then(|entries| entries.into_iter().find(|(id, _)| *id == RT_MANIFEST))
+        else {
+            return Ok(None);
+        };
+        if type_entry.1 & RESOURCE_DIRECTORY_FLAG == 0 {
             return Ok(None);
         }
-        let manifest_type = 4u32;
-        let manifest_id = 1u32;
-        let type_count = u32_at(bytes, rsrc_va + 12)? as usize;
-        let type_entries_off = rsrc_va + 16;
-        for i in 0..type_count {
-            let entry_off = type_entries_off + i * 8;
-            if entry_off + 8 > bytes.len() {
-                break;
-            }
-            let type_id = u32_at(bytes, entry_off)?;
-            let data_dir_off = u32_at(bytes, entry_off + 4)? as usize;
-            if type_id != manifest_type {
-                continue;
-            }
-            let name_count = u32_at(bytes, rsrc_va + data_dir_off + 12)? as usize;
-            let name_entries_off = rsrc_va + data_dir_off + 16;
-            for j in 0..name_count {
-                let name_entry_off = name_entries_off + j * 8;
-                if name_entry_off + 8 > bytes.len() {
-                    break;
-                }
-                let id = u32_at(bytes, name_entry_off)?;
-                let lang_dir_off = u32_at(bytes, name_entry_off + 4)? as usize;
-                if id != manifest_id {
-                    continue;
-                }
-                let lang_count = u32_at(bytes, rsrc_va + lang_dir_off + 12)? as usize;
-                let lang_entries_off = rsrc_va + lang_dir_off + 16;
-                if lang_count == 0 || lang_entries_off + 16 > bytes.len() {
-                    continue;
-                }
-                let data_rva = u32_at(bytes, lang_entries_off)?;
-                return Ok(Some(data_rva));
-            }
+        let type_dir = type_entry.1 & !RESOURCE_DIRECTORY_FLAG;
+
+        let Some(name_entry) = resource_directory_entries(bytes, rsrc_file, rsrc_size, type_dir)
+            .and_then(|entries| {
+                entries
+                    .into_iter()
+                    .find(|(id, _)| *id == MANIFEST_RESOURCE_ID)
+            })
+        else {
+            return Ok(None);
+        };
+        if name_entry.1 & RESOURCE_DIRECTORY_FLAG == 0 {
+            return Ok(None);
         }
-        Ok(None)
+        let language_dir = name_entry.1 & !RESOURCE_DIRECTORY_FLAG;
+
+        let Some((_, data_entry)) =
+            resource_directory_entries(bytes, rsrc_file, rsrc_size, language_dir).and_then(
+                |entries| {
+                    entries
+                        .into_iter()
+                        .find(|(_, offset)| offset & RESOURCE_DIRECTORY_FLAG == 0)
+                },
+            )
+        else {
+            return Ok(None);
+        };
+        let Some(data_entry_file) = rsrc_file.checked_add(data_entry as usize) else {
+            return Ok(None);
+        };
+        let Some(data_entry_end) = data_entry_file.checked_add(16) else {
+            return Ok(None);
+        };
+        let Some(resource_end) = rsrc_file.checked_add(rsrc_size) else {
+            return Ok(None);
+        };
+        if data_entry_end > resource_end || data_entry_end > bytes.len() {
+            return Ok(None);
+        }
+        let data_rva = u32_at(bytes, data_entry_file)?;
+        let data_size = u32_at(bytes, data_entry_file + 4)? as usize;
+        let Some(data_file) = self.rva_to_file_offset(data_rva) else {
+            return Ok(None);
+        };
+        if data_size == 0
+            || data_file
+                .checked_add(data_size)
+                .is_none_or(|end| end > bytes.len())
+        {
+            return Ok(None);
+        }
+        Ok(Some(MANIFEST_RESOURCE_ID))
+    }
+
+    fn rva_to_file_offset(&self, rva: u32) -> Option<usize> {
+        if rva < self.size_of_headers as u32 {
+            return Some(rva as usize);
+        }
+        self.sections.iter().find_map(|section| {
+            let span = section.virtual_size.max(section.raw_size);
+            let delta = rva.checked_sub(section.virtual_address)?;
+            if delta < span && delta < section.raw_size {
+                Some(section.raw_ptr.checked_add(delta)? as usize)
+            } else {
+                None
+            }
+        })
     }
 
     pub(crate) fn mapped_image(&self, bytes: &[u8]) -> Result<Vec<u8>, InjectError> {
@@ -532,6 +570,38 @@ impl Pe {
     }
 }
 
+fn resource_directory_entries(
+    bytes: &[u8],
+    resource_file_base: usize,
+    resource_size: usize,
+    directory_offset: u32,
+) -> Option<Vec<(u32, u32)>> {
+    let resource_end = resource_file_base.checked_add(resource_size)?;
+    let directory = resource_file_base.checked_add(directory_offset as usize)?;
+    let directory_entries = directory.checked_add(16)?;
+    if directory_entries > resource_end || directory_entries > bytes.len() {
+        return None;
+    }
+    let named_count = u16_at(bytes, directory + 12).ok()? as usize;
+    let id_count = u16_at(bytes, directory + 14).ok()? as usize;
+    let total = named_count.checked_add(id_count)?;
+    let entries_end = directory_entries.checked_add(total.checked_mul(8)?)?;
+    if entries_end > resource_end || entries_end > bytes.len() {
+        return None;
+    }
+
+    let mut entries = Vec::with_capacity(total);
+    for i in 0..total {
+        let entry = directory_entries + i * 8;
+        let name_or_id = u32_at(bytes, entry).ok()?;
+        let offset = u32_at(bytes, entry + 4).ok()?;
+        if name_or_id & 0x8000_0000 == 0 {
+            entries.push((name_or_id, offset));
+        }
+    }
+    Some(entries)
+}
+
 pub(crate) fn checked_add(a: usize, b: usize) -> Result<usize, InjectError> {
     a.checked_add(b)
         .ok_or_else(|| InjectError::ManualMap("integer overflow".into()))
@@ -718,5 +788,49 @@ mod tests {
             pe.tls_index_offset(&image, remote_base).unwrap(),
             Some(0x120)
         );
+    }
+
+    #[test]
+    fn manifest_lookup_decodes_resource_directories_from_file_offsets() {
+        let mut pe = minimal_pe();
+        pe.size_of_headers = 0x200;
+        pe.sections.push(Section {
+            virtual_size: 0x100,
+            virtual_address: 0x3000,
+            raw_size: 0x100,
+            raw_ptr: 0x200,
+            characteristics: 0,
+        });
+
+        let mut bytes = vec![0u8; 0x400];
+        bytes[0..2].copy_from_slice(&0x5A4Du16.to_le_bytes());
+        bytes[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(&0x0000_4550u32.to_le_bytes());
+        let optional_header = 0x98usize;
+        bytes[optional_header..optional_header + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        bytes[optional_header + 108..optional_header + 112].copy_from_slice(&16u32.to_le_bytes());
+        let resource_directory = optional_header + 112 + 2 * 8;
+        bytes[resource_directory..resource_directory + 4].copy_from_slice(&0x3000u32.to_le_bytes());
+        bytes[resource_directory + 4..resource_directory + 8]
+            .copy_from_slice(&0x100u32.to_le_bytes());
+
+        let resource = 0x200usize;
+        bytes[resource + 14..resource + 16].copy_from_slice(&1u16.to_le_bytes());
+        bytes[resource + 16..resource + 20].copy_from_slice(&24u32.to_le_bytes());
+        bytes[resource + 20..resource + 24].copy_from_slice(&0x8000_0020u32.to_le_bytes());
+
+        bytes[resource + 0x20 + 14..resource + 0x20 + 16].copy_from_slice(&1u16.to_le_bytes());
+        bytes[resource + 0x30..resource + 0x34].copy_from_slice(&1u32.to_le_bytes());
+        bytes[resource + 0x34..resource + 0x38].copy_from_slice(&0x8000_0040u32.to_le_bytes());
+
+        bytes[resource + 0x40 + 14..resource + 0x40 + 16].copy_from_slice(&1u16.to_le_bytes());
+        bytes[resource + 0x50..resource + 0x54].copy_from_slice(&0x409u32.to_le_bytes());
+        bytes[resource + 0x54..resource + 0x58].copy_from_slice(&0x60u32.to_le_bytes());
+
+        bytes[resource + 0x60..resource + 0x64].copy_from_slice(&0x3080u32.to_le_bytes());
+        bytes[resource + 0x64..resource + 0x68].copy_from_slice(&1u32.to_le_bytes());
+        bytes[resource + 0x80] = b'<';
+
+        assert_eq!(pe.manifest_id(&bytes).unwrap(), Some(1));
     }
 }

@@ -45,6 +45,7 @@ Environment:
   DECANT_GUEST_STACK_SHAPING native|spoofed
   DECANT_GUEST_CLEANUP resident|tracked
   DECANT_GUEST_VAD_SPOOF off|vad-image-map
+  DECANT_GUEST_SXS skip|probe
   DECANT_LIVE_DIR directory for runnable artifacts, default ~/Downloads/decant-live
 EOF
 }
@@ -107,7 +108,7 @@ publish_guest_fixture_artifacts() {
   fi
   mkdir -p "$LIVE_DIR"
   local artifact
-  for artifact in guest-inject-target.exe guest_inject_probe.dll guest_inject_imports.dll guest_inject_tls.dll guest_inject_rust.dll; do
+  for artifact in guest-inject-target.exe guest_inject_probe.dll guest_inject_imports.dll guest_inject_tls.dll guest_inject_sxs.dll guest_inject_rust.dll; do
     install -m 0644 "$source_dir/$artifact" "$LIVE_DIR/$artifact"
   done
 }
@@ -279,6 +280,7 @@ guest_fixture() {
   local cleanup="${DECANT_GUEST_CLEANUP:-resident}"
   local execution_method="${DECANT_GUEST_EXECUTION_METHOD:-iat-hook}"
   local vad_spoof="${DECANT_GUEST_VAD_SPOOF:-off}"
+  local sxs="${DECANT_GUEST_SXS:-skip}"
   local selected_payloads=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -300,6 +302,7 @@ guest_fixture() {
       --cleanup) cleanup="$2"; shift 2 ;;
       --execution-method) execution_method="$2"; shift 2 ;;
       --vad-spoof) vad_spoof="$2"; shift 2 ;;
+      --sxs) sxs="$2"; shift 2 ;;
       -h|--help) usage; return 0 ;;
       *) echo "unknown guest-fixture option: $1" >&2; exit 2 ;;
     esac
@@ -382,6 +385,7 @@ guest_fixture() {
       --cleanup "$cleanup"
       --execution-method "$execution_method"
       --vad-spoof "$vad_spoof"
+      --sxs "$sxs"
     )
     if [[ "$payload_name" == "guest_inject_rust.dll" ]]; then
       local rust_loader_metadata="$loader_metadata"

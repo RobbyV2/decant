@@ -16,6 +16,10 @@
 #define DECANT_PAYLOAD_TLS_CALLBACK 0
 #endif
 
+#ifndef DECANT_PAYLOAD_REQUIRE_ACTCTX
+#define DECANT_PAYLOAD_REQUIRE_ACTCTX 0
+#endif
+
 #define DECANT_TLS_MARKER UINT64_C(0x715CDECAB10C600D)
 
 static volatile uint64_t g_tls_marker = 0;
@@ -95,6 +99,12 @@ static void attach(void) {
     if (probe == 0 || !has_magic(probe)) {
         return;
     }
+#if DECANT_PAYLOAD_REQUIRE_ACTCTX
+    HANDLE actctx = 0;
+    if (!GetCurrentActCtx(&actctx) || actctx == 0 || actctx == INVALID_HANDLE_VALUE) {
+        return;
+    }
+#endif
 #if DECANT_PAYLOAD_TLS_CALLBACK
     if (g_tls_marker != DECANT_TLS_MARKER) {
         return;

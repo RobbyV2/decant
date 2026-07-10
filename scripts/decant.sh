@@ -28,6 +28,7 @@ Examples:
   MEMFLOW_PLUGIN_PATH=/opt/memflow scripts/decant.sh daemon --connector kvm --vm win10
   scripts/decant.sh guest-inject --pid 7800 --payload ./payload.dll --stage-base 0x1400013b0 --result-base 0x140022000
   scripts/decant.sh guest-inject --pid 7800 --payload ./payload.dll --final-protections section --loader-metadata best-effort --call-stack registered-unwind --permission-transitions write-through-final --thread-starts require-module-backed --image-backing sec-image
+  scripts/decant.sh guest-inject --pid 7800 --payload ./managed.dll --clr-assembly 'C:\\payloads\\managed.dll' --clr-class Example.Entry --clr-method Run --clr-argument '{}'
   scripts/decant.sh guest-unmap --config ./target/decant-run/guest-inject.toml
 
 Environment:
@@ -234,7 +235,7 @@ wine_run() {
 }
 
 guest_config() {
-  local config="$1" target_line="$2" payload="$3" stage="" result="" hook_module="$4" hook_function="$5" timeout="$6" dependency_policy="$9" loader_metadata="${10}" final_protections="${11}" call_stack="${12}" permission_transitions="${13}" thread_starts="${14}" image_backing="${15}" base_address="${16}" header_wipe="${17}" loader_entries="${18}" stack_shaping="${19}" cleanup="${20}" execution_method="${21}" vad_spoof="${22}" target_module="${23}" delay_loads="${24}" sxs="${25}" force_remap="${26}" high_memory="${27}" is_dependency="${28}" manual_module_registry="${29}" reserved_hex="${30}" map_callback_path="${31}" clr_assembly="${32}" clr_class="${33}" clr_method="${34}" clr_net_version="${35}"
+  local config="$1" target_line="$2" payload="$3" stage="" result="" hook_module="$4" hook_function="$5" timeout="$6" dependency_policy="$9" loader_metadata="${10}" final_protections="${11}" call_stack="${12}" permission_transitions="${13}" thread_starts="${14}" image_backing="${15}" base_address="${16}" header_wipe="${17}" loader_entries="${18}" stack_shaping="${19}" cleanup="${20}" execution_method="${21}" vad_spoof="${22}" target_module="${23}" delay_loads="${24}" sxs="${25}" force_remap="${26}" high_memory="${27}" is_dependency="${28}" manual_module_registry="${29}" reserved_hex="${30}" map_callback_path="${31}" clr_assembly="${32}" clr_class="${33}" clr_method="${34}" clr_argument="${35}" clr_net_version="${36}"
   stage="$7"
   result="$8"
   local target_module_line="" reserved_line="" callback_line="" clr_block=""
@@ -256,6 +257,9 @@ assembly_path = \"$(toml_escape "$clr_assembly")\"
 class_name = \"$(toml_escape "$clr_class")\"
 method_name = \"$(toml_escape "$clr_method")\"
 "
+    if [[ -n "$clr_argument" ]]; then
+      clr_block+="argument = \"$(toml_escape "$clr_argument")\""$'\n'
+    fi
     if [[ -n "$clr_net_version" ]]; then
       clr_block+="net_version = \"$(toml_escape "$clr_net_version")\""$'\n'
     fi
@@ -314,7 +318,7 @@ guest_inject() {
   local target_module="" delay_loads="resolve" sxs="skip"
   local force_remap="false" high_memory="false" is_dependency="false" manual_module_registry="off"
   local reserved_hex="" map_callback_path=""
-  local clr_assembly="" clr_class="" clr_method="" clr_net_version=""
+  local clr_assembly="" clr_class="" clr_method="" clr_argument="" clr_net_version=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --pid) pid="$2"; shift 2 ;;
@@ -354,6 +358,7 @@ guest_inject() {
       --clr-assembly) clr_assembly="$2"; shift 2 ;;
       --clr-class) clr_class="$2"; shift 2 ;;
       --clr-method) clr_method="$2"; shift 2 ;;
+      --clr-argument) clr_argument="$2"; shift 2 ;;
       --clr-net-version) clr_net_version="$2"; shift 2 ;;
       -h|--help) usage; return 0 ;;
       *) echo "unknown guest-inject option: $1" >&2; exit 2 ;;
@@ -374,12 +379,12 @@ guest_inject() {
       :process) target_line="process = \"$(toml_escape "$process")\"" ;;
       *) echo "guest-inject requires exactly one of --pid or --process" >&2; exit 2 ;;
     esac
-    if [[ -n "$clr_assembly$clr_class$clr_method$clr_net_version" ]] && [[ -z "$clr_assembly" || -z "$clr_class" || -z "$clr_method" ]]; then
+    if [[ -n "$clr_assembly$clr_class$clr_method$clr_argument$clr_net_version" ]] && [[ -z "$clr_assembly" || -z "$clr_class" || -z "$clr_method" ]]; then
       echo "--clr-assembly, --clr-class, and --clr-method must be provided together" >&2
       exit 2
     fi
     config="$STAGE/guest-inject.toml"
-    guest_config "$config" "$target_line" "$payload" "$hook_module" "$hook_function" "$timeout" "$stage" "$result" "$dependency_policy" "$loader_metadata" "$final_protections" "$call_stack" "$permission_transitions" "$thread_starts" "$image_backing" "$base_address" "$header_wipe" "$loader_entries" "$stack_shaping" "$cleanup" "$execution_method" "$vad_spoof" "$target_module" "$delay_loads" "$sxs" "$force_remap" "$high_memory" "$is_dependency" "$manual_module_registry" "$reserved_hex" "$map_callback_path" "$clr_assembly" "$clr_class" "$clr_method" "$clr_net_version"
+    guest_config "$config" "$target_line" "$payload" "$hook_module" "$hook_function" "$timeout" "$stage" "$result" "$dependency_policy" "$loader_metadata" "$final_protections" "$call_stack" "$permission_transitions" "$thread_starts" "$image_backing" "$base_address" "$header_wipe" "$loader_entries" "$stack_shaping" "$cleanup" "$execution_method" "$vad_spoof" "$target_module" "$delay_loads" "$sxs" "$force_remap" "$high_memory" "$is_dependency" "$manual_module_registry" "$reserved_hex" "$map_callback_path" "$clr_assembly" "$clr_class" "$clr_method" "$clr_argument" "$clr_net_version"
   fi
   "$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" --json guest-inject "$config"
 }
