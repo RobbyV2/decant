@@ -10,11 +10,12 @@ use decant_inject::DecantConfig;
 use decant_inject::guest::{
     GuestCapabilities, GuestInjectError, GuestInjectionPlan, GuestInjectionRequest, GuestInjector,
     GuestManualMapInjector, GuestMemoryBackend, GuestMemoryRegion, GuestModuleInfo,
-    GuestProcessInfo, unmap_all_tracked_modules,
+    GuestProcessInfo, inspect_iat_hook_candidates, probe_iat_hook_candidate,
+    unmap_all_tracked_modules,
 };
 use decant_protocol::{
-    Diagnostics, GuestInjectInfo, GuestUnmapInfo, Pid, ProtoError, Request, Response, read_msg,
-    write_msg,
+    Diagnostics, GuestIatHookInfo, GuestIatProbeInfo, GuestInjectInfo, GuestUnmapInfo, Pid,
+    ProtoError, Request, Response, read_msg, write_msg,
 };
 
 pub trait DaemonBackend: MemoryBackend + GuestMemoryBackend {}
@@ -74,6 +75,29 @@ where
     fn memory_map(&self, pid: Pid) -> decant_backend::Result<Vec<decant_protocol::MemRegion>> {
         self.backend.memory_map(pid)
     }
+
+    fn physical_memory_info(&self) -> decant_backend::Result<decant_protocol::PhysicalMemoryInfo> {
+        self.backend.physical_memory_info()
+    }
+
+    fn read_physical(&self, address: u64, length: usize) -> decant_backend::Result<Vec<u8>> {
+        self.backend.read_physical(address, length)
+    }
+
+    fn write_physical(&self, address: u64, data: &[u8]) -> decant_backend::Result<usize> {
+        self.backend.write_physical(address, data)
+    }
+
+    fn read_physical_scatter(
+        &self,
+        ranges: &[decant_protocol::PhysicalRead],
+    ) -> Vec<Option<Vec<u8>>> {
+        self.backend.read_physical_scatter(ranges)
+    }
+
+    fn write_physical_scatter(&self, ranges: &[decant_protocol::PhysicalWrite]) -> Vec<bool> {
+        self.backend.write_physical_scatter(ranges)
+    }
 }
 
 #[derive(Debug)]
@@ -105,6 +129,9 @@ impl Diag {
 }
 
 pub fn dispatch(req: Request, backend: &dyn DaemonBackend, diag: &Diag) -> Response {
+    const MAX_PHYSICAL_SCATTER_RANGES: usize = 16_384;
+    const MAX_PHYSICAL_RANGE_LEN: usize = 0x1000;
+
     fn finish<T>(
         r: decant_backend::Result<T>,
         ok: impl FnOnce(T) -> Response,
@@ -176,6 +203,38 @@ pub fn dispatch(req: Request, backend: &dyn DaemonBackend, diag: &Diag) -> Respo
             Response::MemoryMap,
             diag,
         ),
+        Request::PhysicalMemoryInfo => finish(
+            MemoryBackend::physical_memory_info(backend),
+            Response::PhysicalMemoryInfo,
+            diag,
+        ),
+        Request::PhysicalReadScatter(ranges) => {
+            if ranges.len() > MAX_PHYSICAL_SCATTER_RANGES
+                || ranges
+                    .iter()
+                    .any(|range| range.length as usize > MAX_PHYSICAL_RANGE_LEN)
+            {
+                return Response::Err(ProtoError::Backend {
+                    message: "physical scatter exceeds the LeechCore limits (16384 ranges, 4096 bytes each)".into(),
+                });
+            }
+            diag.reads.fetch_add(ranges.len() as u64, Ordering::Relaxed);
+            Response::PhysicalData(MemoryBackend::read_physical_scatter(backend, &ranges))
+        }
+        Request::PhysicalWriteScatter(ranges) => {
+            if ranges.len() > MAX_PHYSICAL_SCATTER_RANGES
+                || ranges
+                    .iter()
+                    .any(|range| range.data.len() > MAX_PHYSICAL_RANGE_LEN)
+            {
+                return Response::Err(ProtoError::Backend {
+                    message: "physical scatter exceeds the LeechCore limits (16384 ranges, 4096 bytes each)".into(),
+                });
+            }
+            diag.writes
+                .fetch_add(ranges.len() as u64, Ordering::Relaxed);
+            Response::PhysicalWritten(MemoryBackend::write_physical_scatter(backend, &ranges))
+        }
         Request::Scan { pid, pattern } => {
             match decant_analysis::scanner::scan_str(backend, pid, &pattern) {
                 Ok(hits) => Response::ScanHits(hits),
@@ -197,11 +256,60 @@ pub fn dispatch(req: Request, backend: &dyn DaemonBackend, diag: &Diag) -> Respo
             payload_image,
         } => guest_inject(&config_toml, &payload_image, backend, diag),
         Request::GuestUnmap { config_toml } => guest_unmap(&config_toml, backend, diag),
+        Request::GuestIatHooks { pid, module } => {
+            let guest: &dyn GuestMemoryBackend = backend;
+            match inspect_iat_hook_candidates(guest, pid.0, module.as_deref()) {
+                Ok(candidates) => Response::GuestIatHooks(
+                    candidates.into_iter().map(guest_iat_hook_info).collect(),
+                ),
+                Err(err) => guest_error(err, diag),
+            }
+        }
+        Request::GuestIatProbe {
+            pid,
+            source_module,
+            import_module,
+            symbol,
+            stage_base,
+            result_base,
+            timeout_ms,
+        } => {
+            let guest: &dyn GuestMemoryBackend = backend;
+            match probe_iat_hook_candidate(
+                guest,
+                pid.0,
+                &source_module,
+                &import_module,
+                &symbol,
+                stage_base,
+                result_base,
+                timeout_ms,
+            ) {
+                Ok(probe) => Response::GuestIatProbe(GuestIatProbeInfo {
+                    candidate: guest_iat_hook_info(probe.candidate),
+                    observed: probe.observed,
+                    servicing_tid: probe.servicing_tid,
+                    timeout_ms: probe.timeout_ms,
+                }),
+                Err(err) => guest_error(err, diag),
+            }
+        }
         Request::ReportUnsupported { op } => {
             diag.unsupported_ops.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(%op, "unsupported operation refused at the interposer");
             Response::Pong
         }
+    }
+}
+
+fn guest_iat_hook_info(candidate: decant_inject::guest::GuestIatHookCandidate) -> GuestIatHookInfo {
+    GuestIatHookInfo {
+        source_module: candidate.source_module,
+        import_module: candidate.import_module,
+        symbol: candidate.symbol,
+        iat_slot: candidate.iat_slot,
+        original_target: candidate.original_target,
+        priority: candidate.priority,
     }
 }
 
@@ -220,6 +328,7 @@ where
             memory_map: true,
             virtual_alloc: true,
             iat_hook_execution: true,
+            iat_hook_stage_restore: false,
             wait_for_result: true,
             forwarded_exports: true,
             ordinal_imports: true,
@@ -484,5 +593,29 @@ mod tests {
             resp,
             Response::Err(ProtoError::NoSuchProcess { .. })
         ));
+    }
+
+    #[test]
+    fn mock_backend_rejects_raw_physical_access_cleanly() {
+        let b = BasicDaemonBackend::new(demo_backend());
+        let resp = dispatch(Request::PhysicalMemoryInfo, &b, &diag());
+        assert!(matches!(
+            resp,
+            Response::Err(ProtoError::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn physical_scatter_enforces_leechcore_range_size() {
+        let b = BasicDaemonBackend::new(demo_backend());
+        let resp = dispatch(
+            Request::PhysicalReadScatter(vec![decant_protocol::PhysicalRead {
+                address: 0,
+                length: 0x1001,
+            }]),
+            &b,
+            &diag(),
+        );
+        assert!(matches!(resp, Response::Err(ProtoError::Backend { .. })));
     }
 }

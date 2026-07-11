@@ -38,10 +38,20 @@ __attribute__((used)) static volatile decant_probe_t g_probe = {
     .tls_callback_fired = 0,
 };
 
+__attribute__((used)) static volatile decant_diagnostic_mailbox_t g_diagnostics = {
+    .magic = DECANT_GUEST_DIAGNOSTIC_BYTES,
+    .request = 0,
+    .request_id = 0,
+    .completed_id = 0,
+    .status = DECANT_GUEST_DIAGNOSTIC_STATUS_IDLE,
+    .tick = 0,
+    .payload = {0},
+};
+
 __attribute__((used)) static volatile uint8_t g_fixture_version[16] =
     DECANT_GUEST_FIXTURE_VERSION_BYTES;
 
-__attribute__((used)) static volatile uint8_t g_iat_result[16] =
+__attribute__((used)) static volatile uint8_t g_iat_result[24] =
     DECANT_GUEST_RESULT_BYTES;
 
 static DWORD c_len(const char *s) {
@@ -77,6 +87,100 @@ static void write_hex_line(const char *label, uint64_t value) {
     write_all("0x");
     write_all(hex);
     write_all("\r\n");
+}
+
+static void diagnostic_payload(const char *text) {
+    for (DWORD i = 0; i < sizeof(g_diagnostics.payload); i++) {
+        char c = text[i];
+        g_diagnostics.payload[i] = (uint8_t)c;
+        if (c == 0) {
+            return;
+        }
+    }
+    g_diagnostics.payload[sizeof(g_diagnostics.payload) - 1] = 0;
+}
+
+static int diagnostic_file_io_roundtrip(void) {
+    static const char file_name[] = "decant-guest-diagnostics.txt";
+    static const char contents[] = "DECANT guest diagnostics file round-trip\r\n";
+    char path[MAX_PATH] = {0};
+    DWORD path_len = GetTempPathA((DWORD)sizeof(path), path);
+    if (path_len == 0 || path_len >= sizeof(path)) {
+        return 0;
+    }
+    for (DWORD i = 0; i < sizeof(file_name); i++) {
+        if (path_len + i >= sizeof(path)) {
+            return 0;
+        }
+        path[path_len + i] = file_name[i];
+    }
+
+    HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (file == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    DWORD written = 0;
+    BOOL wrote = WriteFile(file, contents, sizeof(contents) - 1, &written, 0);
+    CloseHandle(file);
+    if (!wrote || written != sizeof(contents) - 1) {
+        return 0;
+    }
+
+    file = CreateFileA(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        0,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        0
+    );
+    if (file == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    char readback[sizeof(contents)] = {0};
+    DWORD read = 0;
+    BOOL read_ok = ReadFile(file, readback, sizeof(contents) - 1, &read, 0);
+    CloseHandle(file);
+    if (!read_ok || read != sizeof(contents) - 1) {
+        return 0;
+    }
+    for (DWORD i = 0; i < sizeof(contents) - 1; i++) {
+        if (readback[i] != contents[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void service_diagnostics(void) {
+    uint64_t request_id = g_diagnostics.request_id;
+    if (request_id == 0 || request_id == g_diagnostics.completed_id) {
+        return;
+    }
+
+    g_diagnostics.status = DECANT_GUEST_DIAGNOSTIC_STATUS_BUSY;
+    switch (g_diagnostics.request) {
+    case DECANT_GUEST_DIAGNOSTIC_PING:
+        diagnostic_payload("fixture diagnostic ping ok");
+        g_diagnostics.status = DECANT_GUEST_DIAGNOSTIC_STATUS_OK;
+        break;
+    case DECANT_GUEST_DIAGNOSTIC_FILE_IO:
+        if (diagnostic_file_io_roundtrip()) {
+            diagnostic_payload("fixture diagnostic file io ok");
+            g_diagnostics.status = DECANT_GUEST_DIAGNOSTIC_STATUS_OK;
+        } else {
+            diagnostic_payload("fixture diagnostic file io failed");
+            g_diagnostics.status = DECANT_GUEST_DIAGNOSTIC_STATUS_FAILED;
+        }
+        break;
+    default:
+        diagnostic_payload("fixture diagnostic unsupported request");
+        g_diagnostics.status = DECANT_GUEST_DIAGNOSTIC_STATUS_BAD_REQUEST;
+        break;
+    }
+    g_diagnostics.tick++;
+    g_diagnostics.completed_id = request_id;
 }
 
 static DWORD WINAPI hijack_worker(LPVOID param) {
@@ -144,6 +248,7 @@ static void print_status(void) {
     write_hex_line("  dll_marker @  : ", (uint64_t)(uintptr_t)&g_probe.dll_marker);
     write_hex_line("  stub @        : ", (uint64_t)(uintptr_t)&decant_guest_inject_stage);
     write_hex_line("  result @      : ", (uint64_t)(uintptr_t)&g_iat_result);
+    write_hex_line("  diagnostics @ : ", (uint64_t)(uintptr_t)&g_diagnostics);
     write_hex_line("  apc_result @  : ", (uint64_t)(uintptr_t)&g_probe.apc_result);
     write_hex_line("  hijack_result @: ", (uint64_t)(uintptr_t)&g_probe.hijack_result);
     write_hex_line("  rt_result @   : ", (uint64_t)(uintptr_t)&g_probe.remote_thread_result);
@@ -157,7 +262,7 @@ static void print_status(void) {
     write_hex_line("  dll_count     : ", g_probe.dll_count);
     write_hex_line("  expected mark : ", DECANT_DLL_MARKER);
     write_all("  magic AOB     : 44 45 43 41 4E 54 3A 3A 47 55 45 53 54 49 4E 4A\r\n");
-    write_all("  fixture AOB   : 44 45 43 41 4E 54 3A 3A 47 49 4E 4A 30 30 30 37\r\n");
+    write_all("  fixture AOB   : 44 45 43 41 4E 54 3A 3A 47 49 4E 4A 30 30 30 38\r\n");
     write_all("  stub AOB      : 44 45 43 41 4E 54 3A 3A 53 54 55 42 30 30 30 34\r\n");
     write_all("  result AOB    : 44 45 43 41 4E 54 3A 3A 52 45 53 55 4C 54 30 34\r\n");
 }
@@ -186,6 +291,7 @@ static void resident(void) {
     print_status();
     for (;;) {
         g_probe.tick++;
+        service_diagnostics();
         if (g_probe.dll_marker == DECANT_DLL_MARKER && !observed) {
             observed = 1;
             write_all("guest-inject-target: dll marker observed\r\n");
@@ -203,6 +309,7 @@ static void resident_cached_sleep(void) {
     for (;;) {
         sleep_fn_t fn = g_cached_sleep;
         g_probe.tick++;
+        service_diagnostics();
         if (g_probe.dll_marker == DECANT_DLL_MARKER && !observed) {
             observed = 1;
             write_all("guest-inject-target: dll marker observed\r\n");

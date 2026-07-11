@@ -41,6 +41,31 @@ pub struct MemRegion {
     pub executable: bool,
 }
 
+/// Capabilities of the connector's raw physical-memory address space.
+///
+/// This is intentionally separate from [`MemRegion`], which describes a
+/// process's virtual address space. Consumers such as MemProcFS need the raw
+/// connector metadata so they can perform their own page-table translation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhysicalMemoryInfo {
+    pub max_address: u64,
+    pub real_size: u64,
+    pub readonly: bool,
+    pub ideal_batch_size: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhysicalRead {
+    pub address: u64,
+    pub length: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhysicalWrite {
+    pub address: u64,
+    pub data: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Diagnostics {
     pub connector: String,
@@ -61,6 +86,24 @@ pub struct GuestInjectInfo {
 pub struct GuestUnmapInfo {
     pub pid: Pid,
     pub modules_unmapped: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestIatHookInfo {
+    pub source_module: String,
+    pub import_module: String,
+    pub symbol: String,
+    pub iat_slot: u64,
+    pub original_target: u64,
+    pub priority: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestIatProbeInfo {
+    pub candidate: GuestIatHookInfo,
+    pub observed: bool,
+    pub servicing_tid: Option<u32>,
+    pub timeout_ms: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +181,9 @@ pub enum Request {
         data: Vec<u8>,
     },
     MemoryMap(Pid),
+    PhysicalMemoryInfo,
+    PhysicalReadScatter(Vec<PhysicalRead>),
+    PhysicalWriteScatter(Vec<PhysicalWrite>),
     Diagnostics,
     Scan {
         pid: Pid,
@@ -154,6 +200,19 @@ pub enum Request {
     },
     GuestUnmap {
         config_toml: String,
+    },
+    GuestIatHooks {
+        pid: Pid,
+        module: Option<String>,
+    },
+    GuestIatProbe {
+        pid: Pid,
+        source_module: String,
+        import_module: String,
+        symbol: String,
+        stage_base: Option<u64>,
+        result_base: Option<u64>,
+        timeout_ms: u32,
     },
     ReportUnsupported {
         op: String,
@@ -173,9 +232,12 @@ impl Request {
                 | Request::ModuleExports(_, _)
                 | Request::Read { .. }
                 | Request::MemoryMap(_)
+                | Request::PhysicalMemoryInfo
+                | Request::PhysicalReadScatter(_)
                 | Request::Diagnostics
                 | Request::Scan { .. }
                 | Request::Resolve { .. }
+                | Request::GuestIatHooks { .. }
         )
     }
 }
@@ -191,12 +253,22 @@ pub enum Response {
     Data(Vec<u8>),
     Written(u64),
     MemoryMap(Vec<MemRegion>),
+    PhysicalMemoryInfo(PhysicalMemoryInfo),
+    /// One entry per requested range. `None` means that range was unreadable.
+    PhysicalData(Vec<Option<Vec<u8>>>),
+    /// One entry per requested range.
+    PhysicalWritten(Vec<bool>),
     Diagnostics(Diagnostics),
     Err(ProtoError),
     ScanHits(Vec<u64>),
-    Resolved { address: u64, value: Vec<u8> },
+    Resolved {
+        address: u64,
+        value: Vec<u8>,
+    },
     GuestInjected(GuestInjectInfo),
     GuestUnmapped(GuestUnmapInfo),
+    GuestIatHooks(Vec<GuestIatHookInfo>),
+    GuestIatProbe(GuestIatProbeInfo),
 }
 
 pub const MAX_MSG_LEN: u32 = 64 * 1024 * 1024;
@@ -277,6 +349,15 @@ mod tests {
             data: vec![1, 2, 3, 4],
         });
         roundtrip_req(Request::MemoryMap(Pid(7)));
+        roundtrip_req(Request::PhysicalMemoryInfo);
+        roundtrip_req(Request::PhysicalReadScatter(vec![PhysicalRead {
+            address: 0x1000,
+            length: 0x1000,
+        }]));
+        roundtrip_req(Request::PhysicalWriteScatter(vec![PhysicalWrite {
+            address: 0x2000,
+            data: vec![1, 2, 3, 4],
+        }]));
         roundtrip_req(Request::Diagnostics);
         roundtrip_req(Request::Scan {
             pid: Pid(7),
@@ -293,6 +374,19 @@ mod tests {
         });
         roundtrip_req(Request::GuestUnmap {
             config_toml: "[injection]\ndomain = \"guest\"\nmethod = \"manual-map\"\n".into(),
+        });
+        roundtrip_req(Request::GuestIatHooks {
+            pid: Pid(7),
+            module: Some("xul.dll".into()),
+        });
+        roundtrip_req(Request::GuestIatProbe {
+            pid: Pid(7),
+            source_module: "mozglue.dll".into(),
+            import_module: "api-ms-win-core-synch-l1-2-0.dll".into(),
+            symbol: "Sleep".into(),
+            stage_base: Some(0x1400_0010_0000),
+            result_base: None,
+            timeout_ms: 500,
         });
         roundtrip_req(Request::ReportUnsupported {
             op: "VirtualAllocEx".into(),
@@ -330,6 +424,14 @@ mod tests {
             writable: true,
             executable: false,
         }]));
+        roundtrip_resp(Response::PhysicalMemoryInfo(PhysicalMemoryInfo {
+            max_address: 0x3fff_ffff,
+            real_size: 0x4000_0000,
+            readonly: false,
+            ideal_batch_size: 128,
+        }));
+        roundtrip_resp(Response::PhysicalData(vec![Some(vec![0x4d, 0x5a]), None]));
+        roundtrip_resp(Response::PhysicalWritten(vec![true, false]));
         roundtrip_resp(Response::Diagnostics(Diagnostics::default()));
         roundtrip_resp(Response::Err(ProtoError::Unsupported {
             op: "VirtualAllocEx".into(),
@@ -348,6 +450,27 @@ mod tests {
         roundtrip_resp(Response::GuestUnmapped(GuestUnmapInfo {
             pid: Pid(7),
             modules_unmapped: 2,
+        }));
+        roundtrip_resp(Response::GuestIatHooks(vec![GuestIatHookInfo {
+            source_module: "mozglue.dll".into(),
+            import_module: "kernel32.dll".into(),
+            symbol: "Sleep".into(),
+            iat_slot: 0x1000,
+            original_target: 0x2000,
+            priority: 100,
+        }]));
+        roundtrip_resp(Response::GuestIatProbe(GuestIatProbeInfo {
+            candidate: GuestIatHookInfo {
+                source_module: "mozglue.dll".into(),
+                import_module: "kernel32.dll".into(),
+                symbol: "Sleep".into(),
+                iat_slot: 0x1000,
+                original_target: 0x2000,
+                priority: 100,
+            },
+            observed: true,
+            servicing_tid: Some(1234),
+            timeout_ms: 500,
         }));
     }
 
@@ -401,6 +524,25 @@ mod tests {
         assert!(
             !Request::GuestUnmap {
                 config_toml: String::new(),
+            }
+            .retry_safe()
+        );
+        assert!(
+            !Request::GuestIatProbe {
+                pid: Pid(7),
+                source_module: "a.dll".into(),
+                import_module: "kernel32.dll".into(),
+                symbol: "Sleep".into(),
+                stage_base: None,
+                result_base: None,
+                timeout_ms: 1,
+            }
+            .retry_safe()
+        );
+        assert!(
+            Request::GuestIatHooks {
+                pid: Pid(7),
+                module: None,
             }
             .retry_safe()
         );

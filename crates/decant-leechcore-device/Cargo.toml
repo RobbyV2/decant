@@ -1,0 +1,22 @@
+[package]
+name = "decant-leechcore-device"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "LeechCore physical-memory device plugin backed by a Decant daemon."
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+name = "leechcore_device_decant"
+crate-type = ["cdylib"]
+
+[dependencies]
+decant-client.workspace = true
+decant-protocol.workspace = true
+
+[build-dependencies]
+cc = "1"

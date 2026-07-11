@@ -505,6 +505,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "decant-leechcore-device"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "decant-client",
+ "decant-protocol",
+]
+
+[[package]]
 name = "decant-memflow"
 version = "0.1.0"
 dependencies = [

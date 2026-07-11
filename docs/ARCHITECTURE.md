@@ -48,6 +48,9 @@ outside via [memflow](https://github.com/memflow/memflow).
 - **MemflowBackend** (`decant-memflow`): reads guest physical RAM through a QEMU/KVM
   connector, resolving it into virtual-memory reads, process/module enumeration, and
   export tables. A `MemoryBackend` implementor.
+- **LeechCore device** (`decant-leechcore-device`): an optional raw physical-memory client
+  used by MemProcFS consumers such as Orpheus. It batches LeechCore scatter requests over
+  the daemon protocol; MemProcFS performs its own Windows analysis on the returned RAM.
 - **The carafe** (`decant-interpose`): the DLL loaded into the tool under Wine. It
   intercepts the Win32/NT memory and introspection exports, marshals each to the cellar,
   maintains a synthetic handle table, synthesizes process/module snapshots from daemon

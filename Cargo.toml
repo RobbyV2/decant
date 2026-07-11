@@ -22,6 +22,7 @@ members = [
     "crates/decant-wine-harness",
     "crates/decant-interpose",
     "crates/decant-inject",
+    "crates/decant-leechcore-device",
     "testbins/guest-target",
     "testbins/sample-tool",
     "testbins/decant-launcher",
@@ -50,6 +51,7 @@ default-members = [
     "crates/decant-wine-harness",
     "crates/decant-interpose",
     "crates/decant-inject",
+    "crates/decant-leechcore-device",
 ]
 
 [workspace.package]

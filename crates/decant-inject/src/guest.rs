@@ -11,12 +11,21 @@ use crate::{DecantConfig, InjectError, InjectionDomain, Method};
 const DEFAULT_HOOK_MODULE: &str = "kernel32.dll";
 const DEFAULT_HOOK_FUNCTION: &str = "Sleep";
 const STAGE_CAVE_SIZE: usize = 0x400;
+const DEFAULT_IAT_STAGE_POOL_SLOTS: u32 = 1024;
+const IAT_STAGE_POOL_MAGIC: [u8; 16] = *b"DECANT::IATPOOL3";
+const IAT_STAGE_POOL_HEADER_SIZE: usize = 24;
 const STAGE_RESULT_OFFSET: u64 = 0x20;
 const STAGE_STUB_OFFSET: u64 = 0x100;
 const STAGE_SCRATCH_OFFSET: u64 = 0x300;
 const STAGE_UNWIND_OFFSET: u64 = 0x3E0;
 const STAGE_SCRATCH_SIZE: usize = (STAGE_UNWIND_OFFSET - STAGE_SCRATCH_OFFSET) as usize;
 const GUEST_PAGE_SIZE: usize = 0x1000;
+// Out-of-band KVM writes cannot fault in a Windows demand-zero page. Keep a
+// nonzero byte in a reserved region of every pool page so each stage slot is
+// externally writable after the bootstrap completes.
+const IAT_STAGE_POOL_SLOTS_PER_PAGE: u32 = (GUEST_PAGE_SIZE / STAGE_CAVE_SIZE) as u32 - 1;
+const IAT_STAGE_POOL_CANARY_OFFSET: u64 = (GUEST_PAGE_SIZE - STAGE_CAVE_SIZE) as u64;
+const IAT_STAGE_POOL_CANARY_VALUE: u8 = 0xA5;
 const SCAN_CHUNK: u64 = 0x10000;
 const SPOOFED_RETURN_SCAN_LIMIT: u64 = 0x40000;
 const SPOOFED_CALL_LANDING_DELTA: u64 = 46;
@@ -34,7 +43,14 @@ const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
 const IMAGE_SCN_MEM_DISCARDABLE: u32 = 0x0200_0000;
 const RESULT_RUNNING: u64 = 1;
 const RESULT_STATE: u64 = 2;
-const RESULT_BLOCK_SIZE: usize = 16;
+const RESULT_INFLIGHT_OFFSET: u64 = 16;
+const RESULT_BLOCK_SIZE: usize = 24;
+const IAT_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(1);
+const IAT_QUIESCENCE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const IAT_RESTORE_GRACE: Duration = Duration::from_millis(10);
+const MAX_IAT_IMPORT_DESCRIPTORS: usize = 2048;
+const MAX_IAT_IMPORTS_PER_MODULE: usize = 16384;
+const MAX_IAT_HOOK_CANDIDATES: usize = 32768;
 const OLD_PROTECT_RESULT_OFFSET: u64 = 12;
 const MAX_EXPORT_FORWARD_DEPTH: usize = 8;
 const EXPORT_HEADER_RETRIES: usize = 20;
@@ -48,6 +64,21 @@ const SYSCALL_STUB_OPCODE: u8 = 0xB8;
 
 static ACTIVE_GUEST_INJECTIONS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 static MANUAL_MODULE_REGISTRY: OnceLock<Mutex<HashMap<(u32, u64), ModuleRecord>>> = OnceLock::new();
+static IAT_STAGE_POOLS: OnceLock<Mutex<HashMap<IatStagePoolKey, IatStagePool>>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct IatStagePoolKey {
+    pid: u32,
+    iat_slot: u64,
+    bootstrap_stub_addr: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IatStagePool {
+    base: u64,
+    slots: u32,
+    next_slot: u32,
+}
 
 #[derive(Clone, Debug)]
 struct ModuleRecord {
@@ -95,6 +126,10 @@ fn default_hook_module() -> String {
 
 fn default_hook_function() -> String {
     DEFAULT_HOOK_FUNCTION.into()
+}
+
+fn default_iat_stage_pool_slots() -> u32 {
+    DEFAULT_IAT_STAGE_POOL_SLOTS
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -513,6 +548,8 @@ pub struct GuestInjectionConfig {
     pub result_base: Option<u64>,
     #[serde(default)]
     pub result_pattern: Option<String>,
+    #[serde(default = "default_iat_stage_pool_slots")]
+    pub iat_stage_pool_slots: u32,
     #[serde(default = "default_hook_module")]
     pub hook_module: String,
     #[serde(default = "default_hook_function")]
@@ -674,6 +711,7 @@ pub struct GuestInjectionPlan {
     pub stage_pattern: Option<GuestBytePattern>,
     pub result_base: Option<u64>,
     pub result_pattern: Option<GuestBytePattern>,
+    pub iat_stage_pool_slots: u32,
     pub hook_module: String,
     pub hook_function: String,
     pub execution: GuestExecutionConfig,
@@ -797,6 +835,10 @@ impl GuestInjectionPlan {
                 Some(pattern) => Some(parse_hex_pattern(pattern, "guest.result_pattern")?),
                 None => None,
             },
+            iat_stage_pool_slots: match config.guest.iat_stage_pool_slots {
+                0 => default_iat_stage_pool_slots(),
+                slots => slots,
+            },
             hook_module: config.guest.hook_module.clone(),
             hook_function: config.guest.hook_function.clone(),
             execution: config.guest.execution.clone(),
@@ -841,6 +883,19 @@ pub struct GuestCapabilities {
     pub virtual_free: bool,
     pub protect_memory: bool,
     pub iat_hook_execution: bool,
+    /// The backend can prove no target thread can execute a previously fetched
+    /// IAT target while staging bytes are restored.
+    ///
+    /// This requires a real target-thread barrier. Memory-only backends must
+    /// leave it false and retain a completed pass-through stub instead.
+    pub iat_hook_stage_restore: bool,
+    /// Executes guest stubs without waiting for an imported target function.
+    ///
+    /// A backend advertising this must override the IAT-named execution helpers
+    /// below and treat `GuestIatHook::stub_addr` / `result_addr` as its staging
+    /// contract. This keeps the mapper transport-agnostic while retaining the
+    /// existing IAT-hook fallback for memory-only backends.
+    pub independent_execution: bool,
     pub deterministic_execution: bool,
     pub thread_context: bool,
     pub queue_apc: bool,
@@ -878,6 +933,8 @@ impl GuestCapabilities {
             virtual_free: false,
             protect_memory: false,
             iat_hook_execution: true,
+            iat_hook_stage_restore: false,
+            independent_execution: true,
             deterministic_execution: false,
             thread_context: true,
             queue_apc: true,
@@ -911,7 +968,10 @@ impl GuestCapabilities {
             (self.write_verify, "write-verify"),
             (self.memory_map, "memory-map"),
             (self.virtual_alloc, "virtual-alloc"),
-            (self.iat_hook_execution, "iat-hook-execution"),
+            (
+                self.iat_hook_execution || self.independent_execution,
+                "execution-bootstrap",
+            ),
             (self.wait_for_result, "wait-for-result"),
             (self.forwarded_exports, "forwarded-exports"),
             (self.ordinal_imports, "ordinal-imports"),
@@ -1176,6 +1236,43 @@ impl From<InjectError> for GuestInjectError {
     }
 }
 
+fn independent_execution_override_required(operation: &'static str) -> GuestInjectError {
+    GuestInjectError::Unsupported {
+        operation: "independent guest execution",
+        reason: format!(
+            "backend advertised independent_execution but did not override {operation}; refusing to fall back to an IAT hook"
+        ),
+    }
+}
+
+fn find_rx_code_cave(
+    backend: &dyn GuestMemoryBackend,
+    pid: u32,
+    size: usize,
+) -> Result<u64, GuestInjectError> {
+    for region in backend.memory_map(pid)? {
+        if !region.readable || !region.executable || region.size < size as u64 {
+            continue;
+        }
+        let mut pos = 0u64;
+        while pos < region.size {
+            let len = (region.size - pos).min(0x10000 + size as u64) as usize;
+            let addr = region.base + pos;
+            if let Ok(bytes) = backend.read(pid, addr, len) {
+                if let Some(off) = find_code_cave(&bytes, size) {
+                    let cave = addr + off as u64;
+                    tracing::debug!(pid, cave = format_args!("{cave:#x}"), "found RX code cave");
+                    return Ok(cave);
+                }
+            }
+            pos += 0x10000;
+        }
+    }
+    Err(GuestInjectError::Backend(
+        "no RX code cave found in process memory".into(),
+    ))
+}
+
 pub trait GuestMemoryBackend {
     fn capabilities(&self) -> GuestCapabilities;
     fn list_processes(&self) -> Result<Vec<GuestProcessInfo>, GuestInjectError>;
@@ -1197,7 +1294,13 @@ pub trait GuestMemoryBackend {
         args: &[u64],
         timeout_ms: u32,
     ) -> Result<u64, GuestInjectError> {
-        memory_iat_call(self, pid, hook, function, args, timeout_ms)
+        if self.capabilities().independent_execution {
+            return Err(independent_execution_override_required(
+                "guest function call",
+            ));
+        }
+        let slot = reserve_iat_stage_slot(pid, hook)?;
+        memory_iat_call(self, pid, &slot, function, args, timeout_ms)
     }
 
     fn touch_iat_hook(
@@ -1208,7 +1311,11 @@ pub trait GuestMemoryBackend {
         len: usize,
         timeout_ms: u32,
     ) -> Result<(), GuestInjectError> {
-        memory_iat_touch(self, pid, hook, addr, len, timeout_ms)
+        if self.capabilities().independent_execution {
+            return Err(independent_execution_override_required("guest page touch"));
+        }
+        let slot = reserve_iat_stage_slot(pid, hook)?;
+        memory_iat_touch(self, pid, &slot, addr, len, timeout_ms)
     }
 
     fn read_touch_iat_hook(
@@ -1219,7 +1326,13 @@ pub trait GuestMemoryBackend {
         len: usize,
         timeout_ms: u32,
     ) -> Result<(), GuestInjectError> {
-        memory_iat_read_touch(self, pid, hook, addr, len, timeout_ms)
+        if self.capabilities().independent_execution {
+            return Err(independent_execution_override_required(
+                "guest read page touch",
+            ));
+        }
+        let slot = reserve_iat_stage_slot(pid, hook)?;
+        memory_iat_read_touch(self, pid, &slot, addr, len, timeout_ms)
     }
 
     fn preserve_touch_iat_hook(
@@ -1230,7 +1343,13 @@ pub trait GuestMemoryBackend {
         len: usize,
         timeout_ms: u32,
     ) -> Result<(), GuestInjectError> {
-        memory_iat_preserve_touch(self, pid, hook, addr, len, timeout_ms)
+        if self.capabilities().independent_execution {
+            return Err(independent_execution_override_required(
+                "guest preserve page touch",
+            ));
+        }
+        let slot = reserve_iat_stage_slot(pid, hook)?;
+        memory_iat_preserve_touch(self, pid, &slot, addr, len, timeout_ms)
     }
 
     fn spoof_vad_type(&self, _pid: u32, _base: u64, _size: u64) -> Result<(), GuestInjectError> {
@@ -1537,8 +1656,276 @@ pub struct GuestIatHook {
     pub original_target: u64,
     pub stub_addr: u64,
     pub result_addr: u64,
+    /// Whether this stub may restore `iat_slot` from guest mode.
+    ///
+    /// This requires both a writable page and a backend execution barrier.
+    /// Memory-only backends restore the slot from the host transaction instead,
+    /// because they cannot synchronize a guest write with an external patch.
+    pub iat_slot_guest_writable: bool,
     pub call_stack: GuestCallStackPolicy,
     pub spoofed_return: Option<GuestSpoofedReturn>,
+}
+
+fn iat_stage_pool_key(pid: u32, hook: &GuestIatHook) -> IatStagePoolKey {
+    IatStagePoolKey {
+        pid,
+        iat_slot: hook.iat_slot,
+        bootstrap_stub_addr: hook.stub_addr,
+    }
+}
+
+fn activate_iat_stage_pool(
+    pid: u32,
+    hook: &GuestIatHook,
+    base: u64,
+    slots: u32,
+) -> Result<(), GuestInjectError> {
+    if slots == 0 {
+        return Err(GuestInjectError::Config(
+            "guest.iat_stage_pool_slots must be greater than zero".into(),
+        ));
+    }
+    let key = iat_stage_pool_key(pid, hook);
+    let pools = IAT_STAGE_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut pools = pools.lock().map_err(|_| {
+        GuestInjectError::Backend("guest IAT stage-pool registry lock was poisoned".into())
+    })?;
+    if pools
+        .insert(
+            key,
+            IatStagePool {
+                base,
+                slots,
+                next_slot: 0,
+            },
+        )
+        .is_some()
+    {
+        return Err(GuestInjectError::Backend(format!(
+            "guest IAT stage pool already exists for pid {pid} and IAT slot {:#x}",
+            hook.iat_slot
+        )));
+    }
+    Ok(())
+}
+
+fn iat_stage_pool_header(slots: u32) -> [u8; IAT_STAGE_POOL_HEADER_SIZE] {
+    let mut header = [0u8; IAT_STAGE_POOL_HEADER_SIZE];
+    header[..IAT_STAGE_POOL_MAGIC.len()].copy_from_slice(&IAT_STAGE_POOL_MAGIC);
+    header[16..24].copy_from_slice(&u64::from(slots).to_le_bytes());
+    header
+}
+
+fn iat_stage_pool_page_count(slots: u32) -> Result<u64, GuestInjectError> {
+    if slots == 0 {
+        return Err(GuestInjectError::Config(
+            "guest.iat_stage_pool_slots must be greater than zero".into(),
+        ));
+    }
+    Ok(u64::from(slots).div_ceil(u64::from(IAT_STAGE_POOL_SLOTS_PER_PAGE)))
+}
+
+fn iat_stage_pool_size(slots: u32) -> Result<u64, GuestInjectError> {
+    iat_stage_pool_page_count(slots)?
+        .checked_mul(GUEST_PAGE_SIZE as u64)
+        .ok_or_else(|| GuestInjectError::Config("guest IAT stage-pool size overflows".into()))
+}
+
+fn iat_stage_pool_slot_offset(slot: u32) -> Result<u64, GuestInjectError> {
+    let page = u64::from(slot / IAT_STAGE_POOL_SLOTS_PER_PAGE);
+    let slot_in_page = u64::from(slot % IAT_STAGE_POOL_SLOTS_PER_PAGE);
+    page.checked_mul(GUEST_PAGE_SIZE as u64)
+        .and_then(|offset| {
+            slot_in_page
+                .checked_mul(STAGE_CAVE_SIZE as u64)
+                .and_then(|slot_offset| offset.checked_add(slot_offset))
+        })
+        .ok_or_else(|| {
+            GuestInjectError::Backend("guest IAT stage-pool slot offset overflows".into())
+        })
+}
+
+fn recover_iat_stage_pool(
+    backend: &dyn GuestMemoryBackend,
+    pid: u32,
+    hook: &GuestIatHook,
+) -> Result<Option<u64>, GuestInjectError> {
+    let key = iat_stage_pool_key(pid, hook);
+    if let Some(pools) = IAT_STAGE_POOLS.get() {
+        let pool = pools
+            .lock()
+            .map_err(|_| {
+                GuestInjectError::Backend("guest IAT stage-pool registry lock was poisoned".into())
+            })?
+            .get(&key)
+            .copied();
+        if let Some(pool) = pool {
+            let header = backend.read(pid, pool.base, IAT_STAGE_POOL_HEADER_SIZE)?;
+            if header == iat_stage_pool_header(pool.slots) {
+                return Ok(Some(pool.base));
+            }
+            let mut pools = pools.lock().map_err(|_| {
+                GuestInjectError::Backend("guest IAT stage-pool registry lock was poisoned".into())
+            })?;
+            pools.remove(&key);
+        }
+    }
+
+    let pattern = GuestBytePattern {
+        bytes: IAT_STAGE_POOL_MAGIC.iter().copied().map(Some).collect(),
+    };
+    let Some(base) = find_writable_pattern(backend, pid, &pattern)? else {
+        return Ok(None);
+    };
+    let header = backend.read(pid, base, IAT_STAGE_POOL_HEADER_SIZE)?;
+    let slots = u64::from_le_bytes(header[16..24].try_into().unwrap());
+    let slots = u32::try_from(slots).map_err(|_| {
+        GuestInjectError::Backend("guest IAT stage-pool header has an invalid slot count".into())
+    })?;
+    if slots == 0 || header != iat_stage_pool_header(slots) {
+        return Err(GuestInjectError::Backend(
+            "guest IAT stage-pool header is invalid".into(),
+        ));
+    }
+    let mut next_slot = 0u32;
+    while next_slot < slots {
+        let offset = iat_stage_pool_slot_offset(next_slot)?
+            .checked_add(STAGE_RESULT_OFFSET)
+            .ok_or_else(|| {
+                GuestInjectError::Backend("guest IAT stage-pool result offset overflows".into())
+            })?;
+        let state = backend.read(pid, base + offset, 8)?;
+        if state == [0; 8] {
+            break;
+        }
+        next_slot += 1;
+    }
+    activate_iat_stage_pool(pid, hook, base, slots)?;
+    let pools = IAT_STAGE_POOLS
+        .get()
+        .expect("stage pool registry initialized");
+    let mut pools = pools.lock().map_err(|_| {
+        GuestInjectError::Backend("guest IAT stage-pool registry lock was poisoned".into())
+    })?;
+    let pool = pools
+        .get_mut(&key)
+        .expect("stage pool registration inserted the requested key");
+    pool.next_slot = next_slot;
+    tracing::info!(
+        pid,
+        base = format_args!("{base:#x}"),
+        slots,
+        next_slot,
+        "recovered persistent guest IAT stage pool"
+    );
+    Ok(Some(base))
+}
+
+fn ensure_iat_stage_pool(
+    backend: &dyn GuestMemoryBackend,
+    pid: u32,
+    bootstrap_hook: &GuestIatHook,
+    virtual_alloc: u64,
+    slots: u32,
+    timeout_ms: u32,
+) -> Result<u64, GuestInjectError> {
+    if let Some(base) = recover_iat_stage_pool(backend, pid, bootstrap_hook)? {
+        return Ok(base);
+    }
+    let base = allocate_iat_stage_pool(
+        backend,
+        pid,
+        bootstrap_hook,
+        virtual_alloc,
+        slots,
+        timeout_ms,
+    )?;
+    write_verified(
+        backend,
+        pid,
+        base,
+        &iat_stage_pool_header(slots),
+        "guest IAT stage-pool header",
+    )?;
+    activate_iat_stage_pool(pid, bootstrap_hook, base, slots)?;
+    Ok(base)
+}
+
+fn reserve_iat_stage_slot(pid: u32, hook: &GuestIatHook) -> Result<GuestIatHook, GuestInjectError> {
+    let key = iat_stage_pool_key(pid, hook);
+    let Some(pools) = IAT_STAGE_POOLS.get() else {
+        return Ok(*hook);
+    };
+    let mut pools = pools.lock().map_err(|_| {
+        GuestInjectError::Backend("guest IAT stage-pool registry lock was poisoned".into())
+    })?;
+    let Some(pool) = pools.get_mut(&key) else {
+        return Ok(*hook);
+    };
+    if pool.next_slot >= pool.slots {
+        return Err(GuestInjectError::Unsupported {
+            operation: "guest IAT-hook execution",
+            reason: format!(
+                "guest IAT stage pool exhausted after {} one-shot calls; increase guest.iat_stage_pool_slots",
+                pool.slots
+            ),
+        });
+    }
+    let slot_offset = iat_stage_pool_slot_offset(pool.next_slot)?;
+    pool.next_slot += 1;
+    let slot_base = pool.base.checked_add(slot_offset).ok_or_else(|| {
+        GuestInjectError::Backend("guest IAT stage-pool slot address overflows".into())
+    })?;
+    let mut slot_hook = *hook;
+    slot_hook.stub_addr = slot_base.checked_add(STAGE_STUB_OFFSET).ok_or_else(|| {
+        GuestInjectError::Backend("guest IAT stage-pool stub address overflows".into())
+    })?;
+    slot_hook.result_addr = slot_base.checked_add(STAGE_RESULT_OFFSET).ok_or_else(|| {
+        GuestInjectError::Backend("guest IAT stage-pool result address overflows".into())
+    })?;
+    Ok(slot_hook)
+}
+
+fn iat_stage_pool_slot_count(
+    pid: u32,
+    hook: &GuestIatHook,
+) -> Result<Option<u32>, GuestInjectError> {
+    let Some(pools) = IAT_STAGE_POOLS.get() else {
+        return Ok(None);
+    };
+    let pools = pools.lock().map_err(|_| {
+        GuestInjectError::Backend("guest IAT stage-pool registry lock was poisoned".into())
+    })?;
+    Ok(pools
+        .get(&iat_stage_pool_key(pid, hook))
+        .map(|pool| pool.slots))
+}
+
+/// One import-address-table entry that can be used as an execution trigger.
+///
+/// The entry is reported exactly as it appears in the importing module. API-set
+/// names are intentionally not normalized: they must match the IAT descriptor
+/// when used for a subsequent liveness probe or injection plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestIatHookCandidate {
+    pub source_module: String,
+    pub import_module: String,
+    pub symbol: String,
+    pub iat_slot: u64,
+    pub original_target: u64,
+    pub priority: u8,
+}
+
+/// Result of a bounded IAT liveness probe.
+///
+/// The probe uses the normal guest call stub to invoke GetCurrentThreadId when
+/// the selected import fires, then tail-jumps to the original import target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestIatHookProbe {
+    pub candidate: GuestIatHookCandidate,
+    pub observed: bool,
+    pub servicing_tid: Option<u32>,
+    pub timeout_ms: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1645,7 +2032,7 @@ impl GuestInjector for GuestManualMapInjector {
 
             let process = backend.resolve_process(&req.plan.target)?;
             tracing::info!(pid = process.pid, process = %process.name, "guest target resolved");
-            let _injection_lock = GuestInjectionLock::acquire(process.pid)?;
+            let injection_lock = GuestInjectionLock::acquire(process.pid)?;
 
             match req.plan.execution.method {
                 GuestExecutionMethod::IatHook
@@ -1710,43 +2097,23 @@ impl GuestInjector for GuestManualMapInjector {
                 }
             };
 
-            let hook = find_iat_hook(backend, process.pid, req.plan)?;
-            let hook = GuestIatHook {
-                iat_slot: hook.iat_slot,
-                original_target: hook.original_target,
-                stub_addr: stage + STAGE_STUB_OFFSET,
+            let hook = select_execution_hook(
+                backend,
+                process.pid,
+                req.plan,
+                stage,
                 result_addr,
-                call_stack: req.plan.call_stack,
-                spoofed_return: if req.plan.stack_shaping == GuestStackShaping::Spoofed {
-                    Some(find_spoofed_return(backend, process.pid)?)
-                } else {
-                    None
-                },
+                capabilities.independent_execution,
+                capabilities.iat_hook_stage_restore,
+            )?;
+            let mut thread_start_notes = if capabilities.independent_execution {
+                vec![
+                    "execution bootstrap: backend executes guest stubs independently of target IAT call cadence"
+                        .into(),
+                ]
+            } else {
+                validate_guest_thread_start_policy(backend, process.pid, req.plan, stage, &hook)?
             };
-            tracing::info!(
-                pid = process.pid,
-                iat_slot = format_args!("{:#x}", hook.iat_slot),
-                original_target = format_args!("{:#x}", hook.original_target),
-                stub_addr = format_args!("{:#x}", hook.stub_addr),
-                result_addr = format_args!("{:#x}", hook.result_addr),
-                hook_module = %req.plan.hook_module,
-                hook_function = %req.plan.hook_function,
-                "guest IAT hook selected"
-            );
-            let mut thread_start_notes =
-                validate_guest_thread_start_policy(backend, process.pid, req.plan, stage, &hook)?;
-            let mut call_stack_notes = Vec::new();
-            if req.plan.call_stack == GuestCallStackPolicy::RegisteredUnwind {
-                register_guest_stub_unwind(
-                    backend,
-                    process.pid,
-                    &hook,
-                    stage,
-                    req.plan.execution.timeout_ms,
-                )?;
-                call_stack_notes
-                    .push("call stack: registered unwind metadata for IAT-hook stub".to_string());
-            }
 
             let virtual_alloc =
                 resolve_import_symbol(backend, process.pid, "kernel32.dll", "VirtualAlloc")?;
@@ -1755,6 +2122,30 @@ impl GuestInjector for GuestManualMapInjector {
                 virtual_alloc = format_args!("{virtual_alloc:#x}"),
                 "guest allocator resolved"
             );
+            let iat_stage_pool_base = if capabilities.independent_execution {
+                None
+            } else {
+                Some(ensure_iat_stage_pool(
+                    backend,
+                    process.pid,
+                    &hook,
+                    virtual_alloc,
+                    req.plan.iat_stage_pool_slots,
+                    req.plan.execution.timeout_ms,
+                )?)
+            };
+            let mut call_stack_notes = Vec::new();
+            if req.plan.call_stack == GuestCallStackPolicy::RegisteredUnwind {
+                register_guest_stub_unwind(
+                    backend,
+                    process.pid,
+                    &hook,
+                    iat_stage_pool_base.unwrap_or(stage),
+                    req.plan.execution.timeout_ms,
+                )?;
+                call_stack_notes
+                    .push("call stack: registered unwind metadata for IAT-hook stub".to_string());
+            }
             let virtual_protect = match req.plan.final_protections {
                 GuestFinalProtections::Rwx => None,
                 GuestFinalProtections::Section => {
@@ -3383,6 +3774,13 @@ impl GuestInjector for GuestManualMapInjector {
                 format!("cleanup={}", req.plan.cleanup.label()),
                 format!("vad_spoof={}", req.plan.vad_spoof.label()),
             ];
+            if let Some(pool_base) = iat_stage_pool_base {
+                notes.push(format!(
+                    "IAT execution pool: using {} one-shot {}-byte RWX stage slots at {pool_base:#x}; slots are retained until target exit so late IAT callers cannot enter reused code",
+                    req.plan.iat_stage_pool_slots,
+                    STAGE_CAVE_SIZE,
+                ));
+            }
             notes.append(&mut loader_metadata_notes);
             notes.append(&mut call_stack_notes);
             notes.append(&mut thread_start_notes);
@@ -3419,12 +3817,14 @@ impl GuestInjector for GuestManualMapInjector {
             }
             notes.extend(guest_artifact_notes(req, &pe, remote_base, has_static_tls));
 
-            Ok(GuestLoadInfo {
+            let info = GuestLoadInfo {
                 method: self.name().into(),
                 pid: process.pid,
                 remote_base: Some(remote_base),
                 notes,
-            })
+            };
+            drop(injection_lock);
+            Ok(info)
         })();
 
         match &result {
@@ -3451,6 +3851,7 @@ struct IatHookTransaction<'a, B: GuestMemoryBackend + ?Sized> {
     original_iat: [u8; 8],
     original_stub: Vec<u8>,
     original_result: Vec<u8>,
+    armed: bool,
     restored: bool,
 }
 
@@ -3481,8 +3882,22 @@ impl<'a, B: GuestMemoryBackend + ?Sized> IatHookTransaction<'a, B> {
             original_iat: expected_iat,
             original_stub,
             original_result,
+            armed: false,
             restored: false,
         })
+    }
+
+    fn arm(&mut self) -> Result<(), GuestInjectError> {
+        // Treat a failed verification as armed: the backend may have completed
+        // the write before its read-back failed, so Drop must restore the slot.
+        self.armed = true;
+        write_verified(
+            self.backend,
+            self.pid,
+            self.hook.iat_slot,
+            &self.hook.stub_addr.to_le_bytes(),
+            "guest IAT-hook thunk",
+        )
     }
 
     fn restore(&mut self) -> Result<(), GuestInjectError> {
@@ -3490,8 +3905,63 @@ impl<'a, B: GuestMemoryBackend + ?Sized> IatHookTransaction<'a, B> {
             return Ok(());
         }
         let mut errors = Vec::new();
+        if self.armed {
+            // Disarm before touching the stage. A thread may have already fetched
+            // the stub address, so leave its instruction bytes and result block
+            // intact until every stub invocation has tail-jumped to the original
+            // import target.
+            if let Err(err) = write_verified(
+                self.backend,
+                self.pid,
+                self.hook.iat_slot,
+                &self.original_iat,
+                "guest IAT-hook slot restore",
+            ) {
+                self.restored = true;
+                return Err(GuestInjectError::Backend(format!(
+                    "failed restoring guest IAT hook transaction: IAT slot at {:#x}: {err}; \
+                     stage and result bytes were deliberately retained because the slot state is uncertain",
+                    self.hook.iat_slot
+                )));
+            }
+            if let Err(err) = self.wait_for_stub_quiescence() {
+                self.restored = true;
+                return Err(GuestInjectError::Backend(format!(
+                    "failed restoring guest IAT hook transaction: {err}; \
+                     stage and result bytes were deliberately retained while guest stub invocations remain in flight"
+                )));
+            }
+            if !self.backend.capabilities().iat_hook_stage_restore {
+                // The IAT slot is back to its original target, but a target
+                // thread may already have fetched the temporary stub address.
+                // Retain a completed stub so that late execution only
+                // tail-jumps to the original import instead of entering bytes
+                // restored from an unrelated code cave.
+                if let Err(err) = write_verified(
+                    self.backend,
+                    self.pid,
+                    self.hook.result_addr,
+                    &RESULT_STATE.to_le_bytes(),
+                    "guest IAT-hook completed-state fence",
+                ) {
+                    self.restored = true;
+                    return Err(GuestInjectError::Backend(format!(
+                        "failed finalizing guest IAT hook transaction: {err}; \
+                         stage and result bytes were deliberately retained"
+                    )));
+                }
+                self.restored = true;
+                tracing::debug!(
+                    pid = self.pid,
+                    iat_slot = format_args!("{:#x}", self.hook.iat_slot),
+                    stub_addr = format_args!("{:#x}", self.hook.stub_addr),
+                    "guest IAT-hook transaction retained completed stage for late callers"
+                );
+                return Ok(());
+            }
+            thread::sleep(IAT_RESTORE_GRACE);
+        }
         for (addr, bytes, label) in [
-            (self.hook.iat_slot, self.original_iat.as_slice(), "IAT slot"),
             (
                 self.hook.stub_addr,
                 self.original_stub.as_slice(),
@@ -3514,6 +3984,33 @@ impl<'a, B: GuestMemoryBackend + ?Sized> IatHookTransaction<'a, B> {
                 "failed restoring guest IAT hook transaction: {}",
                 errors.join("; ")
             ))),
+        }
+    }
+
+    fn wait_for_stub_quiescence(&self) -> Result<(), GuestInjectError> {
+        let counter_addr = self
+            .hook
+            .result_addr
+            .checked_add(RESULT_INFLIGHT_OFFSET)
+            .ok_or_else(|| {
+                GuestInjectError::Backend("guest IAT in-flight counter overflows".into())
+            })?;
+        let deadline = Instant::now() + IAT_QUIESCENCE_TIMEOUT;
+        loop {
+            let bytes = self.backend.read(self.pid, counter_addr, 8)?;
+            let in_flight = u64::from_le_bytes(bytes.as_slice().try_into().map_err(|_| {
+                GuestInjectError::Backend("guest IAT in-flight counter read was truncated".into())
+            })?);
+            if in_flight == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(GuestInjectError::Backend(format!(
+                    "guest IAT stubs did not quiesce within {} ms (in_flight={in_flight})",
+                    IAT_QUIESCENCE_TIMEOUT.as_millis()
+                )));
+            }
+            thread::sleep(IAT_QUIESCENCE_POLL_INTERVAL);
         }
     }
 }
@@ -3564,13 +4061,7 @@ fn memory_iat_call<B: GuestMemoryBackend + ?Sized>(
         &stub,
         "guest IAT-hook call stub",
     )?;
-    write_verified(
-        backend,
-        pid,
-        hook.iat_slot,
-        &hook.stub_addr.to_le_bytes(),
-        "guest IAT-hook thunk",
-    )?;
+    transaction.arm()?;
     tracing::debug!(
         pid,
         iat_slot = format_args!("{:#x}", hook.iat_slot),
@@ -3618,6 +4109,130 @@ fn memory_iat_call<B: GuestMemoryBackend + ?Sized>(
     }
 }
 
+fn memory_iat_bootstrap_stage_pool<B: GuestMemoryBackend + ?Sized>(
+    backend: &B,
+    pid: u32,
+    hook: &GuestIatHook,
+    virtual_alloc: u64,
+    size: u64,
+    timeout_ms: u32,
+) -> Result<u64, GuestInjectError> {
+    let zero_result = vec![0u8; RESULT_BLOCK_SIZE];
+    let stub = stage_pool_bootstrap_stub(hook, virtual_alloc, size)?;
+    let mut transaction = IatHookTransaction::prepare(backend, pid, hook, stub.len())?;
+    tracing::debug!(
+        pid,
+        virtual_alloc = format_args!("{virtual_alloc:#x}"),
+        size,
+        iat_slot = format_args!("{:#x}", hook.iat_slot),
+        stub_addr = format_args!("{:#x}", hook.stub_addr),
+        result_addr = format_args!("{:#x}", hook.result_addr),
+        "guest IAT-hook stage-pool bootstrap installing allocation/materialization stub"
+    );
+    write_verified(
+        backend,
+        pid,
+        hook.result_addr,
+        &zero_result,
+        "guest IAT stage-pool bootstrap result block",
+    )?;
+    write_verified(
+        backend,
+        pid,
+        hook.stub_addr,
+        &stub,
+        "guest IAT stage-pool bootstrap stub",
+    )?;
+    transaction.arm()?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+    loop {
+        let result = backend.read(pid, hook.result_addr, RESULT_BLOCK_SIZE)?;
+        let state = u64::from_le_bytes(result[0..8].try_into().unwrap());
+        let value = u64::from_le_bytes(result[8..16].try_into().unwrap());
+        if state == RESULT_STATE {
+            transaction.restore()?;
+            return Ok(value);
+        }
+        if Instant::now() >= deadline {
+            let restore_result = transaction.restore();
+            if let Err(err) = restore_result {
+                tracing::warn!(pid, error = %err, "guest IAT stage-pool bootstrap timeout restore failed");
+            }
+            return Err(GuestInjectError::Unsupported {
+                operation: "guest IAT stage-pool bootstrap",
+                reason: format!(
+                    "target did not call the configured import before {} ms",
+                    timeout_ms
+                ),
+            });
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn memory_iat_probe<B: GuestMemoryBackend + ?Sized>(
+    backend: &B,
+    pid: u32,
+    hook: &GuestIatHook,
+    probe_function: u64,
+    timeout_ms: u32,
+) -> Result<Option<u32>, GuestInjectError> {
+    let zero_result = vec![0u8; RESULT_BLOCK_SIZE];
+    let stub = call_stub(hook, probe_function, &[]);
+    let mut transaction = IatHookTransaction::prepare(backend, pid, hook, stub.len())?;
+    write_verified(
+        backend,
+        pid,
+        hook.result_addr,
+        &zero_result,
+        "guest IAT-hook probe result block",
+    )?;
+    write_verified(
+        backend,
+        pid,
+        hook.stub_addr,
+        &stub,
+        "guest IAT-hook probe stub",
+    )?;
+    transaction.arm()?;
+    tracing::debug!(
+        pid,
+        iat_slot = format_args!("{:#x}", hook.iat_slot),
+        original_target = format_args!("{:#x}", hook.original_target),
+        probe_function = format_args!("{probe_function:#x}"),
+        timeout_ms,
+        "guest IAT liveness probe armed through GetCurrentThreadId call stub"
+    );
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+    loop {
+        let result = backend.read(pid, hook.result_addr, RESULT_BLOCK_SIZE)?;
+        let state = u64::from_le_bytes(result[0..8].try_into().unwrap());
+        if state == RESULT_STATE {
+            let tid = u64::from_le_bytes(result[8..16].try_into().unwrap()) as u32;
+            transaction.restore()?;
+            tracing::info!(
+                pid,
+                iat_slot = format_args!("{:#x}", hook.iat_slot),
+                tid,
+                "guest IAT liveness probe observed call"
+            );
+            return Ok(Some(tid));
+        }
+        if Instant::now() >= deadline {
+            transaction.restore()?;
+            tracing::info!(
+                pid,
+                iat_slot = format_args!("{:#x}", hook.iat_slot),
+                timeout_ms,
+                "guest IAT liveness probe observed no call"
+            );
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn memory_iat_touch<B: GuestMemoryBackend + ?Sized>(
     backend: &B,
     pid: u32,
@@ -3654,13 +4269,7 @@ fn memory_iat_touch<B: GuestMemoryBackend + ?Sized>(
         &stub,
         "guest IAT-hook page-touch stub",
     )?;
-    write_verified(
-        backend,
-        pid,
-        hook.iat_slot,
-        &hook.stub_addr.to_le_bytes(),
-        "guest IAT-hook thunk",
-    )?;
+    transaction.arm()?;
     tracing::debug!(
         pid,
         iat_slot = format_args!("{:#x}", hook.iat_slot),
@@ -3744,13 +4353,7 @@ fn memory_iat_read_touch<B: GuestMemoryBackend + ?Sized>(
         &stub,
         "guest IAT-hook read-touch stub",
     )?;
-    write_verified(
-        backend,
-        pid,
-        hook.iat_slot,
-        &hook.stub_addr.to_le_bytes(),
-        "guest IAT-hook thunk",
-    )?;
+    transaction.arm()?;
     tracing::debug!(
         pid,
         iat_slot = format_args!("{:#x}", hook.iat_slot),
@@ -3834,13 +4437,7 @@ fn memory_iat_preserve_touch<B: GuestMemoryBackend + ?Sized>(
         &stub,
         "guest IAT-hook preserve-touch stub",
     )?;
-    write_verified(
-        backend,
-        pid,
-        hook.iat_slot,
-        &hook.stub_addr.to_le_bytes(),
-        "guest IAT-hook thunk",
-    )?;
+    transaction.arm()?;
     tracing::debug!(
         pid,
         iat_slot = format_args!("{:#x}", hook.iat_slot),
@@ -4475,6 +5072,43 @@ fn allocate_helper_buffer_with_protect(
     }
     backend.touch_iat_hook(pid, hook, remote, aligned, timeout_ms)?;
     Ok(remote)
+}
+
+fn allocate_iat_stage_pool(
+    backend: &dyn GuestMemoryBackend,
+    pid: u32,
+    bootstrap_hook: &GuestIatHook,
+    virtual_alloc: u64,
+    slots: u32,
+    timeout_ms: u32,
+) -> Result<u64, GuestInjectError> {
+    if slots == 0 {
+        return Err(GuestInjectError::Config(
+            "guest.iat_stage_pool_slots must be greater than zero".into(),
+        ));
+    }
+    let size = iat_stage_pool_size(slots)?;
+    let base = memory_iat_bootstrap_stage_pool(
+        backend,
+        pid,
+        bootstrap_hook,
+        virtual_alloc,
+        size,
+        timeout_ms,
+    )?;
+    if base == 0 {
+        return Err(GuestInjectError::Backend(format!(
+            "VirtualAlloc returned NULL for {slots}-slot guest IAT stage pool"
+        )));
+    }
+    tracing::info!(
+        pid,
+        base = format_args!("{base:#x}"),
+        slots,
+        size,
+        "guest IAT stage pool allocated; each guest call uses a one-shot slot"
+    );
+    Ok(base)
 }
 
 fn allocate_tls_template_copy(
@@ -5306,27 +5940,39 @@ pub fn unmap_all_tracked_modules(
             found
         }
     };
-    let selected_hook = find_iat_hook(backend, process.pid, plan)?;
-    let hook = GuestIatHook {
-        iat_slot: selected_hook.iat_slot,
-        original_target: selected_hook.original_target,
-        stub_addr: stage + STAGE_STUB_OFFSET,
+    let hook = select_execution_hook(
+        backend,
+        process.pid,
+        plan,
+        stage,
         result_addr,
-        call_stack: plan.call_stack,
-        spoofed_return: if plan.stack_shaping == GuestStackShaping::Spoofed {
-            Some(find_spoofed_return(backend, process.pid)?)
-        } else {
-            None
-        },
-    };
+        capabilities.independent_execution,
+        capabilities.iat_hook_stage_restore,
+    )?;
 
-    validate_guest_thread_start_policy(backend, process.pid, plan, stage, &hook)?;
+    if !capabilities.independent_execution {
+        validate_guest_thread_start_policy(backend, process.pid, plan, stage, &hook)?;
+    }
+    let iat_stage_pool_base = if capabilities.independent_execution {
+        None
+    } else {
+        let virtual_alloc =
+            resolve_import_symbol(backend, process.pid, "kernel32.dll", "VirtualAlloc")?;
+        Some(ensure_iat_stage_pool(
+            backend,
+            process.pid,
+            &hook,
+            virtual_alloc,
+            plan.iat_stage_pool_slots,
+            plan.execution.timeout_ms,
+        )?)
+    };
     if plan.call_stack == GuestCallStackPolicy::RegisteredUnwind {
         register_guest_stub_unwind(
             backend,
             process.pid,
             &hook,
-            stage,
+            iat_stage_pool_base.unwrap_or(stage),
             plan.execution.timeout_ms,
         )?;
     }
@@ -6639,7 +7285,7 @@ fn register_guest_stub_unwind(
     let metadata_addr = stage
         .checked_add(STAGE_UNWIND_OFFSET)
         .ok_or_else(|| GuestInjectError::Image("stub unwind metadata address overflows".into()))?;
-    let metadata = stub_unwind_metadata()?;
+    let metadata = stub_unwind_metadata(iat_stage_pool_slot_count(pid, hook)?)?;
     write_verified(
         backend,
         pid,
@@ -6671,10 +7317,32 @@ fn register_guest_stub_unwind(
     Ok(())
 }
 
-fn stub_unwind_metadata() -> Result<Vec<u8>, GuestInjectError> {
-    let begin = u32::try_from(STAGE_STUB_OFFSET)
+fn stub_unwind_metadata(stage_pool_slots: Option<u32>) -> Result<Vec<u8>, GuestInjectError> {
+    let (begin, end) = match stage_pool_slots {
+        Some(slots) if slots > 1 => {
+            let begin = (STAGE_CAVE_SIZE as u64)
+                .checked_add(STAGE_STUB_OFFSET)
+                .ok_or_else(|| {
+                    GuestInjectError::Image("IAT stage-pool unwind begin overflows".into())
+                })?;
+            let end = u64::from(slots)
+                .checked_mul(STAGE_CAVE_SIZE as u64)
+                .ok_or_else(|| {
+                    GuestInjectError::Image("IAT stage-pool unwind end overflows".into())
+                })?;
+            (begin, end)
+        }
+        Some(_) => {
+            return Err(GuestInjectError::Config(
+                "call_stack=registered-unwind requires at least two guest.iat_stage_pool_slots"
+                    .into(),
+            ));
+        }
+        None => (STAGE_STUB_OFFSET, STAGE_SCRATCH_OFFSET),
+    };
+    let begin = u32::try_from(begin)
         .map_err(|_| GuestInjectError::Image("stub begin RVA exceeds u32".into()))?;
-    let end = u32::try_from(STAGE_SCRATCH_OFFSET)
+    let end = u32::try_from(end)
         .map_err(|_| GuestInjectError::Image("stub end RVA exceeds u32".into()))?;
     let unwind = u32::try_from(STAGE_UNWIND_OFFSET + 12)
         .map_err(|_| GuestInjectError::Image("stub unwind RVA exceeds u32".into()))?;
@@ -7823,6 +8491,7 @@ fn call_stub(hook: &GuestIatHook, function: u64, args: &[u64]) -> Vec<u8> {
     }
     let mut code = X64Stub::new();
     preserve_import_args(&mut code);
+    increment_inflight_counter(&mut code, hook);
     code.mov_abs(Reg64::R10, hook.result_addr);
     code.xor_eax_eax();
     code.mov_abs(Reg64::R11, RESULT_RUNNING);
@@ -7842,14 +8511,94 @@ fn call_stub(hook: &GuestIatHook, function: u64, args: &[u64]) -> Vec<u8> {
     }
     code.mov_abs(Reg64::R10, hook.result_addr + 8);
     code.store_rax_at_r10();
+    if hook.iat_slot_guest_writable {
+        disarm_iat_slot(&mut code, hook);
+    }
     code.mov_abs(Reg64::R10, hook.result_addr);
     code.mov_abs(Reg64::Rax, RESULT_STATE);
     code.store_rax_at_r10();
 
     let tail_original = code.len();
     code.patch_rel32(skip_call, tail_original);
-    tail_jump_original_import(&mut code, hook.original_target);
+    tail_jump_original_import(&mut code, hook);
     code.finish()
+}
+
+fn stage_pool_bootstrap_stub(
+    hook: &GuestIatHook,
+    virtual_alloc: u64,
+    size: u64,
+) -> Result<Vec<u8>, GuestInjectError> {
+    let page_count = size.div_ceil(GUEST_PAGE_SIZE as u64);
+    if page_count == 0 {
+        return Err(GuestInjectError::Config(
+            "guest IAT stage-pool bootstrap size must be nonzero".into(),
+        ));
+    }
+    let mut code = X64Stub::new();
+    let framed = hook.call_stack == GuestCallStackPolicy::RegisteredUnwind;
+    if framed {
+        framed_prologue(&mut code);
+    } else {
+        preserve_import_args(&mut code);
+    }
+    increment_inflight_counter(&mut code, hook);
+    code.mov_abs(Reg64::R10, hook.result_addr);
+    code.xor_eax_eax();
+    code.mov_abs(Reg64::R11, RESULT_RUNNING);
+    code.lock_cmpxchg_rax_at_r10_with_r11();
+    let skip_call = code.jne_rel32_placeholder();
+
+    stage_register_args(
+        &mut code,
+        &[0, size, MEM_COMMIT_RESERVE, PAGE_EXECUTE_READWRITE],
+    );
+    if framed {
+        code.mov_abs(Reg64::Rax, virtual_alloc);
+        code.call_rax_with_current_frame();
+    } else {
+        emit_direct_call(&mut code, virtual_alloc, &[]);
+    }
+
+    code.test_rax_rax();
+    let skip_touch = code.je_rel32_placeholder();
+    code.mov_rdx_rax();
+    code.add_rdx_imm32(IAT_STAGE_POOL_CANARY_OFFSET as u32);
+    code.mov_abs(Reg64::Rcx, page_count);
+    let touch_loop = code.len();
+    code.write_byte_at_rdx(IAT_STAGE_POOL_CANARY_VALUE);
+    code.add_rdx_imm32(GUEST_PAGE_SIZE as u32);
+    code.dec_rcx();
+    let repeat_touch = code.jne_rel32_placeholder();
+    code.patch_rel32(repeat_touch, touch_loop);
+    let after_touch = code.len();
+    code.patch_rel32(skip_touch, after_touch);
+
+    code.mov_abs(Reg64::R10, hook.result_addr + 8);
+    code.store_rax_at_r10();
+    if hook.iat_slot_guest_writable {
+        disarm_iat_slot(&mut code, hook);
+    }
+    code.mov_abs(Reg64::R10, hook.result_addr);
+    code.mov_abs(Reg64::Rax, RESULT_STATE);
+    code.store_rax_at_r10();
+
+    let tail_original = code.len();
+    code.patch_rel32(skip_call, tail_original);
+    if framed {
+        framed_tail_jump_original_import(&mut code, hook);
+    } else {
+        tail_jump_original_import(&mut code, hook);
+    }
+    let stub = code.finish();
+    if stub.len() > (STAGE_SCRATCH_OFFSET - STAGE_STUB_OFFSET) as usize {
+        return Err(GuestInjectError::Backend(format!(
+            "guest IAT stage-pool bootstrap stub is {} bytes, exceeding the {}-byte stage slot",
+            stub.len(),
+            STAGE_SCRATCH_OFFSET - STAGE_STUB_OFFSET
+        )));
+    }
+    Ok(stub)
 }
 
 fn framed_call_stub(hook: &GuestIatHook, function: u64, args: &[u64]) -> Vec<u8> {
@@ -7861,6 +8610,7 @@ fn framed_call_stub(hook: &GuestIatHook, function: u64, args: &[u64]) -> Vec<u8>
     );
     let mut code = X64Stub::new();
     framed_prologue(&mut code);
+    increment_inflight_counter(&mut code, hook);
     code.mov_abs(Reg64::R10, hook.result_addr);
     code.xor_eax_eax();
     code.mov_abs(Reg64::R11, RESULT_RUNNING);
@@ -7884,40 +8634,58 @@ fn framed_call_stub(hook: &GuestIatHook, function: u64, args: &[u64]) -> Vec<u8>
     }
     code.mov_abs(Reg64::R10, hook.result_addr + 8);
     code.store_rax_at_r10();
+    if hook.iat_slot_guest_writable {
+        disarm_iat_slot(&mut code, hook);
+    }
     code.mov_abs(Reg64::R10, hook.result_addr);
     code.mov_abs(Reg64::Rax, RESULT_STATE);
     code.store_rax_at_r10();
 
     let tail_original = code.len();
     code.patch_rel32(skip_call, tail_original);
-    framed_tail_jump_original_import(&mut code, hook.original_target);
+    framed_tail_jump_original_import(&mut code, hook);
     code.finish()
+}
+
+fn increment_inflight_counter(code: &mut X64Stub, hook: &GuestIatHook) {
+    code.mov_abs(Reg64::R10, hook.result_addr + RESULT_INFLIGHT_OFFSET);
+    code.lock_inc_qword_at_r10();
+}
+
+fn disarm_iat_slot(code: &mut X64Stub, hook: &GuestIatHook) {
+    code.mov_abs(Reg64::R10, hook.iat_slot);
+    code.mov_abs(Reg64::Rax, hook.original_target);
+    code.store_rax_at_r10();
 }
 
 fn touch_stub(hook: &GuestIatHook, addr: u64, len: usize) -> Vec<u8> {
     if hook.call_stack == GuestCallStackPolicy::RegisteredUnwind {
-        return framed_touch_stub(hook, addr, len, TouchMode::WriteZero);
+        return framed_touch_stub(hook, addr, len, TouchMode::ForceMaterialize);
     }
     let mut code = X64Stub::new();
     preserve_import_args(&mut code);
+    increment_inflight_counter(&mut code, hook);
     code.mov_abs(Reg64::R10, hook.result_addr);
     code.xor_eax_eax();
     code.mov_abs(Reg64::R11, RESULT_RUNNING);
     code.lock_cmpxchg_rax_at_r10_with_r11();
     let skip_touch = code.jne_rel32_placeholder();
 
-    emit_touch_loop(&mut code, addr, len, TouchMode::WriteZero);
+    emit_touch_loop(&mut code, addr, len, TouchMode::ForceMaterialize);
 
     code.mov_abs(Reg64::R10, hook.result_addr + 8);
     code.mov_abs(Reg64::Rax, addr);
     code.store_rax_at_r10();
+    if hook.iat_slot_guest_writable {
+        disarm_iat_slot(&mut code, hook);
+    }
     code.mov_abs(Reg64::R10, hook.result_addr);
     code.mov_abs(Reg64::Rax, RESULT_STATE);
     code.store_rax_at_r10();
 
     let tail_original = code.len();
     code.patch_rel32(skip_touch, tail_original);
-    tail_jump_original_import(&mut code, hook.original_target);
+    tail_jump_original_import(&mut code, hook);
     code.finish()
 }
 
@@ -7938,6 +8706,7 @@ fn preserve_touch_stub(hook: &GuestIatHook, addr: u64, len: usize) -> Vec<u8> {
 fn touch_mode_stub(hook: &GuestIatHook, addr: u64, len: usize, mode: TouchMode) -> Vec<u8> {
     let mut code = X64Stub::new();
     preserve_import_args(&mut code);
+    increment_inflight_counter(&mut code, hook);
     code.mov_abs(Reg64::R10, hook.result_addr);
     code.xor_eax_eax();
     code.mov_abs(Reg64::R11, RESULT_RUNNING);
@@ -7949,19 +8718,22 @@ fn touch_mode_stub(hook: &GuestIatHook, addr: u64, len: usize, mode: TouchMode) 
     code.mov_abs(Reg64::R10, hook.result_addr + 8);
     code.mov_abs(Reg64::Rax, addr);
     code.store_rax_at_r10();
+    if hook.iat_slot_guest_writable {
+        disarm_iat_slot(&mut code, hook);
+    }
     code.mov_abs(Reg64::R10, hook.result_addr);
     code.mov_abs(Reg64::Rax, RESULT_STATE);
     code.store_rax_at_r10();
 
     let tail_original = code.len();
     code.patch_rel32(skip_touch, tail_original);
-    tail_jump_original_import(&mut code, hook.original_target);
+    tail_jump_original_import(&mut code, hook);
     code.finish()
 }
 
 #[derive(Clone, Copy)]
 enum TouchMode {
-    WriteZero,
+    ForceMaterialize,
     ReadOnly,
     WriteSame,
 }
@@ -7969,6 +8741,7 @@ enum TouchMode {
 fn framed_touch_stub(hook: &GuestIatHook, addr: u64, len: usize, mode: TouchMode) -> Vec<u8> {
     let mut code = X64Stub::new();
     framed_prologue(&mut code);
+    increment_inflight_counter(&mut code, hook);
     code.mov_abs(Reg64::R10, hook.result_addr);
     code.xor_eax_eax();
     code.mov_abs(Reg64::R11, RESULT_RUNNING);
@@ -7980,13 +8753,16 @@ fn framed_touch_stub(hook: &GuestIatHook, addr: u64, len: usize, mode: TouchMode
     code.mov_abs(Reg64::R10, hook.result_addr + 8);
     code.mov_abs(Reg64::Rax, addr);
     code.store_rax_at_r10();
+    if hook.iat_slot_guest_writable {
+        disarm_iat_slot(&mut code, hook);
+    }
     code.mov_abs(Reg64::R10, hook.result_addr);
     code.mov_abs(Reg64::Rax, RESULT_STATE);
     code.store_rax_at_r10();
 
     let tail_original = code.len();
     code.patch_rel32(skip_touch, tail_original);
-    framed_tail_jump_original_import(&mut code, hook.original_target);
+    framed_tail_jump_original_import(&mut code, hook);
     code.finish()
 }
 
@@ -7999,7 +8775,7 @@ fn emit_touch_loop(code: &mut X64Stub, addr: u64, len: usize, mode: TouchMode) {
     code.mov_abs(Reg64::Rcx, page_count);
     let touch_loop = code.len();
     match mode {
-        TouchMode::WriteZero => code.mov_byte_zero_at_rdx(),
+        TouchMode::ForceMaterialize => code.force_materialize_byte_at_rdx(),
         TouchMode::ReadOnly => code.movzx_eax_byte_at_rdx(),
         TouchMode::WriteSame => {
             code.movzx_eax_byte_at_rdx();
@@ -8052,12 +8828,14 @@ fn spoofed_stack_frame(stack_adjust: u8, desired_frame_mod: u8) -> (u8, u8) {
     )
 }
 
-fn tail_jump_original_import(code: &mut X64Stub, original_target: u64) {
+fn tail_jump_original_import(code: &mut X64Stub, hook: &GuestIatHook) {
     code.pop(Reg64::R9);
     code.pop(Reg64::R8);
     code.pop(Reg64::Rdx);
     code.pop(Reg64::Rcx);
-    code.mov_abs(Reg64::Rax, original_target);
+    code.mov_abs(Reg64::Rax, hook.original_target);
+    code.mov_abs(Reg64::R10, hook.result_addr + RESULT_INFLIGHT_OFFSET);
+    code.lock_dec_qword_at_r10();
     code.jmp_rax();
 }
 
@@ -8100,13 +8878,15 @@ fn framed_prologue(code: &mut X64Stub) {
     code.store_reg_at_rsp_disp(Reg64::R9, 0x60);
 }
 
-fn framed_tail_jump_original_import(code: &mut X64Stub, original_target: u64) {
+fn framed_tail_jump_original_import(code: &mut X64Stub, hook: &GuestIatHook) {
     code.load_reg_from_rsp_disp(Reg64::Rcx, 0x48);
     code.load_reg_from_rsp_disp(Reg64::Rdx, 0x50);
     code.load_reg_from_rsp_disp(Reg64::R8, 0x58);
     code.load_reg_from_rsp_disp(Reg64::R9, 0x60);
     code.add_rsp(FRAMED_STUB_STACK_ALLOC);
-    code.mov_abs(Reg64::Rax, original_target);
+    code.mov_abs(Reg64::Rax, hook.original_target);
+    code.mov_abs(Reg64::R10, hook.result_addr + RESULT_INFLIGHT_OFFSET);
+    code.lock_dec_qword_at_r10();
     code.jmp_rax();
 }
 
@@ -8181,8 +8961,19 @@ impl X64Stub {
         }
     }
 
-    fn mov_byte_zero_at_rdx(&mut self) {
-        self.bytes.extend_from_slice(&[0xC6, 0x02, 0x00]);
+    fn force_materialize_byte_at_rdx(&mut self) {
+        // A zero store can be optimized against a demand-zero page. Flip twice
+        // to preserve its byte while forcing a concrete guest write fault.
+        self.bytes
+            .extend_from_slice(&[0x80, 0x32, 0xA5, 0x80, 0x32, 0xA5]);
+    }
+
+    fn write_byte_at_rdx(&mut self, value: u8) {
+        self.bytes.extend_from_slice(&[0xC6, 0x02, value]);
+    }
+
+    fn mov_rdx_rax(&mut self) {
+        self.bytes.extend_from_slice(&[0x48, 0x89, 0xC2]);
     }
 
     fn movzx_eax_byte_at_rdx(&mut self) {
@@ -8197,13 +8988,30 @@ impl X64Stub {
         self.bytes.extend_from_slice(&[0x31, 0xC0]);
     }
 
+    fn test_rax_rax(&mut self) {
+        self.bytes.extend_from_slice(&[0x48, 0x85, 0xC0]);
+    }
+
     fn lock_cmpxchg_rax_at_r10_with_r11(&mut self) {
         self.bytes
             .extend_from_slice(&[0xF0, 0x4D, 0x0F, 0xB1, 0x1A]);
     }
 
+    fn lock_inc_qword_at_r10(&mut self) {
+        self.bytes.extend_from_slice(&[0xF0, 0x49, 0xFF, 0x02]);
+    }
+
+    fn lock_dec_qword_at_r10(&mut self) {
+        self.bytes.extend_from_slice(&[0xF0, 0x49, 0xFF, 0x0A]);
+    }
+
     fn jne_rel32_placeholder(&mut self) -> usize {
         self.bytes.extend_from_slice(&[0x0F, 0x85, 0, 0, 0, 0]);
+        self.bytes.len() - 4
+    }
+
+    fn je_rel32_placeholder(&mut self) -> usize {
+        self.bytes.extend_from_slice(&[0x0F, 0x84, 0, 0, 0, 0]);
         self.bytes.len() - 4
     }
 
@@ -8294,7 +9102,13 @@ fn find_stage(
     {
         return Ok(addr);
     }
-    find_writable_executable_code_cave(backend, pid, STAGE_CAVE_SIZE)
+    match find_writable_executable_code_cave(backend, pid, STAGE_CAVE_SIZE) {
+        Ok(addr) => Ok(addr),
+        Err(_) => {
+            tracing::info!(pid, "no RWX code cave; falling back to RX search");
+            find_rx_code_cave(backend, pid, STAGE_CAVE_SIZE)
+        }
+    }
 }
 
 fn find_stage_pattern(
@@ -8415,6 +9229,32 @@ fn validate_result_region(
     )))
 }
 
+fn guest_range_is_writable(
+    backend: &dyn GuestMemoryBackend,
+    pid: u32,
+    addr: u64,
+    len: u64,
+) -> bool {
+    let Some(end) = addr.checked_add(len) else {
+        return false;
+    };
+    match backend.memory_map(pid) {
+        Ok(regions) => regions.into_iter().any(|region| {
+            region.writable && addr >= region.base && end <= region.base.saturating_add(region.size)
+        }),
+        Err(error) => {
+            tracing::debug!(
+                pid,
+                addr = format_args!("{addr:#x}"),
+                len,
+                error = %error,
+                "IAT slot writability unavailable; requiring host-side restoration"
+            );
+            false
+        }
+    }
+}
+
 fn find_writable_executable_code_cave(
     backend: &dyn GuestMemoryBackend,
     pid: u32,
@@ -8499,6 +9339,283 @@ fn find_code_cave(bytes: &[u8], size: usize) -> Option<usize> {
 
 fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
+}
+
+fn select_execution_hook(
+    backend: &dyn GuestMemoryBackend,
+    pid: u32,
+    plan: &GuestInjectionPlan,
+    stage: u64,
+    result_addr: u64,
+    independent_execution: bool,
+    allow_guest_self_disarm: bool,
+) -> Result<GuestIatHook, GuestInjectError> {
+    let spoofed_return = if plan.stack_shaping == GuestStackShaping::Spoofed {
+        Some(find_spoofed_return(backend, pid)?)
+    } else {
+        None
+    };
+    let mut hook = GuestIatHook {
+        iat_slot: 0,
+        original_target: 0,
+        stub_addr: stage + STAGE_STUB_OFFSET,
+        result_addr,
+        iat_slot_guest_writable: false,
+        call_stack: plan.call_stack,
+        spoofed_return,
+    };
+
+    if independent_execution {
+        tracing::info!(
+            pid,
+            stub_addr = format_args!("{:#x}", hook.stub_addr),
+            result_addr = format_args!("{:#x}", hook.result_addr),
+            "using backend-provided independent guest execution bootstrap"
+        );
+        return Ok(hook);
+    }
+
+    let selected = find_iat_hook(backend, pid, plan)?;
+    hook.iat_slot = selected.iat_slot;
+    hook.original_target = selected.original_target;
+    hook.iat_slot_guest_writable =
+        allow_guest_self_disarm && guest_range_is_writable(backend, pid, hook.iat_slot, 8);
+    tracing::info!(
+        pid,
+        iat_slot = format_args!("{:#x}", hook.iat_slot),
+        original_target = format_args!("{:#x}", hook.original_target),
+        stub_addr = format_args!("{:#x}", hook.stub_addr),
+        result_addr = format_args!("{:#x}", hook.result_addr),
+        guest_self_disarm = hook.iat_slot_guest_writable,
+        hook_module = %plan.hook_module,
+        hook_function = %plan.hook_function,
+        "guest IAT hook selected"
+    );
+    Ok(hook)
+}
+
+/// Enumerates named and ordinal IAT entries from one module or every loaded module.
+///
+/// Entries are read from the original thunk table when present, so this remains useful
+/// after the Windows loader has rewritten the IAT with resolved addresses.
+pub fn inspect_iat_hook_candidates(
+    backend: &dyn GuestMemoryBackend,
+    pid: u32,
+    source_module: Option<&str>,
+) -> Result<Vec<GuestIatHookCandidate>, GuestInjectError> {
+    let modules = backend.module_list(pid)?;
+    let selected: Vec<_> = match source_module {
+        Some(name) => vec![
+            modules
+                .into_iter()
+                .find(|module| module.name.eq_ignore_ascii_case(name))
+                .ok_or_else(|| GuestInjectError::Process(format!("module {name:?} not found")))?,
+        ],
+        None => modules,
+    };
+
+    let mut candidates = Vec::new();
+    for module in selected {
+        match inspect_module_iat_hooks(backend, pid, &module) {
+            Ok(mut entries) => {
+                candidates.append(&mut entries);
+                if candidates.len() > MAX_IAT_HOOK_CANDIDATES {
+                    return Err(GuestInjectError::Unsupported {
+                        operation: "IAT hook discovery",
+                        reason: format!(
+                            "found more than {MAX_IAT_HOOK_CANDIDATES} entries; specify a target module"
+                        ),
+                    });
+                }
+            }
+            Err(err) if source_module.is_none() => {
+                tracing::debug!(
+                    pid,
+                    module = %module.name,
+                    error = %err,
+                    "skipping module whose IAT could not be inspected"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| left.source_module.cmp(&right.source_module))
+            .then_with(|| left.import_module.cmp(&right.import_module))
+            .then_with(|| left.symbol.cmp(&right.symbol))
+    });
+    Ok(candidates)
+}
+
+/// Arms a bounded liveness probe for one IAT entry.
+///
+/// When the selected import fires, the normal guest call stub invokes
+/// GetCurrentThreadId, records the servicing thread id, then tail-jumps to the
+/// original target. The probe restores the slot before returning; memory-only
+/// backends retain a completed pass-through stub for late callers. It never
+/// maps a payload or invokes DllMain.
+#[allow(clippy::too_many_arguments)]
+pub fn probe_iat_hook_candidate(
+    backend: &dyn GuestMemoryBackend,
+    pid: u32,
+    source_module: &str,
+    import_module: &str,
+    symbol: &str,
+    stage_base: Option<u64>,
+    result_base: Option<u64>,
+    timeout_ms: u32,
+) -> Result<GuestIatHookProbe, GuestInjectError> {
+    let candidates = inspect_iat_hook_candidates(backend, pid, Some(source_module))?;
+    let import_candidates = import_module_candidates(import_module);
+    let candidate = candidates
+        .into_iter()
+        .find(|candidate| {
+            import_candidates
+                .iter()
+                .any(|module| candidate.import_module.eq_ignore_ascii_case(module))
+                && candidate.symbol.eq_ignore_ascii_case(symbol)
+        })
+        .ok_or_else(|| {
+            GuestInjectError::Image(format!(
+                "target import {import_module}!{symbol} not found in {source_module}"
+            ))
+        })?;
+
+    let stage = match stage_base {
+        Some(base) => base,
+        None => find_stage(backend, pid, None)?,
+    };
+    validate_stub_region(backend, pid, stage, STAGE_CAVE_SIZE)?;
+    let result_addr = result_base.unwrap_or(stage + STAGE_RESULT_OFFSET);
+    validate_result_region(backend, pid, result_addr)?;
+
+    let hook = GuestIatHook {
+        iat_slot: candidate.iat_slot,
+        original_target: candidate.original_target,
+        stub_addr: stage + STAGE_STUB_OFFSET,
+        result_addr,
+        iat_slot_guest_writable: backend.capabilities().iat_hook_stage_restore
+            && guest_range_is_writable(backend, pid, candidate.iat_slot, 8),
+        call_stack: GuestCallStackPolicy::Native,
+        spoofed_return: None,
+    };
+    let get_current_thread_id =
+        resolve_import_symbol(backend, pid, "kernel32.dll", "GetCurrentThreadId")?;
+    let servicing_tid = memory_iat_probe(backend, pid, &hook, get_current_thread_id, timeout_ms)?;
+    Ok(GuestIatHookProbe {
+        candidate,
+        observed: servicing_tid.is_some(),
+        servicing_tid,
+        timeout_ms,
+    })
+}
+
+fn inspect_module_iat_hooks(
+    backend: &dyn GuestMemoryBackend,
+    pid: u32,
+    module: &GuestModuleInfo,
+) -> Result<Vec<GuestIatHookCandidate>, GuestInjectError> {
+    let header = backend.read(pid, module.base, 0x1000)?;
+    if u16_at(&header, 0).map_err(GuestInjectError::from)? != 0x5A4D {
+        return Err(GuestInjectError::Image(format!(
+            "module {} at {:#x} is missing an MZ header",
+            module.name, module.base
+        )));
+    }
+    let nt = u32_at(&header, 0x3C).map_err(GuestInjectError::from)? as usize;
+    if nt + 24 + 128 > header.len()
+        || u32_at(&header, nt).map_err(GuestInjectError::from)? != 0x0000_4550
+    {
+        return Err(GuestInjectError::Image(format!(
+            "module {} at {:#x} is missing a PE header",
+            module.name, module.base
+        )));
+    }
+    let optional = nt + 24;
+    if u16_at(&header, optional).map_err(GuestInjectError::from)? != 0x20B {
+        return Err(GuestInjectError::Unsupported {
+            operation: "IAT hook discovery",
+            reason: format!("module {} is not a PE32+ image", module.name),
+        });
+    }
+    let import_rva = u32_at(&header, optional + 120).map_err(GuestInjectError::from)? as u64;
+    let import_size = u32_at(&header, optional + 124).map_err(GuestInjectError::from)? as u64;
+    if import_rva == 0 || import_size == 0 {
+        return Ok(Vec::new());
+    }
+    if import_rva >= module.size {
+        return Err(GuestInjectError::Image(format!(
+            "module {} has import directory RVA {import_rva:#x} outside image size {:#x}",
+            module.name, module.size
+        )));
+    }
+
+    let descriptor_count = (import_size as usize / 20).clamp(1, MAX_IAT_IMPORT_DESCRIPTORS);
+    let mut entries = Vec::new();
+    for index in 0..descriptor_count {
+        let descriptor_addr = module.base + import_rva + (index * 20) as u64;
+        let descriptor = backend.read(pid, descriptor_addr, 20)?;
+        let original_first_thunk = u32_at(&descriptor, 0).map_err(GuestInjectError::from)? as u64;
+        let name_rva = u32_at(&descriptor, 12).map_err(GuestInjectError::from)? as u64;
+        let first_thunk = u32_at(&descriptor, 16).map_err(GuestInjectError::from)? as u64;
+        if original_first_thunk == 0 && name_rva == 0 && first_thunk == 0 {
+            break;
+        }
+        if name_rva == 0 || first_thunk == 0 {
+            continue;
+        }
+        let import_module = read_remote_cstr(backend, pid, module.base + name_rva, 256)?;
+        if import_module.is_empty() {
+            continue;
+        }
+        let lookup = if original_first_thunk == 0 {
+            first_thunk
+        } else {
+            original_first_thunk
+        };
+        for thunk_index in 0..MAX_IAT_IMPORTS_PER_MODULE {
+            let thunk = read_remote_u64(
+                backend,
+                pid,
+                module.base + lookup + (thunk_index * 8) as u64,
+            )?;
+            if thunk == 0 {
+                break;
+            }
+            let symbol = if thunk & 0x8000_0000_0000_0000 != 0 {
+                format!("#{}", thunk as u16)
+            } else {
+                read_remote_cstr(backend, pid, module.base + thunk + 2, 256)?
+            };
+            if symbol.is_empty() {
+                continue;
+            }
+            let iat_slot = module.base + first_thunk + (thunk_index * 8) as u64;
+            entries.push(GuestIatHookCandidate {
+                source_module: module.name.clone(),
+                import_module: import_module.clone(),
+                priority: iat_hook_priority(&symbol),
+                symbol,
+                iat_slot,
+                original_target: read_remote_u64(backend, pid, iat_slot)?,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+fn iat_hook_priority(symbol: &str) -> u8 {
+    match symbol.to_ascii_lowercase().as_str() {
+        "sleep" | "sleepex" | "ntdelayexecution" => 100,
+        "gettickcount" | "gettickcount64" | "queryperformancecounter" => 90,
+        "getcurrentthreadid" | "getcurrentprocessid" => 80,
+        "waitforsingleobject" | "waitformultipleobjects" | "msgwaitformultipleobjects" => 70,
+        "dispatchmessagew" | "peekmessagew" | "getmessagew" => 60,
+        _ => 0,
+    }
 }
 
 fn find_iat_hook(
@@ -9469,6 +10586,543 @@ fn parse_hex_pattern(pattern: &str, field: &str) -> Result<GuestBytePattern, Gue
 mod tests {
     use super::*;
 
+    const IAT_TEST_PID: u32 = 7;
+    const IAT_TEST_IMAGE: u64 = 0x1000;
+    const IAT_TEST_STAGE: u64 = 0x4000;
+
+    fn mov_immediate_offset(stub: &[u8], opcode: [u8; 2], immediate: [u8; 8]) -> usize {
+        let mut instruction = opcode.to_vec();
+        instruction.extend_from_slice(&immediate);
+        stub.windows(instruction.len())
+            .position(|window| window == instruction)
+            .expect("stub must contain expected mov-immediate instruction")
+    }
+
+    fn assert_stub_disarms_before_completion(stub: &[u8], hook: &GuestIatHook) {
+        let disarm = mov_immediate_offset(stub, [0x49, 0xBA], hook.iat_slot.to_le_bytes());
+        let completion = mov_immediate_offset(stub, [0x48, 0xB8], RESULT_STATE.to_le_bytes());
+        assert!(
+            disarm < completion,
+            "stub must restore the IAT slot before publishing completion"
+        );
+    }
+
+    fn test_iat_hook() -> GuestIatHook {
+        GuestIatHook {
+            iat_slot: IAT_TEST_IMAGE + 0x700,
+            original_target: IAT_TEST_IMAGE + 0x800,
+            stub_addr: IAT_TEST_STAGE + STAGE_STUB_OFFSET,
+            result_addr: IAT_TEST_STAGE + STAGE_RESULT_OFFSET,
+            iat_slot_guest_writable: false,
+            call_stack: GuestCallStackPolicy::Native,
+            spoofed_return: None,
+        }
+    }
+
+    #[test]
+    fn iat_stage_pool_reserves_distinct_immutable_slots() {
+        let hook = test_iat_hook();
+        activate_iat_stage_pool(IAT_TEST_PID, &hook, 0x9000, 4).unwrap();
+        let first = reserve_iat_stage_slot(IAT_TEST_PID, &hook).unwrap();
+        let second = reserve_iat_stage_slot(IAT_TEST_PID, &hook).unwrap();
+        let third = reserve_iat_stage_slot(IAT_TEST_PID, &hook).unwrap();
+        let fourth = reserve_iat_stage_slot(IAT_TEST_PID, &hook).unwrap();
+
+        assert_eq!(first.stub_addr, 0x9000 + STAGE_STUB_OFFSET);
+        assert_eq!(second.stub_addr, 0x9400 + STAGE_STUB_OFFSET);
+        assert_eq!(third.stub_addr, 0x9800 + STAGE_STUB_OFFSET);
+        assert_eq!(fourth.stub_addr, 0xa000 + STAGE_STUB_OFFSET);
+        assert_eq!(first.result_addr, 0x9000 + STAGE_RESULT_OFFSET);
+        assert_eq!(second.result_addr, 0x9400 + STAGE_RESULT_OFFSET);
+        assert_eq!(third.result_addr, 0x9800 + STAGE_RESULT_OFFSET);
+        assert_eq!(fourth.result_addr, 0xa000 + STAGE_RESULT_OFFSET);
+
+        let err = reserve_iat_stage_slot(IAT_TEST_PID, &hook).unwrap_err();
+        assert!(err.to_string().contains("stage pool exhausted"));
+        IAT_STAGE_POOLS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(&iat_stage_pool_key(IAT_TEST_PID, &hook));
+    }
+
+    #[test]
+    fn iat_stage_pool_bootstrap_materializes_each_page_before_completion() {
+        let hook = test_iat_hook();
+        let stub = stage_pool_bootstrap_stub(&hook, 0x1810, 3 * GUEST_PAGE_SIZE as u64).unwrap();
+
+        assert!(
+            stub.windows(3).any(|window| window == [0x48, 0x85, 0xC0]),
+            "bootstrap must skip the touch loop when VirtualAlloc returns NULL"
+        );
+        assert!(
+            stub.windows(3).any(|window| window == [0x48, 0x89, 0xC2]),
+            "bootstrap must use the returned allocation base as the touch address"
+        );
+        assert!(
+            stub.windows(3)
+                .any(|window| window == [0xC6, 0x02, IAT_STAGE_POOL_CANARY_VALUE]),
+            "bootstrap must leave a nonzero canary on every pool page"
+        );
+        let completion = mov_immediate_offset(&stub, [0x48, 0xB8], RESULT_STATE.to_le_bytes());
+        let touch = stub
+            .windows(3)
+            .position(|window| window == [0xC6, 0x02, IAT_STAGE_POOL_CANARY_VALUE])
+            .unwrap();
+        assert!(
+            touch < completion,
+            "pool pages must be touched before completion"
+        );
+    }
+
+    #[test]
+    fn iat_stage_pool_reserves_one_nonzero_canary_region_per_page() {
+        assert_eq!(iat_stage_pool_page_count(1).unwrap(), 1);
+        assert_eq!(iat_stage_pool_page_count(3).unwrap(), 1);
+        assert_eq!(iat_stage_pool_page_count(4).unwrap(), 2);
+        assert_eq!(iat_stage_pool_size(4).unwrap(), 2 * GUEST_PAGE_SIZE as u64);
+        assert_eq!(iat_stage_pool_slot_offset(0).unwrap(), 0);
+        assert_eq!(iat_stage_pool_slot_offset(2).unwrap(), 0x800);
+        assert_eq!(
+            iat_stage_pool_slot_offset(3).unwrap(),
+            GUEST_PAGE_SIZE as u64
+        );
+    }
+
+    #[test]
+    fn guest_injection_lock_releases_pid_on_drop() {
+        const PID: u32 = 0x7f00_0001;
+        let first = GuestInjectionLock::acquire(PID).unwrap();
+        assert!(GuestInjectionLock::acquire(PID).is_err());
+        drop(first);
+        drop(GuestInjectionLock::acquire(PID).unwrap());
+    }
+
+    #[test]
+    fn iat_stage_pool_recovers_after_host_state_is_lost() {
+        let backend = IatTestBackend::new();
+        let hook = test_iat_hook();
+        let base = 0x5000;
+        backend
+            .write(IAT_TEST_PID, base, &iat_stage_pool_header(3))
+            .unwrap();
+        backend
+            .write(
+                IAT_TEST_PID,
+                base + STAGE_RESULT_OFFSET,
+                &RESULT_STATE.to_le_bytes(),
+            )
+            .unwrap();
+        activate_iat_stage_pool(IAT_TEST_PID, &hook, base, 3).unwrap();
+
+        IAT_STAGE_POOLS.get().unwrap().lock().unwrap().clear();
+
+        assert_eq!(
+            recover_iat_stage_pool(&backend, IAT_TEST_PID, &hook).unwrap(),
+            Some(base)
+        );
+        let next = reserve_iat_stage_slot(IAT_TEST_PID, &hook).unwrap();
+        assert_eq!(
+            next.stub_addr,
+            base + STAGE_CAVE_SIZE as u64 + STAGE_STUB_OFFSET
+        );
+        IAT_STAGE_POOLS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(&iat_stage_pool_key(IAT_TEST_PID, &hook));
+    }
+
+    struct IatTestBackend {
+        memory: Mutex<Vec<u8>>,
+        stage_restore_safe: bool,
+    }
+
+    impl IatTestBackend {
+        fn new() -> Self {
+            let mut memory = vec![0u8; 0x6000];
+            let put = |memory: &mut Vec<u8>, rva: usize, bytes: &[u8]| {
+                memory[rva..rva + bytes.len()].copy_from_slice(bytes);
+            };
+            put(&mut memory, 0, &0x5A4Du16.to_le_bytes());
+            put(&mut memory, 0x3C, &0x80u32.to_le_bytes());
+            put(&mut memory, 0x80, &0x0000_4550u32.to_le_bytes());
+            put(&mut memory, 0x80 + 24, &0x20Bu16.to_le_bytes());
+            put(&mut memory, 0x80 + 24 + 120, &0x400u32.to_le_bytes());
+            put(&mut memory, 0x80 + 24 + 124, &0x28u32.to_le_bytes());
+
+            // IMAGE_IMPORT_DESCRIPTOR for KERNEL32.dll!GetTickCount64.
+            put(&mut memory, 0x400, &0x500u32.to_le_bytes());
+            put(&mut memory, 0x400 + 12, &0x600u32.to_le_bytes());
+            put(&mut memory, 0x400 + 16, &0x700u32.to_le_bytes());
+            put(&mut memory, 0x500, &0x800u64.to_le_bytes());
+            put(&mut memory, 0x700, &0x1800u64.to_le_bytes());
+            put(&mut memory, 0x600, b"KERNEL32.dll\0");
+            put(&mut memory, 0x800 + 2, b"GetTickCount64\0");
+
+            Self {
+                memory: Mutex::new(memory),
+                stage_restore_safe: false,
+            }
+        }
+
+        fn with_stage_restore() -> Self {
+            let mut backend = Self::new();
+            backend.stage_restore_safe = true;
+            backend
+        }
+
+        fn offset(addr: u64) -> usize {
+            (addr - IAT_TEST_IMAGE) as usize
+        }
+    }
+
+    impl GuestMemoryBackend for IatTestBackend {
+        fn capabilities(&self) -> GuestCapabilities {
+            let mut capabilities = GuestCapabilities::memflow_guest_injection();
+            capabilities.iat_hook_stage_restore = self.stage_restore_safe;
+            capabilities
+        }
+
+        fn list_processes(&self) -> Result<Vec<GuestProcessInfo>, GuestInjectError> {
+            Ok(vec![GuestProcessInfo {
+                pid: IAT_TEST_PID,
+                name: "fixture.exe".into(),
+            }])
+        }
+
+        fn module_list(&self, _pid: u32) -> Result<Vec<GuestModuleInfo>, GuestInjectError> {
+            Ok(vec![GuestModuleInfo {
+                name: "fixture.exe".into(),
+                base: IAT_TEST_IMAGE,
+                size: 0x3000,
+            }])
+        }
+
+        fn module_exports(
+            &self,
+            _pid: u32,
+            _module: &str,
+        ) -> Result<Vec<(String, u64)>, GuestInjectError> {
+            Ok(Vec::new())
+        }
+
+        fn memory_map(&self, _pid: u32) -> Result<Vec<GuestMemoryRegion>, GuestInjectError> {
+            Ok(vec![GuestMemoryRegion {
+                base: IAT_TEST_IMAGE,
+                size: 0x6000,
+                readable: true,
+                writable: true,
+                executable: true,
+            }])
+        }
+
+        fn read(&self, _pid: u32, addr: u64, len: usize) -> Result<Vec<u8>, GuestInjectError> {
+            let start = Self::offset(addr);
+            let end = start
+                .checked_add(len)
+                .ok_or_else(|| GuestInjectError::Backend("synthetic read overflow".into()))?;
+            self.memory
+                .lock()
+                .unwrap()
+                .get(start..end)
+                .map(|bytes| bytes.to_vec())
+                .ok_or_else(|| GuestInjectError::Backend("synthetic read out of range".into()))
+        }
+
+        fn write(&self, _pid: u32, addr: u64, data: &[u8]) -> Result<(), GuestInjectError> {
+            let start = Self::offset(addr);
+            let end = start
+                .checked_add(data.len())
+                .ok_or_else(|| GuestInjectError::Backend("synthetic write overflow".into()))?;
+            let mut memory = self.memory.lock().unwrap();
+            let destination = memory
+                .get_mut(start..end)
+                .ok_or_else(|| GuestInjectError::Backend("synthetic write out of range".into()))?;
+            destination.copy_from_slice(data);
+            Ok(())
+        }
+    }
+
+    struct FailingIatRestoreBackend {
+        inner: IatTestBackend,
+    }
+
+    impl FailingIatRestoreBackend {
+        fn new() -> Self {
+            Self {
+                inner: IatTestBackend::new(),
+            }
+        }
+    }
+
+    impl GuestMemoryBackend for FailingIatRestoreBackend {
+        fn capabilities(&self) -> GuestCapabilities {
+            self.inner.capabilities()
+        }
+
+        fn list_processes(&self) -> Result<Vec<GuestProcessInfo>, GuestInjectError> {
+            self.inner.list_processes()
+        }
+
+        fn module_list(&self, pid: u32) -> Result<Vec<GuestModuleInfo>, GuestInjectError> {
+            self.inner.module_list(pid)
+        }
+
+        fn module_exports(
+            &self,
+            pid: u32,
+            module: &str,
+        ) -> Result<Vec<(String, u64)>, GuestInjectError> {
+            self.inner.module_exports(pid, module)
+        }
+
+        fn memory_map(&self, pid: u32) -> Result<Vec<GuestMemoryRegion>, GuestInjectError> {
+            self.inner.memory_map(pid)
+        }
+
+        fn read(&self, pid: u32, addr: u64, len: usize) -> Result<Vec<u8>, GuestInjectError> {
+            self.inner.read(pid, addr, len)
+        }
+
+        fn write(&self, pid: u32, addr: u64, data: &[u8]) -> Result<(), GuestInjectError> {
+            if addr == IAT_TEST_IMAGE + 0x700 && data == 0x1800u64.to_le_bytes() {
+                return Err(GuestInjectError::Backend(
+                    "synthetic IAT restore failure".into(),
+                ));
+            }
+            self.inner.write(pid, addr, data)
+        }
+    }
+
+    #[test]
+    fn iat_hook_discovery_reports_named_import_slot_and_priority() {
+        let backend = IatTestBackend::new();
+        let candidates =
+            inspect_iat_hook_candidates(&backend, IAT_TEST_PID, Some("fixture.exe")).unwrap();
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.source_module, "fixture.exe");
+        assert_eq!(candidate.import_module, "KERNEL32.dll");
+        assert_eq!(candidate.symbol, "GetTickCount64");
+        assert_eq!(candidate.iat_slot, IAT_TEST_IMAGE + 0x700);
+        assert_eq!(candidate.original_target, 0x1800);
+        assert_eq!(candidate.priority, 90);
+    }
+
+    #[test]
+    fn iat_hook_probe_timeout_restores_iat_and_retains_completed_stage() {
+        let backend = IatTestBackend::new();
+        let iat_before = backend
+            .read(IAT_TEST_PID, IAT_TEST_IMAGE + 0x700, 8)
+            .unwrap();
+        let stub_before = backend
+            .read(IAT_TEST_PID, IAT_TEST_STAGE + STAGE_STUB_OFFSET, 64)
+            .unwrap();
+        let result_before = backend
+            .read(
+                IAT_TEST_PID,
+                IAT_TEST_STAGE + STAGE_RESULT_OFFSET,
+                RESULT_BLOCK_SIZE,
+            )
+            .unwrap();
+
+        let hook = GuestIatHook {
+            iat_slot: IAT_TEST_IMAGE + 0x700,
+            original_target: 0x1800,
+            stub_addr: IAT_TEST_STAGE + STAGE_STUB_OFFSET,
+            result_addr: IAT_TEST_STAGE + STAGE_RESULT_OFFSET,
+            iat_slot_guest_writable: true,
+            call_stack: GuestCallStackPolicy::Native,
+            spoofed_return: None,
+        };
+        assert_eq!(
+            memory_iat_probe(&backend, IAT_TEST_PID, &hook, 0x1810, 0).unwrap(),
+            None
+        );
+        assert_eq!(
+            backend
+                .read(IAT_TEST_PID, IAT_TEST_IMAGE + 0x700, 8)
+                .unwrap(),
+            iat_before
+        );
+        assert_ne!(
+            backend
+                .read(IAT_TEST_PID, IAT_TEST_STAGE + STAGE_STUB_OFFSET, 64)
+                .unwrap(),
+            stub_before
+        );
+        assert_eq!(
+            u64::from_le_bytes(
+                backend
+                    .read(IAT_TEST_PID, IAT_TEST_STAGE + STAGE_RESULT_OFFSET, 8)
+                    .unwrap()
+                    .try_into()
+                    .unwrap()
+            ),
+            RESULT_STATE
+        );
+        assert_ne!(
+            backend
+                .read(
+                    IAT_TEST_PID,
+                    IAT_TEST_STAGE + STAGE_RESULT_OFFSET,
+                    RESULT_BLOCK_SIZE
+                )
+                .unwrap(),
+            result_before
+        );
+    }
+
+    #[test]
+    fn iat_hook_probe_timeout_restores_stage_with_proven_thread_barrier() {
+        let backend = IatTestBackend::with_stage_restore();
+        let stub_before = backend
+            .read(IAT_TEST_PID, IAT_TEST_STAGE + STAGE_STUB_OFFSET, 64)
+            .unwrap();
+        let result_before = backend
+            .read(
+                IAT_TEST_PID,
+                IAT_TEST_STAGE + STAGE_RESULT_OFFSET,
+                RESULT_BLOCK_SIZE,
+            )
+            .unwrap();
+        let hook = GuestIatHook {
+            iat_slot: IAT_TEST_IMAGE + 0x700,
+            original_target: 0x1800,
+            stub_addr: IAT_TEST_STAGE + STAGE_STUB_OFFSET,
+            result_addr: IAT_TEST_STAGE + STAGE_RESULT_OFFSET,
+            iat_slot_guest_writable: true,
+            call_stack: GuestCallStackPolicy::Native,
+            spoofed_return: None,
+        };
+
+        assert_eq!(
+            memory_iat_probe(&backend, IAT_TEST_PID, &hook, 0x1810, 0).unwrap(),
+            None
+        );
+        assert_eq!(
+            backend
+                .read(IAT_TEST_PID, IAT_TEST_STAGE + STAGE_STUB_OFFSET, 64)
+                .unwrap(),
+            stub_before
+        );
+        assert_eq!(
+            backend
+                .read(
+                    IAT_TEST_PID,
+                    IAT_TEST_STAGE + STAGE_RESULT_OFFSET,
+                    RESULT_BLOCK_SIZE
+                )
+                .unwrap(),
+            result_before
+        );
+    }
+
+    #[test]
+    fn iat_hook_restore_retains_stage_when_disarming_the_slot_fails() {
+        let backend = FailingIatRestoreBackend::new();
+        let hook = GuestIatHook {
+            iat_slot: IAT_TEST_IMAGE + 0x700,
+            original_target: 0x1800,
+            stub_addr: IAT_TEST_STAGE + STAGE_STUB_OFFSET,
+            result_addr: IAT_TEST_STAGE + STAGE_RESULT_OFFSET,
+            iat_slot_guest_writable: false,
+            call_stack: GuestCallStackPolicy::Native,
+            spoofed_return: None,
+        };
+        let mut transaction = IatHookTransaction::prepare(&backend, IAT_TEST_PID, &hook, 64)
+            .expect("transaction should snapshot the intact IAT slot");
+        let armed_stub = vec![0xA5; 64];
+        let armed_result = vec![0x5A; RESULT_BLOCK_SIZE];
+        backend
+            .write(IAT_TEST_PID, hook.stub_addr, &armed_stub)
+            .unwrap();
+        backend
+            .write(IAT_TEST_PID, hook.result_addr, &armed_result)
+            .unwrap();
+        transaction.armed = true;
+
+        let err = transaction.restore().unwrap_err();
+        assert!(err.to_string().contains("deliberately retained"));
+        assert_eq!(
+            backend
+                .read(IAT_TEST_PID, hook.stub_addr, armed_stub.len())
+                .unwrap(),
+            armed_stub,
+            "stage code must remain intact when IAT restoration is uncertain"
+        );
+        assert_eq!(
+            backend
+                .read(IAT_TEST_PID, hook.result_addr, armed_result.len())
+                .unwrap(),
+            armed_result,
+            "result memory must remain intact when IAT restoration is uncertain"
+        );
+    }
+
+    #[test]
+    fn iat_hook_restore_waits_for_inflight_stubs_before_restoring_stage() {
+        let backend = IatTestBackend::with_stage_restore();
+        let hook = GuestIatHook {
+            iat_slot: IAT_TEST_IMAGE + 0x700,
+            original_target: 0x1800,
+            stub_addr: IAT_TEST_STAGE + STAGE_STUB_OFFSET,
+            result_addr: IAT_TEST_STAGE + STAGE_RESULT_OFFSET,
+            iat_slot_guest_writable: false,
+            call_stack: GuestCallStackPolicy::Native,
+            spoofed_return: None,
+        };
+        let mut transaction = IatHookTransaction::prepare(&backend, IAT_TEST_PID, &hook, 64)
+            .expect("transaction should snapshot the intact IAT slot");
+        let armed_stub = vec![0xA5; 64];
+        backend
+            .write(IAT_TEST_PID, hook.stub_addr, &armed_stub)
+            .unwrap();
+        backend
+            .write(
+                IAT_TEST_PID,
+                hook.result_addr + RESULT_INFLIGHT_OFFSET,
+                &1u64.to_le_bytes(),
+            )
+            .unwrap();
+        transaction.armed = true;
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(5));
+                assert_eq!(
+                    backend
+                        .read(IAT_TEST_PID, hook.stub_addr, armed_stub.len())
+                        .unwrap(),
+                    armed_stub,
+                    "stage must remain intact until in-flight stubs have exited"
+                );
+                backend
+                    .write(
+                        IAT_TEST_PID,
+                        hook.result_addr + RESULT_INFLIGHT_OFFSET,
+                        &0u64.to_le_bytes(),
+                    )
+                    .unwrap();
+            });
+            transaction.restore().unwrap();
+        });
+    }
+
+    #[test]
+    fn independent_execution_satisfies_the_bootstrap_capability_requirement() {
+        let mut capabilities = GuestCapabilities::default();
+        capabilities.independent_execution = true;
+        let missing = capabilities.missing_manual_map();
+        assert!(
+            !missing.contains(&"execution-bootstrap"),
+            "independent execution is a valid replacement for IAT-hook bootstrap"
+        );
+    }
+
     #[test]
     fn target_requires_pid_or_name() {
         let target = GuestProcessSelector {
@@ -9622,6 +11276,7 @@ mod tests {
             original_target: 0x2000,
             stub_addr: 0x3000,
             result_addr: 0x4000,
+            iat_slot_guest_writable: true,
             call_stack: GuestCallStackPolicy::Native,
             spoofed_return: None,
         };
@@ -9642,10 +11297,7 @@ mod tests {
             stub.windows(5).any(|w| w == [0xF0, 0x4D, 0x0F, 0xB1, 0x1A]),
             "stub must atomically claim the result block so only one thread runs the injection call"
         );
-        assert!(
-            !stub.windows(8).any(|w| w == hook.iat_slot.to_le_bytes()),
-            "stub must not write the guest IAT; the host transaction restores it"
-        );
+        assert_stub_disarms_before_completion(&stub, &hook);
         assert!(
             stub.starts_with(&[0x51, 0x52, 0x41, 0x50, 0x41, 0x51]),
             "stub must save the import caller's register arguments before the injected call"
@@ -9675,6 +11327,7 @@ mod tests {
             original_target: 0x2000,
             stub_addr: 0x3000,
             result_addr: 0x4000,
+            iat_slot_guest_writable: true,
             call_stack: GuestCallStackPolicy::Native,
             spoofed_return: Some(GuestSpoofedReturn {
                 gadget_addr: 0x7000,
@@ -9709,29 +11362,28 @@ mod tests {
     }
 
     #[test]
-    fn iat_hook_touch_stub_materializes_pages_without_iat_write() {
+    fn iat_hook_touch_stub_materializes_pages_and_self_disarms() {
         let hook = GuestIatHook {
             iat_slot: 0x1000,
             original_target: 0x2000,
             stub_addr: 0x3000,
             result_addr: 0x4000,
+            iat_slot_guest_writable: true,
             call_stack: GuestCallStackPolicy::Native,
             spoofed_return: None,
         };
         let stub = touch_stub(&hook, 0x5000, GUEST_PAGE_SIZE + 1);
         assert!(
-            stub.windows(3).any(|w| w == [0xC6, 0x02, 0x00]),
-            "touch stub must fault in pages by writing through RDX"
+            stub.windows(6)
+                .any(|w| w == [0x80, 0x32, 0xA5, 0x80, 0x32, 0xA5]),
+            "touch stub must fault in pages by flipping and restoring a byte through RDX"
         );
         assert!(
             stub.windows(7)
                 .any(|w| w == [0x48, 0x81, 0xC2, 0x00, 0x10, 0x00, 0x00]),
             "touch stub must advance by guest page size"
         );
-        assert!(
-            !stub.windows(8).any(|w| w == hook.iat_slot.to_le_bytes()),
-            "touch stub must not write the guest IAT; the host transaction restores it"
-        );
+        assert_stub_disarms_before_completion(&stub, &hook);
         assert!(
             stub.windows(8)
                 .any(|w| w == hook.original_target.to_le_bytes()),
@@ -9751,6 +11403,7 @@ mod tests {
             original_target: 0x2000,
             stub_addr: 0x3000,
             result_addr: 0x4000,
+            iat_slot_guest_writable: true,
             call_stack: GuestCallStackPolicy::Native,
             spoofed_return: None,
         };
@@ -9760,13 +11413,12 @@ mod tests {
             "read-touch stub must fault in pages by reading through RDX"
         );
         assert!(
-            !stub.windows(3).any(|w| w == [0xC6, 0x02, 0x00]),
+            !stub
+                .windows(6)
+                .any(|w| w == [0x80, 0x32, 0xA5, 0x80, 0x32, 0xA5]),
             "read-touch stub must not write to materialized pages"
         );
-        assert!(
-            !stub.windows(8).any(|w| w == hook.iat_slot.to_le_bytes()),
-            "read-touch stub must not write the guest IAT; the host transaction restores it"
-        );
+        assert_stub_disarms_before_completion(&stub, &hook);
     }
 
     #[test]
@@ -9776,6 +11428,7 @@ mod tests {
             original_target: 0x2000,
             stub_addr: 0x3000,
             result_addr: 0x4000,
+            iat_slot_guest_writable: true,
             call_stack: GuestCallStackPolicy::Native,
             spoofed_return: None,
         };
@@ -9785,13 +11438,87 @@ mod tests {
             "preserve-touch stub must fault in pages by writing the original byte back"
         );
         assert!(
-            !stub.windows(3).any(|w| w == [0xC6, 0x02, 0x00]),
+            !stub
+                .windows(6)
+                .any(|w| w == [0x80, 0x32, 0xA5, 0x80, 0x32, 0xA5]),
             "preserve-touch stub must not zero image-backed page contents"
         );
-        assert!(
-            !stub.windows(8).any(|w| w == hook.iat_slot.to_le_bytes()),
-            "preserve-touch stub must not write the guest IAT; the host transaction restores it"
+        assert_stub_disarms_before_completion(&stub, &hook);
+    }
+
+    #[test]
+    fn iat_hook_framed_touch_stub_self_disarms() {
+        let hook = GuestIatHook {
+            iat_slot: 0x1000,
+            original_target: 0x2000,
+            stub_addr: 0x3000,
+            result_addr: 0x4000,
+            iat_slot_guest_writable: true,
+            call_stack: GuestCallStackPolicy::RegisteredUnwind,
+            spoofed_return: None,
+        };
+        let stub = touch_stub(&hook, 0x5000, GUEST_PAGE_SIZE);
+        assert_stub_disarms_before_completion(&stub, &hook);
+        assert_eq!(
+            &stub[stub.len() - 2..],
+            &[0xFF, 0xE0],
+            "framed touch stub should tail-jump through RAX to the original import target"
         );
+    }
+
+    #[test]
+    fn iat_hook_stubs_leave_read_only_slots_for_host_restoration() {
+        let hook = GuestIatHook {
+            iat_slot: 0x1000,
+            original_target: 0x2000,
+            stub_addr: 0x3000,
+            result_addr: 0x4000,
+            iat_slot_guest_writable: false,
+            call_stack: GuestCallStackPolicy::Native,
+            spoofed_return: None,
+        };
+        let mut slot_restore = vec![0x49, 0xBA];
+        slot_restore.extend_from_slice(&hook.iat_slot.to_le_bytes());
+
+        for stub in [
+            call_stub(&hook, 0x5000, &[1, 2, 3, 4]),
+            touch_stub(&hook, 0x5000, GUEST_PAGE_SIZE),
+        ] {
+            assert!(
+                !stub
+                    .windows(slot_restore.len())
+                    .any(|window| window == slot_restore),
+                "read-only IAT slots must be restored by the host transaction"
+            );
+        }
+    }
+
+    #[test]
+    fn iat_hook_stubs_track_inflight_execution_until_the_tail_jump() {
+        let hook = GuestIatHook {
+            iat_slot: 0x1000,
+            original_target: 0x2000,
+            stub_addr: 0x3000,
+            result_addr: 0x4000,
+            iat_slot_guest_writable: false,
+            call_stack: GuestCallStackPolicy::Native,
+            spoofed_return: None,
+        };
+        for stub in [
+            call_stub(&hook, 0x5000, &[1, 2, 3, 4]),
+            touch_stub(&hook, 0x5000, GUEST_PAGE_SIZE),
+        ] {
+            let increment = stub
+                .windows(4)
+                .position(|window| window == [0xF0, 0x49, 0xFF, 0x02])
+                .expect("stub must increment the in-flight counter");
+            let decrement = stub
+                .windows(4)
+                .position(|window| window == [0xF0, 0x49, 0xFF, 0x0A])
+                .expect("stub must decrement the in-flight counter");
+            assert!(increment < decrement);
+            assert_eq!(&stub[stub.len() - 2..], &[0xFF, 0xE0]);
+        }
     }
 
     #[test]
@@ -9878,6 +11605,7 @@ mod tests {
             original_target: 0x2000,
             stub_addr: 0x3000,
             result_addr: 0x4000,
+            iat_slot_guest_writable: true,
             call_stack: GuestCallStackPolicy::RegisteredUnwind,
             spoofed_return: None,
         };
@@ -9905,7 +11633,7 @@ mod tests {
 
     #[test]
     fn stub_unwind_metadata_describes_registered_frame() {
-        let metadata = stub_unwind_metadata().unwrap();
+        let metadata = stub_unwind_metadata(None).unwrap();
         assert_eq!(&metadata[0..4], &(STAGE_STUB_OFFSET as u32).to_le_bytes());
         assert_eq!(
             &metadata[4..8],
@@ -9919,6 +11647,19 @@ mod tests {
         assert_eq!(metadata[13], 4);
         assert_eq!(metadata[14], 1);
         assert_eq!(metadata[17], ((FRAMED_STUB_STACK_ALLOC / 8 - 1) << 4) | 2);
+    }
+
+    #[test]
+    fn pooled_stub_unwind_metadata_excludes_bootstrap_slot() {
+        let metadata = stub_unwind_metadata(Some(3)).unwrap();
+        assert_eq!(
+            &metadata[0..4],
+            &((STAGE_CAVE_SIZE as u32) + (STAGE_STUB_OFFSET as u32)).to_le_bytes()
+        );
+        assert_eq!(
+            &metadata[4..8],
+            &((STAGE_CAVE_SIZE as u32) * 3).to_le_bytes()
+        );
     }
 
     #[test]
@@ -10172,6 +11913,7 @@ mod tests {
             original_target: 0x2000,
             stub_addr: 0x3000,
             result_addr: 0x4000,
+            iat_slot_guest_writable: true,
             call_stack: GuestCallStackPolicy::Native,
             spoofed_return: None,
         };

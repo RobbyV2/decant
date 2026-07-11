@@ -8,10 +8,12 @@ LIVE_DIR="${DECANT_LIVE_DIR:-$HOME/Downloads/decant-live}"
 ENDPOINT="${DECANT_ENDPOINT:-127.0.0.1:7878}"
 
 FIXTURE_PROCESS="guest-inject-target.exe"
-FIXTURE_MAGIC="44 45 43 41 4e 54 3a 3a 47 49 4e 4a 30 30 30 37"
+FIXTURE_MAGIC="${DECANT_GUEST_FIXTURE_MAGIC:-44 45 43 41 4e 54 3a 3a 47 49 4e 4a 30 30 30 38}"
+FIXTURE_PROBE_MAGIC="44 45 43 41 4e 54 3a 3a 47 55 45 53 54 49 4e 4a"
 STUB_MAGIC="44 45 43 41 4e 54 3a 3a 53 54 55 42 30 30 30 34"
 RESULT_MAGIC="44 45 43 41 4e 54 3a 3a 52 45 53 55 4c 54 30 34"
 MARKER_LE="07 51 0d 60 a7 ec 1d d1"
+FIXTURE_RESULT_RVA="${DECANT_GUEST_FIXTURE_RESULT_RVA:-0x22000}"
 DAEMON_PID=""
 
 usage() {
@@ -108,7 +110,7 @@ publish_guest_fixture_artifacts() {
   fi
   mkdir -p "$LIVE_DIR"
   local artifact
-  for artifact in guest-inject-target.exe guest_inject_probe.dll guest_inject_imports.dll guest_inject_tls.dll guest_inject_sxs.dll guest_inject_rust.dll; do
+  for artifact in guest-inject-target.exe guest_inject_probe.dll guest_inject_imports.dll guest_inject_tls.dll guest_inject_sxs.dll guest_inject_fileio.dll guest_inject_restart.dll guest_inject_rust.dll; do
     install -m 0644 "$source_dir/$artifact" "$LIVE_DIR/$artifact"
   done
 }
@@ -213,8 +215,8 @@ wait_for_tick_window() {
 }
 
 fixture_tick_advances() {
-  local pid="$1" fixture="$2" tick_addr before after bytes
-  tick_addr="$(printf '0x%x' "$((fixture + 32))")"
+  local pid="$1" probe="$2" tick_addr before after bytes
+  tick_addr="$(printf '0x%x' "$((probe + 16))")"
   bytes="$(hex_bytes "$pid" "$tick_addr" 8 || true)"
   if [[ -z "$bytes" ]]; then
     return 1
@@ -235,34 +237,70 @@ fixture_tick_advances() {
 }
 
 fixture_target() {
-  local name="$1" pid marker found_pid="" found_marker="" stale_count=0
+  local name="$1" pid version_marker probe found_pid="" found_probe="" stale_count=0
   while read -r pid _; do
-    marker="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$FIXTURE_MAGIC" | awk '/^0x/{print $1; exit}')"
-    if [[ -n "$marker" ]]; then
-      if ! fixture_tick_advances "$pid" "$marker"; then
-        stale_count=$((stale_count + 1))
-        echo "skipping stale $name pid=$pid: fixture tick did not advance" >&2
-        continue
-      fi
-      if [[ -n "$found_pid" ]]; then
-        echo "multiple $name processes contain the fixture marker; set DECANT_GUEST_PID" >&2
-        exit 4
-      fi
-      found_pid="$pid"
-      found_marker="$marker"
+    version_marker="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$FIXTURE_MAGIC" | awk '/^0x/{print $1; exit}')"
+    probe="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$FIXTURE_PROBE_MAGIC" | awk '/^0x/{print $1; exit}')"
+    if [[ -z "$probe" ]]; then
+      continue
     fi
+    if [[ -z "$version_marker" && "${DECANT_GUEST_FIXTURE_ALLOW_LEGACY_PROBE:-0}" != "1" ]]; then
+      continue
+    fi
+    if ! fixture_tick_advances "$pid" "$probe"; then
+      stale_count=$((stale_count + 1))
+      echo "skipping stale $name pid=$pid: fixture tick did not advance" >&2
+      continue
+    fi
+    if [[ -n "$found_pid" ]]; then
+      echo "multiple $name processes contain the fixture probe; set DECANT_GUEST_PID" >&2
+      exit 4
+    fi
+    found_pid="$pid"
+    found_probe="$probe"
   done < <("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" processes | awk -v n="$name" '$2 == n {print $1, $2}')
   if [[ -z "$found_pid" ]]; then
     if [[ "$stale_count" -gt 0 ]]; then
       echo "$name has $stale_count stale fixture process(es), but none are live" >&2
       echo "stop the stale guest-inject-target.exe process in the VM, start a fresh one, then rerun" >&2
     else
-      echo "$name is not running with fixture marker DECANT::GINJ0007" >&2
+    echo "$name is not running with the expected fixture version marker" >&2
     fi
     echo "copy $LIVE_DIR/guest-inject-target.exe into the VM, start it, then rerun this command" >&2
     exit 4
   fi
-  printf '%s %s\n' "$found_pid" "$found_marker"
+  printf '%s %s\n' "$found_pid" "$found_probe"
+}
+
+replacement_fixture_target() {
+  local old_pid="$1" pid version_marker probe
+  while read -r pid _; do
+    if [[ "$pid" == "$old_pid" ]]; then
+      continue
+    fi
+    version_marker="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$FIXTURE_MAGIC" | awk '/^0x/{print $1; exit}')"
+    probe="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$FIXTURE_PROBE_MAGIC" | awk '/^0x/{print $1; exit}')"
+    if [[ -n "$probe" ]] \
+      && { [[ -n "$version_marker" ]] || [[ "${DECANT_GUEST_FIXTURE_ALLOW_LEGACY_PROBE:-0}" == "1" ]]; } \
+      && fixture_tick_advances "$pid" "$probe"; then
+      printf '%s %s\n' "$pid" "$probe"
+      return 0
+    fi
+  done < <("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" processes | awk -v n="$FIXTURE_PROCESS" '$2 == n {print $1, $2}')
+  return 1
+}
+
+wait_for_replacement_fixture() {
+  local old_pid="$1" replacement
+  for _ in $(seq 1 80); do
+    if replacement="$(replacement_fixture_target "$old_pid")"; then
+      printf '%s\n' "$replacement"
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "guest fixture: replacement target did not appear after pid $old_pid exited" >&2
+  return 1
 }
 
 guest_fixture() {
@@ -319,16 +357,26 @@ guest_fixture() {
   start_daemon_background "$connector" "$vm" "$args" "$log"
   trap cleanup_daemon EXIT
 
-  local pid fixture stub result bytes marker probe tick_addr count_addr count_before count_after
+  local pid probe stub result result_from_marker bytes marker tick_addr count_addr count_before count_after
   if [[ -n "${DECANT_GUEST_PID:-}" ]]; then
     pid="$DECANT_GUEST_PID"
-    fixture="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$FIXTURE_MAGIC" | awk '/^0x/{print $1; exit}')"
+    probe="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$FIXTURE_PROBE_MAGIC" | awk '/^0x/{print $1; exit}')"
   else
-    read -r pid fixture < <(fixture_target "$FIXTURE_PROCESS")
+    read -r pid probe < <(fixture_target "$FIXTURE_PROCESS")
   fi
   stub="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$STUB_MAGIC" | awk '/^0x/{print $1; exit}')"
   result="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$RESULT_MAGIC" | awk '/^0x/{print $1; exit}')"
-  if [[ -z "$fixture" || -z "$stub" || -z "$result" ]]; then
+  result_from_marker=1
+  if [[ -z "$result" ]]; then
+    local fixture_module_base
+    fixture_module_base="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" modules "$pid" | awk -v n="$FIXTURE_PROCESS" '$3 == n {print $1; exit}')"
+    if [[ -n "$fixture_module_base" ]]; then
+      result="$(printf '0x%x' "$((fixture_module_base + FIXTURE_RESULT_RVA))")"
+      result_from_marker=0
+      echo "guest fixture: result magic is consumed; using fixture result RVA $FIXTURE_RESULT_RVA at $result" >&2
+    fi
+  fi
+  if [[ -z "$probe" || -z "$stub" || -z "$result" ]]; then
     echo "fixture markers were not all found in pid $pid" >&2
     exit 4
   fi
@@ -337,13 +385,20 @@ guest_fixture() {
     echo "stub marker readback mismatch at $stub: ${bytes:-<unreadable>}" >&2
     exit 4
   fi
-  bytes="$(hex_bytes "$pid" "$result" 16 || true)"
-  if [[ "$bytes" != "$RESULT_MAGIC" ]]; then
-    echo "result marker readback mismatch at $result: ${bytes:-<unreadable>}" >&2
-    exit 4
+  if [[ "$result_from_marker" -eq 1 ]]; then
+    bytes="$(hex_bytes "$pid" "$result" 16 || true)"
+    if [[ "$bytes" != "$RESULT_MAGIC" ]]; then
+      echo "result marker readback mismatch at $result: ${bytes:-<unreadable>}" >&2
+      exit 4
+    fi
+  else
+    bytes="$(hex_bytes "$pid" "$result" 24 || true)"
+    if [[ -z "$bytes" ]]; then
+      echo "result slot at fallback address $result is unreadable" >&2
+      exit 4
+    fi
   fi
-  echo "selected target: pid=$pid fixture=$fixture stub=$stub result=$result"
-  probe="$(printf '0x%x' "$((fixture + 16))")"
+  echo "selected target: pid=$pid probe=$probe stub=$stub result=$result"
   tick_addr="$(printf '0x%x' "$((probe + 16))")"
   marker="$(printf '0x%x' "$((probe + 24))")"
   count_addr="$(printf '0x%x' "$((probe + 32))")"
@@ -359,7 +414,9 @@ guest_fixture() {
       guest_inject_probe.dll
       guest_inject_imports.dll
       guest_inject_tls.dll
+      guest_inject_fileio.dll
       guest_inject_rust.dll
+      guest_inject_restart.dll
     )
   fi
   for payload in "${payloads[@]}"; do
@@ -372,6 +429,11 @@ guest_fixture() {
       echo "guest fixture payload not found: $payload" >&2
       exit 2
     fi
+    local expected_payload=""
+    case "$payload_name" in
+      guest_inject_fileio.dll) expected_payload="decant file io ok" ;;
+      guest_inject_restart.dll) expected_payload="decant restart scheduled" ;;
+    esac
     local extra_args=(
       --loader-metadata "$loader_metadata"
       --call-stack "$call_stack"
@@ -424,11 +486,42 @@ guest_fixture() {
       tail -n 260 "$log" >&2 || true
       exit 5
     fi
+    if [[ "$payload_name" == "guest_inject_restart.dll" ]]; then
+      local old_pid="$pid" replacement
+      read -r pid probe < <(wait_for_replacement_fixture "$old_pid")
+      if "$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" processes | awk -v old="$old_pid" '$1 == old { found=1 } END { exit found ? 0 : 1 }'; then
+        echo "guest fixture: restart payload left old pid=$old_pid running" >&2
+        exit 5
+      fi
+      stub="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$STUB_MAGIC" | awk '/^0x/{print $1; exit}')"
+      result="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$RESULT_MAGIC" | awk '/^0x/{print $1; exit}')"
+      if [[ -z "$stub" || -z "$result" ]]; then
+        echo "guest fixture: replacement pid=$pid is missing stage/result markers" >&2
+        exit 5
+      fi
+      tick_addr="$(printf '0x%x' "$((probe + 16))")"
+      marker="$(printf '0x%x' "$((probe + 24))")"
+      count_addr="$(printf '0x%x' "$((probe + 32))")"
+      count_before="$(read_u64_le "$pid" "$count_addr")"
+      echo "guest fixture: PASS $payload_name replaced pid=$old_pid with pid=$pid"
+      continue
+    fi
     for _ in $(seq 1 50); do
       bytes="$(hex_bytes "$pid" "$marker" 8 || true)"
       count_after="$(read_u64_le "$pid" "$count_addr")"
-      if [[ "$bytes" == "$MARKER_LE" && "$count_after" -ge "$expected_count" ]]; then
+      local payload_ok=1
+      if [[ -n "$expected_payload" ]]; then
+        local payload_addr expected_payload_bytes actual_payload_bytes
+        payload_addr="$(printf '0x%x' "$((probe + 40))")"
+        expected_payload_bytes="$(printf '%s' "$expected_payload" | od -An -tx1 | tr -s ' ' | sed 's/^ //;s/ $//')"
+        actual_payload_bytes="$(hex_bytes "$pid" "$payload_addr" "${#expected_payload}" || true)"
+        [[ "$actual_payload_bytes" == "$expected_payload_bytes" ]] || payload_ok=0
+      fi
+      if [[ "$bytes" == "$MARKER_LE" && "$count_after" -ge "$expected_count" && "$payload_ok" -eq 1 ]]; then
         echo "guest fixture: PASS $payload_name pid=$pid count=$count_after"
+        if [[ "$payload_name" == "guest_inject_fileio.dll" ]]; then
+          echo "guest fixture: filesystem round-trip verified at %TEMP%\\decant-guest-inject-fileio.txt"
+        fi
         count_before="$count_after"
         break
       fi

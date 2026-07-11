@@ -4,8 +4,8 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use decant_protocol::{
-    Diagnostics, MemRegion, ModuleInfo, Pid, ProcessInfo, ProtoError, Request, Response, read_msg,
-    write_msg,
+    Diagnostics, MemRegion, ModuleInfo, PhysicalMemoryInfo, PhysicalRead, PhysicalWrite, Pid,
+    ProcessInfo, ProtoError, Request, Response, read_msg, write_msg,
 };
 
 pub use decant_protocol as protocol;
@@ -167,6 +167,36 @@ impl Client {
             Response::MemoryMap(m) => Ok(m),
             o => Err(o),
         })
+    }
+
+    pub fn physical_memory_info(&mut self) -> Result<PhysicalMemoryInfo> {
+        expect(self.send(Request::PhysicalMemoryInfo)?, |r| match r {
+            Response::PhysicalMemoryInfo(info) => Ok(info),
+            o => Err(o),
+        })
+    }
+
+    pub fn read_physical_scatter(
+        &mut self,
+        ranges: Vec<PhysicalRead>,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        expect(
+            self.send(Request::PhysicalReadScatter(ranges))?,
+            |r| match r {
+                Response::PhysicalData(data) => Ok(data),
+                o => Err(o),
+            },
+        )
+    }
+
+    pub fn write_physical_scatter(&mut self, ranges: Vec<PhysicalWrite>) -> Result<Vec<bool>> {
+        expect(
+            self.send(Request::PhysicalWriteScatter(ranges))?,
+            |r| match r {
+                Response::PhysicalWritten(written) => Ok(written),
+                o => Err(o),
+            },
+        )
     }
 
     pub fn scan(&mut self, pid: Pid, pattern: &str) -> Result<Vec<u64>> {

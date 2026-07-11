@@ -1,6 +1,9 @@
 //! Backend trait and mock guest model for Decant memory access.
 
-pub use decant_protocol::{MemRegion, ModuleInfo, Pid, ProcessInfo, ProtoError};
+pub use decant_protocol::{
+    MemRegion, ModuleInfo, PhysicalMemoryInfo, PhysicalRead, PhysicalWrite, Pid, ProcessInfo,
+    ProtoError,
+};
 
 mod mock;
 pub use mock::{MockBackend, MockGuest};
@@ -58,4 +61,46 @@ pub trait MemoryBackend: Send + Sync {
     fn read(&self, pid: Pid, addr: u64, len: usize) -> Result<Vec<u8>>;
     fn write(&self, pid: Pid, addr: u64, data: &[u8]) -> Result<usize>;
     fn memory_map(&self, pid: Pid) -> Result<Vec<MemRegion>>;
+
+    /// Describe the raw connector address space for consumers that perform
+    /// their own operating-system analysis (for example MemProcFS/Orpheus).
+    fn physical_memory_info(&self) -> Result<PhysicalMemoryInfo> {
+        Err(BackendError::Unsupported {
+            op: "raw physical-memory metadata".into(),
+        })
+    }
+
+    fn read_physical(&self, address: u64, length: usize) -> Result<Vec<u8>> {
+        Err(BackendError::Unsupported {
+            op: format!("raw physical-memory read at {address:#x}+{length:#x}"),
+        })
+    }
+
+    fn write_physical(&self, address: u64, _data: &[u8]) -> Result<usize> {
+        Err(BackendError::Unsupported {
+            op: format!("raw physical-memory write at {address:#x}"),
+        })
+    }
+
+    /// Batched physical reads preserve per-range failure, matching the
+    /// scatter contract used by LeechCore.
+    fn read_physical_scatter(&self, ranges: &[PhysicalRead]) -> Vec<Option<Vec<u8>>> {
+        ranges
+            .iter()
+            .map(|range| {
+                self.read_physical(range.address, range.length as usize)
+                    .ok()
+            })
+            .collect()
+    }
+
+    fn write_physical_scatter(&self, ranges: &[PhysicalWrite]) -> Vec<bool> {
+        ranges
+            .iter()
+            .map(|range| {
+                self.write_physical(range.address, &range.data)
+                    .is_ok_and(|written| written == range.data.len())
+            })
+            .collect()
+    }
 }

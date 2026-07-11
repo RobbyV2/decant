@@ -67,6 +67,20 @@ Translating these once covers every Win32 API above them.
 - `MockBackend`: scriptable mock guest, runs offline.
 - `MemflowBackend` (`--features memflow`): reads guest physical RAM.
 
+## Orpheus / MemProcFS
+
+Decant includes a LeechCore device plugin for
+[Orpheus](https://github.com/super2xl/orpheus). It feeds raw VM physical memory from the
+existing memflow daemon into Orpheus's stock `vmm`/MemProcFS engine, preserving Orpheus's
+process, VAD, DTB, and analysis behavior.
+
+```bash
+scripts/decant.sh orpheus install
+ORPHEUS_API_KEY='...' scripts/decant.sh orpheus connect
+```
+
+See [docs/ORPHEUS.md](docs/ORPHEUS.md) for Linux, Wine, and native Windows setup.
+
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Library
@@ -170,9 +184,20 @@ $ decant-cli resolve 3120 0x140010200 0x10    # pointer chain: base plus offsets
 
 $ decant-cli diagnostics
 connector: memflow:kvm   reads: 42  writes: 3  unsupported_ops: 0
+
+$ decant-cli iat-hooks 3120 --module target.exe
+target.exe  KERNEL32.dll!GetTickCount64  slot=0x00007ff7004050a0  target=0x00007ffb8d912340  priority=90
+
+$ decant-cli iat-probe 3120 --module target.exe --import-module KERNEL32.dll \
+    --function GetTickCount64 --stage-base 0x140001500 --timeout-ms 1000
+observed target.exe!KERNEL32.dll!GetTickCount64 via slot 0x00007ff7004050a0 on tid 3124
 ```
 
-Full set: `processes`, `modules <pid>`, `exports <pid> <module>`, `read <pid> <addr> <len>`, `write <pid> <addr> <hexbytes>`, `memory-map <pid>`, `scan <pid> "<AOB>"`, `resolve <pid> <base> <off>...`, `diagnostics`. Add `--json` for machine-readable output.
+`iat-hooks` ranks imported functions that are useful execution triggers. `iat-probe` temporarily hooks one selected slot, calls `GetCurrentThreadId` to record the servicing thread, then tail-jumps to the original target and restores the slot. Memflow retains a completed pass-through stub in the reserved stage/result backing, because an external-memory backend cannot prove that no thread already fetched the temporary target before cleanup. It never maps a payload or invokes `DllMain`. Provide a writable, executable stage address only after inspecting the target's memory map.
+
+Full set: `processes`, `modules <pid>`, `exports <pid> <module>`, `read <pid> <addr> <len>`, `write <pid> <addr> <hexbytes>`, `memory-map <pid>`, `scan <pid> "<AOB>"`, `resolve <pid> <base> <off>...`, `diagnostics`, `iat-hooks <pid> [--module <module>]`, `iat-probe <pid> --module <module> --import-module <dll> --function <name> --stage-base <addr>`. Add `--json` for machine-readable output.
+
+`fixture-control <pid> <ping|file-io>` is intentionally limited to the guest-inject test fixture. It uses a versioned in-memory mailbox for liveness and a `%TEMP%` write/read-back diagnostic; it is not a command shell and cannot execute arbitrary commands.
 
 ## Running the daemon
 
@@ -298,6 +323,7 @@ process = "target.exe"          # or: pid = 1234
 process_pattern = "44 45 ?? 41"
 stage_pattern = "44 45 43 41 4E 54 3A 3A 53 54 41 47 45 30 30"
 result_pattern = "44 45 43 41 4E 54 3A 3A 52 45 53 55 4C 54 30 34"
+iat_stage_pool_slots = 1024          # one-shot IAT call slots, retained until target exit
 payload_path = "payload.dll"
 allocation = "virtual-alloc"
 dependency_policy = "require-loaded"  # require-loaded | load-with-guest-loader
@@ -366,15 +392,22 @@ requires `allocation = "virtual-alloc"` for helper buffers and
 `final_protections = "section"`, because an image-file-backed mapping uses PE-derived page
 protections rather than a single RWX region.
 
-`guest.execution.method = "iat-hook"` is the default execution path. Decant snapshots the
-selected thunk, stage bytes, and writable result slot, patches them, lets one target thread run
-the requested call, reads the return value, and restores the IAT-hook transaction (IAT slot,
-stub bytes, result block) on every exit path. The `sec-image` trampoline and
-`registered-unwind` metadata are restored or left in place separately from this transaction.
-The result slot is execution scratch for this call path, not a payload success marker. For
-repeatable runs, set `guest.stage_pattern` or `guest.stage_base` to executable staging bytes you
-control, and set `guest.result_pattern` or `guest.result_base` to a writable scratch slot;
-otherwise Decant only auto-selects memory that passes those permission checks.
+`guest.execution.method = "iat-hook"` is the default execution path. Decant uses the configured
+stage and writable result slot once to allocate a private RWX pool, then consumes one distinct
+1 KiB slot for each subsequent guest call, including subsequent manual-map requests for that target
+process. This prevents a target thread that fetched an old IAT target from entering bytes that were
+later armed for a different operation. A versioned pool header lets a restarted daemon rediscover
+the target-resident pool and skip completed slots. A memory-only backend such as memflow retains
+completed pass-through stubs for the target lifetime, because it cannot prove that no thread already
+fetched the temporary target before disarm. The pool capacity is `guest.iat_stage_pool_slots`
+(default `1024`); exhaustion is a hard error rather than a slot reuse. The pool is intentionally not
+freed while the target remains alive. A backend that proves a real all-thread barrier may advertise
+`iat_hook_stage_restore` and restore per-slot stage/result snapshots. The `sec-image` trampoline and
+`registered-unwind` metadata are restored or left in place separately from this transaction. The
+result slot is bootstrap scratch, not a payload success marker. Set `guest.stage_pattern` or
+`guest.stage_base` to executable staging bytes you control, and set `guest.result_pattern` or
+`guest.result_base` to a writable bootstrap scratch slot; otherwise Decant only auto-selects memory
+that passes those permission checks.
 
 `guest.execution.method = "remote-thread"` creates a kernel-tracked guest thread by first
 entering the target through the IAT-hook trampoline, then calling `CreateThread` from inside the

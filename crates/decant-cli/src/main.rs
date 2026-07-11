@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use decant_client::Client;
 use decant_inject::DecantConfig;
 use decant_inject::guest::GuestInjectionPlan;
@@ -61,6 +62,42 @@ enum Cmd {
     GuestUnmap {
         config: PathBuf,
     },
+    /// List imported IAT entries that can be used as execution triggers.
+    IatHooks {
+        pid: u32,
+        #[arg(long)]
+        module: Option<String>,
+    },
+    /// Verify that one IAT entry is called within a bounded interval.
+    IatProbe {
+        pid: u32,
+        #[arg(long)]
+        module: String,
+        #[arg(long)]
+        import_module: String,
+        #[arg(long)]
+        function: String,
+        #[arg(long)]
+        stage_base: Option<String>,
+        #[arg(long)]
+        result_base: Option<String>,
+        #[arg(long, default_value_t = 1_000)]
+        timeout_ms: u32,
+    },
+    /// Send one fixed diagnostic request to a guest-inject fixture mailbox.
+    FixtureControl {
+        pid: u32,
+        #[arg(value_enum)]
+        request: FixtureControlRequest,
+        #[arg(long, default_value_t = 2_000)]
+        timeout_ms: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FixtureControlRequest {
+    Ping,
+    FileIo,
 }
 
 fn main() -> ExitCode {
@@ -136,10 +173,194 @@ fn run() -> Result<()> {
         }
         Cmd::GuestInject { config } => return guest_inject(&mut client, cli.json, &config),
         Cmd::GuestUnmap { config } => return guest_unmap(&mut client, cli.json, &config),
+        Cmd::FixtureControl {
+            pid,
+            request,
+            timeout_ms,
+        } => return fixture_control(&mut client, cli.json, pid, request, timeout_ms),
+        Cmd::IatHooks { pid, module } => (
+            Request::GuestIatHooks {
+                pid: Pid(pid),
+                module,
+            },
+            None,
+        ),
+        Cmd::IatProbe {
+            pid,
+            module,
+            import_module,
+            function,
+            stage_base,
+            result_base,
+            timeout_ms,
+        } => (
+            Request::GuestIatProbe {
+                pid: Pid(pid),
+                source_module: module,
+                import_module,
+                symbol: function,
+                stage_base: stage_base
+                    .as_deref()
+                    .map(parse_u64)
+                    .transpose()
+                    .context("parsing --stage-base")?,
+                result_base: result_base
+                    .as_deref()
+                    .map(parse_u64)
+                    .transpose()
+                    .context("parsing --result-base")?,
+                timeout_ms,
+            },
+            None,
+        ),
     };
+
+    if let Request::GuestIatProbe { timeout_ms, .. } = &req {
+        client.set_timeout(Duration::from_millis(
+            u64::from(*timeout_ms).saturating_add(5_000),
+        ));
+    }
 
     let resp = client.send(req).context("daemon request")?;
     emit(resp, cli.json, read_base)
+}
+
+const FIXTURE_DIAGNOSTIC_MAGIC: &str = "44 45 43 41 4e 54 3a 3a 44 49 41 47 30 30 30 31";
+const FIXTURE_DIAGNOSTIC_MAILBOX_LEN: usize = 120;
+const FIXTURE_DIAGNOSTIC_REQUEST_OFFSET: u64 = 16;
+const FIXTURE_DIAGNOSTIC_REQUEST_ID_OFFSET: u64 = 24;
+const FIXTURE_DIAGNOSTIC_COMPLETED_ID_OFFSET: u64 = 32;
+const FIXTURE_DIAGNOSTIC_STATUS_OFFSET: u64 = 40;
+const FIXTURE_DIAGNOSTIC_TICK_OFFSET: u64 = 48;
+const FIXTURE_DIAGNOSTIC_PAYLOAD_OFFSET: usize = 56;
+
+fn fixture_control(
+    client: &mut Client,
+    json: bool,
+    pid: u32,
+    request: FixtureControlRequest,
+    timeout_ms: u32,
+) -> Result<()> {
+    let pid = Pid(pid);
+    let matches = client
+        .scan(pid, FIXTURE_DIAGNOSTIC_MAGIC)
+        .context("scanning fixture diagnostic mailbox")?;
+    let mailbox = match matches.as_slice() {
+        [mailbox] => *mailbox,
+        [] => bail!("fixture diagnostic mailbox was not found"),
+        _ => bail!(
+            "fixture diagnostic mailbox is ambiguous; {} matches found",
+            matches.len()
+        ),
+    };
+    let initial = client
+        .read(pid, mailbox, FIXTURE_DIAGNOSTIC_MAILBOX_LEN)
+        .context("reading fixture diagnostic mailbox")?;
+    let request_id = next_fixture_request_id(
+        read_u64_at(&initial, FIXTURE_DIAGNOSTIC_REQUEST_ID_OFFSET as usize)?,
+        read_u64_at(&initial, FIXTURE_DIAGNOSTIC_COMPLETED_ID_OFFSET as usize)?,
+    );
+    let request_code = match request {
+        FixtureControlRequest::Ping => 1u64,
+        FixtureControlRequest::FileIo => 2u64,
+    };
+
+    client
+        .write(
+            pid,
+            mailbox + FIXTURE_DIAGNOSTIC_REQUEST_OFFSET,
+            &request_code.to_le_bytes(),
+        )
+        .context("writing fixture diagnostic request")?;
+    client
+        .write(
+            pid,
+            mailbox + FIXTURE_DIAGNOSTIC_REQUEST_ID_OFFSET,
+            &request_id.to_le_bytes(),
+        )
+        .context("committing fixture diagnostic request")?;
+
+    let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+    loop {
+        let state = client
+            .read(pid, mailbox, FIXTURE_DIAGNOSTIC_MAILBOX_LEN)
+            .context("reading fixture diagnostic result")?;
+        let completed_id = read_u64_at(&state, FIXTURE_DIAGNOSTIC_COMPLETED_ID_OFFSET as usize)?;
+        if completed_id == request_id {
+            let status = read_u64_at(&state, FIXTURE_DIAGNOSTIC_STATUS_OFFSET as usize)?;
+            let tick = read_u64_at(&state, FIXTURE_DIAGNOSTIC_TICK_OFFSET as usize)?;
+            let payload = fixture_payload(&state)?;
+            if status != 2 {
+                bail!(
+                    "fixture diagnostic {:?} failed with status={status}, payload={payload:?}",
+                    request
+                );
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "pid": pid.0,
+                        "mailbox": mailbox,
+                        "request": request_name(request),
+                        "request_id": request_id,
+                        "status": status,
+                        "tick": tick,
+                        "payload": payload,
+                    })
+                );
+            } else {
+                println!("mailbox:    {mailbox:#018x}");
+                println!("request:    {}", request_name(request));
+                println!("request id: {request_id}");
+                println!("status:     ok");
+                println!("tick:       {tick}");
+                println!("payload:    {payload}");
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "fixture diagnostic {} timed out after {timeout_ms} ms",
+                request_name(request)
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn read_u64_at(bytes: &[u8], offset: usize) -> Result<u64> {
+    let end = offset
+        .checked_add(8)
+        .ok_or_else(|| anyhow!("fixture diagnostic offset overflow"))?;
+    let value: [u8; 8] = bytes
+        .get(offset..end)
+        .ok_or_else(|| anyhow!("fixture diagnostic mailbox is truncated"))?
+        .try_into()
+        .map_err(|_| anyhow!("fixture diagnostic u64 is truncated"))?;
+    Ok(u64::from_le_bytes(value))
+}
+
+fn next_fixture_request_id(request_id: u64, completed_id: u64) -> u64 {
+    request_id.max(completed_id).wrapping_add(1).max(1)
+}
+
+fn fixture_payload(bytes: &[u8]) -> Result<String> {
+    let payload = bytes
+        .get(FIXTURE_DIAGNOSTIC_PAYLOAD_OFFSET..)
+        .ok_or_else(|| anyhow!("fixture diagnostic payload is missing"))?;
+    let end = payload
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(payload.len());
+    Ok(String::from_utf8_lossy(&payload[..end]).into_owned())
+}
+
+fn request_name(request: FixtureControlRequest) -> &'static str {
+    match request {
+        FixtureControlRequest::Ping => "ping",
+        FixtureControlRequest::FileIo => "file-io",
+    }
 }
 
 fn guest_inject(client: &mut Client, json: bool, config_path: &Path) -> Result<()> {
@@ -339,6 +560,37 @@ fn emit(resp: Response, json: bool, read_base: Option<u64>) -> Result<()> {
             println!("pid:             {}", info.pid);
             println!("modules unmapped: {}", info.modules_unmapped);
         }
+        Response::GuestIatHooks(candidates) => {
+            if candidates.is_empty() {
+                println!("(no IAT hook candidates)");
+            }
+            for candidate in candidates {
+                println!(
+                    "priority={:<3}  {}: {}!{}  slot={:#018x} target={:#018x}",
+                    candidate.priority,
+                    candidate.source_module,
+                    candidate.import_module,
+                    candidate.symbol,
+                    candidate.iat_slot,
+                    candidate.original_target,
+                );
+            }
+        }
+        Response::GuestIatProbe(probe) => {
+            let candidate = probe.candidate;
+            println!(
+                "candidate:       {}: {}!{}",
+                candidate.source_module, candidate.import_module, candidate.symbol
+            );
+            println!("IAT slot:        {:#018x}", candidate.iat_slot);
+            println!("original target: {:#018x}", candidate.original_target);
+            println!("observed:        {}", probe.observed);
+            match probe.servicing_tid {
+                Some(tid) => println!("servicing tid:   {tid}"),
+                None => println!("servicing tid:   <none>"),
+            }
+            println!("timeout:         {} ms", probe.timeout_ms);
+        }
         Response::Err(e) => bail!("daemon error: {e}"),
         other => bail!("unexpected response: {other:?}"),
     }
@@ -416,5 +668,20 @@ mod tests {
         );
         assert_eq!(parse_hex("0xDEAD").unwrap(), vec![0xde, 0xad]);
         assert!(parse_hex("abc").is_err());
+    }
+
+    #[test]
+    fn fixture_request_id_advances_without_using_zero() {
+        assert_eq!(next_fixture_request_id(0, 0), 1);
+        assert_eq!(next_fixture_request_id(4, 7), 8);
+        assert_eq!(next_fixture_request_id(u64::MAX, u64::MAX), 1);
+    }
+
+    #[test]
+    fn fixture_payload_stops_at_nul() {
+        let mut mailbox = vec![0u8; FIXTURE_DIAGNOSTIC_MAILBOX_LEN];
+        mailbox[FIXTURE_DIAGNOSTIC_PAYLOAD_OFFSET..FIXTURE_DIAGNOSTIC_PAYLOAD_OFFSET + 4]
+            .copy_from_slice(b"pong");
+        assert_eq!(fixture_payload(&mailbox).unwrap(), "pong");
     }
 }
