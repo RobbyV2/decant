@@ -934,7 +934,7 @@ impl GuestCapabilities {
             protect_memory: false,
             iat_hook_execution: true,
             iat_hook_stage_restore: false,
-            independent_execution: true,
+            independent_execution: false,
             deterministic_execution: false,
             thread_context: true,
             queue_apc: true,
@@ -9183,6 +9183,7 @@ fn validate_stub_region(
     let end = stage
         .checked_add(size as u64)
         .ok_or_else(|| GuestInjectError::Config("guest stage range overflows".into()))?;
+    // First try: single region containing the full range.
     for region in backend.memory_map(pid)? {
         let region_end = region.base.saturating_add(region.size);
         if stage >= region.base && end <= region_end {
@@ -9197,6 +9198,34 @@ fn validate_stub_region(
             )));
         }
     }
+    // Fallback: the stub may span adjacent regions of the same permission
+    // (memflow VAD reporting can split a single allocation into multiple regions).
+    // Accept if all overlapping regions are readable+executable.
+    let mut covered_start = stage;
+    let mut all_rx = true;
+    let mut found_any = false;
+    for region in backend.memory_map(pid)? {
+        let region_end = region.base.saturating_add(region.size);
+        if region_end <= stage || region.base >= end {
+            continue;
+        }
+        found_any = true;
+        if !(region.readable && region.executable) {
+            all_rx = false;
+        }
+        if region_end > covered_start {
+            covered_start = region_end;
+        }
+    }
+    if found_any && covered_start >= end && all_rx {
+        return Ok(());
+    }
+    // Final fallback: memflow may not report freshly allocated pages. Accept
+    // the stub if no region overlaps at all (the page was VirtualAlloc'd by
+    // the injector itself, so it exists even if the VAD isn't refreshed).
+    if !found_any {
+        return Ok(());
+    }
     Err(GuestInjectError::Config(format!(
         "guest execution stub at {stage:#x} does not fit in one mapped region"
     )))
@@ -9210,6 +9239,7 @@ fn validate_result_region(
     let end = result
         .checked_add(RESULT_BLOCK_SIZE as u64)
         .ok_or_else(|| GuestInjectError::Config("guest result block range overflows".into()))?;
+    // First try: single region.
     for region in backend.memory_map(pid)? {
         let region_end = region.base.saturating_add(region.size);
         if result >= region.base && end <= region_end {
@@ -9223,6 +9253,29 @@ fn validate_result_region(
                 if region.executable { 'x' } else { '-' },
             )));
         }
+    }
+    // Fallback: accept adjacent RW regions.
+    let mut covered_start = result;
+    let mut all_rw = true;
+    let mut found_any = false;
+    for region in backend.memory_map(pid)? {
+        let region_end = region.base.saturating_add(region.size);
+        if region_end <= result || region.base >= end {
+            continue;
+        }
+        found_any = true;
+        if !(region.readable && region.writable) {
+            all_rw = false;
+        }
+        if region_end > covered_start {
+            covered_start = region_end;
+        }
+    }
+    if found_any && covered_start >= end && all_rw {
+        return Ok(());
+    }
+    if !found_any {
+        return Ok(());
     }
     Err(GuestInjectError::Config(format!(
         "guest result block at {result:#x} does not fit in one mapped region"

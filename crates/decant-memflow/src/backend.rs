@@ -1308,7 +1308,7 @@ impl MemflowBackend {
             )));
         }
 
-        let kernel = self.resolve_kernel_bootstrap_exports()?;
+        let kernel = self.resolve_kernel_bootstrap_exports(pid)?;
         let kernel_cave = find_kernel_bootstrap_cave(self, pid, &kernel)?;
         let state_addr = kernel_cave + KERNEL_BOOTSTRAP_STATE_OFFSET;
         let status_addr = kernel_cave + KERNEL_BOOTSTRAP_STATUS_OFFSET;
@@ -1431,6 +1431,7 @@ impl MemflowBackend {
 
     fn resolve_kernel_bootstrap_exports(
         &self,
+        pid: u32,
     ) -> std::result::Result<KernelBootstrapExports, GuestInjectError> {
         let mut os = self.os.lock().unwrap();
         let module = ["ntoskrnl.exe", "ntkrnlmp.exe"]
@@ -1451,6 +1452,24 @@ impl MemflowBackend {
             .map(|export| (export.name.to_string(), module_base + export.offset))
             .collect::<Vec<_>>();
 
+        // Fallback: if ntoskrnl doesn't export all needed Zw*/Nt* syscalls
+        // (some Windows builds only list them in ntdll), resolve from ntdll
+        // in the target process directly.
+        let need_fallback = [
+            "ZwOpenProcess", "NtOpenProcess",
+            "ZwWriteVirtualMemory", "NtWriteVirtualMemory",
+            "ZwAllocateVirtualMemory", "NtAllocateVirtualMemory",
+        ].iter().any(|name| kernel_export_by_name(&exports, name).is_err());
+
+        let exports = if need_fallback {
+            let ntdll_exports =
+                <MemflowBackend as MemoryBackend>::module_exports(self, Pid(pid), "ntdll.dll")
+                    .map_err(guest_other)?;
+            ntdll_exports
+        } else {
+            exports
+        };
+
         let hook = [
             "NtWaitForSingleObject",
             "NtWaitForMultipleObjects",
@@ -1469,15 +1488,22 @@ impl MemflowBackend {
             module_base,
             module_size,
             hook,
-            zw_open_process: kernel_export_by_name(&exports, "ZwOpenProcess")?,
-            zw_allocate_virtual_memory: kernel_export_by_name(&exports, "ZwAllocateVirtualMemory")?,
-            zw_write_virtual_memory: kernel_export_by_name(&exports, "ZwWriteVirtualMemory")?,
+            zw_open_process: kernel_export_by_name(&exports, "ZwOpenProcess")
+                .or_else(|_| kernel_export_by_name(&exports, "NtOpenProcess"))?,
+            zw_allocate_virtual_memory: kernel_export_by_name(&exports, "ZwAllocateVirtualMemory")
+                .or_else(|_| kernel_export_by_name(&exports, "NtAllocateVirtualMemory"))?,
+            zw_write_virtual_memory: kernel_export_by_name(&exports, "ZwWriteVirtualMemory")
+                .or_else(|_| kernel_export_by_name(&exports, "NtWriteVirtualMemory"))?,
             zw_set_information_virtual_memory: kernel_export_by_name(
                 &exports,
                 "ZwSetInformationVirtualMemory",
-            )?,
+            )
+            .or_else(|_| {
+                kernel_export_by_name(&exports, "NtSetInformationVirtualMemory")
+            })?,
             rtl_create_user_thread: kernel_export_by_name(&exports, "RtlCreateUserThread")?,
-            zw_close: kernel_export_by_name(&exports, "ZwClose")?,
+            zw_close: kernel_export_by_name(&exports, "ZwClose")
+                .or_else(|_| kernel_export_by_name(&exports, "NtClose"))?,
         })
     }
 
@@ -1936,6 +1962,10 @@ fn build_kernel_bootstrap_stage(
     c.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
     let open_failed = emit_jcc_rel32(&mut c, 0x88); // js finalize
 
+    let cfg_page_base = user_base_addr;
+    let cfg_target_offset = hook_addr.wrapping_sub(user_base_addr);
+    let user_start = user_base_addr;
+
     emit_mov_imm64(&mut c, 0xB8, cfg_page_base); // mov rax, CFG page base
     c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x60]); // Range.VirtualAddress
     c.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x68, 0x00, 0x10, 0x00, 0x00]); // Range.NumberOfBytes = PAGE_SIZE
@@ -1969,8 +1999,7 @@ fn build_kernel_bootstrap_stage(
     c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]); // StackReserved = NULL
     c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x28]); // StackCommit = NULL
     emit_mov_imm64(&mut c, 0xB8, user_start); // mov rax, user start
-    c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x30]); // StartAddress
-    c.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x30]); // StartAddress    c.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
     c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x38]); // StartParameter = NULL
     c.extend_from_slice(&[0x48, 0x8D, 0x84, 0x24, 0xC8, 0x00, 0x00, 0x00]); // lea rax, [rsp+0xc8]
     c.extend_from_slice(&[0x48, 0x89, 0x84, 0x24, 0x40, 0x00, 0x00, 0x00]); // ThreadHandle
